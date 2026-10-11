@@ -111,6 +111,32 @@ async fn created_nodes_list_only_canonical_configured_stream_transport() {
 }
 
 #[tokio::test]
+async fn rejected_node_links_report_the_static_parser_reason() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let before = std::fs::read_to_string(fixture.path("main.dae")).unwrap();
+    let link = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@127.0.0.1:443?type=xhttp&security=tls&extra=%7B%22xPaddingBytes%22%3A%220-10%22%2C%22headers%22%3A%7B%22X-Secret%22%3A%22private-value%22%7D%7D";
+    let response = create_node(&fixture, "bad-xhttp", link)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let text = response.text().await.unwrap();
+    assert!(!text.contains("private-value"), "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_value");
+    assert_eq!(
+        body["error"]["message"],
+        "XHTTP xPaddingBytes must stay within 1-8192"
+    );
+    assert_eq!(body["error"]["details"]["written"], false);
+    assert_eq!(
+        std::fs::read_to_string(fixture.path("main.dae")).unwrap(),
+        before
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn node_management_commits_disk_catalog_and_generation_before_success() {
     let fixture = Fixture::new(Access::Admin, false).await;
     std::fs::write(
