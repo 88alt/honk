@@ -309,6 +309,8 @@ Publication makes the replacement immediately available with independent executi
 
 The 30-second deadline bounds waiting for query leases, not completion of transport and outbound-pool teardown. It is a safety cutoff, not a prerequisite for new service: expiry cancels runtime-owned forwarding and admitted reply futures before transport teardown. Application/bootstrap fallback remains inside the original query lease, so drain waits for it and forced shutdown cancels it too. At most four retired generations remain retained; cap eviction and provider shutdown force the same cancellation. Once a generation has finished retirement and its leases have drained, it releases its runtime and keeps only its outbound registry for that forced shutdown. A ready terminal `SERVFAIL` reply is still attempted, but stalled admitted reply I/O is cancelled; a cancelled TCP write closes the connection.
 
+At query completion, an already-published runtime cancellation wins even if the lookup becomes ready in the same executor poll. Reply I/O deliberately keeps completion priority; a reply that is still pending remains cancellable.
+
 `DnsServiceProvider` owns every retirement and forced-close supervisor; they are reaped and joined at shutdown. Listener sockets and process-wide physical resource limits remain shared, so isolation does not promise service after descriptor exhaustion.
 
 SIGHUP builds policy, `/etc/hosts`, groups, routing, upstream transports, projection data, and the outbound runtime before the commit point. Publication occurs with the control-plane routing/config locks; failed preparation leaves the current generation intact. A semantic `dns.bind` change is the exception: listener ownership is process-scoped and the reload is rejected as restart-required.

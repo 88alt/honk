@@ -302,6 +302,8 @@ worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired
 
 30 秒期限只限制等待查询 lease 排空的时间，不限制 transport 与 outbound pool 整体拆除所需的时间。它是安全限制，并非新代服务的前置条件；到期会取消 runtime 所有的 forwarding 和已准入应答 future。应用解析的 bootstrap fallback 仍在原查询 lease 内执行，drain 会等待它，强制 shutdown 也会取消它。最多保留四个已退役代；超过上限与 provider 关闭会触发相同的强制取消。某代完成退役且 lease 排空后即释放其 runtime，只保留 outbound registry 供上述强制关闭使用。已就绪的终态 `SERVFAIL` 应答仍会尝试发送，但停滞的已准入应答 I/O 会被取消；TCP 写入被取消时关闭连接。
 
+查询完成时，已经发布的 runtime 取消优先，即使查询结果在同一次执行器轮询中变为就绪。应答 I/O 刻意保留完成优先；尚未完成的应答仍可被取消。
+
 `DnsServiceProvider` 持有、回收全部退役与强制关闭 supervisor，并在关闭时等待它们结束。监听 socket 与进程级物理资源限制仍共享，因此代际隔离不承诺描述符耗尽后仍可服务。
 
 SIGHUP 在 commit point 前构建 policy、`/etc/hosts`、组、路由、上游 transport、投影数据与 outbound runtime。发布时持有控制面 routing/config lock；准备失败会完整保留当前 generation。`dns.bind` 的语义变化是例外：监听器属于进程级资源，reload 会被拒绝并要求重启。
