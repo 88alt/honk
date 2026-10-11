@@ -381,9 +381,11 @@ impl Worker {
                 if active.nodes.iter().any(|node| node.name == input.name) {
                     return Err(management::conflict());
                 }
-                append_node_source(main, &input.name, &input.link).map_err(|_| {
+                append_node_source(main, &input.name, &input.link).map_err(|error| {
                     management::unsupported_value(
-                        "The main source cannot hold this node name and share link",
+                        error
+                            .reason
+                            .unwrap_or("The main source cannot hold this node name and share link"),
                         json!({"resource":"/nodes","fields":["name","link"]}),
                     )
                 })?
@@ -397,9 +399,11 @@ impl Worker {
                     return Err(management::conflict());
                 }
                 append_subscription_source(main, &input.name, &input.url, &input.options())
-                    .map_err(|_| {
+                    .map_err(|error| {
                         management::unsupported_value(
-                            "The main source cannot hold this provider name, URL or user agent",
+                            error.reason.unwrap_or(
+                                "The main source cannot hold this provider name, URL or user agent",
+                            ),
                             json!({"resource":"/providers","fields":["name","url","user_agent"]}),
                         )
                     })?

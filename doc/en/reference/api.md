@@ -10,6 +10,8 @@ The native contract, including authentication, node/provider management, geodata
 
 `Node.stream_transport` is an optional nullable string projected from accepted Trojan/VMess/VLESS configuration: `tcp`, `ws`, `grpc` or `xhttp` (including the `splithttp` alias). honk returns null when unrecognized or inapplicable. It describes configured transport, not negotiation or health; `protocol` and TCP/UDP health transport keep their existing meanings. It exposes no credentials, host, path, extra options or link. The fixture copies the doona contract bundle with its `read_only_reason` extension (SHA-256 `ef3e1ce08392c26d256b70277318d61a7ec932f4f5825ac8117d839944a33646`); this pin does not identify a published frontend release.
 
+`POST /api/v1/nodes` accepts a link of 1–8192 characters; a longer declaration (for example XHTTP `extra` near its 16 KiB header bound) belongs in a configuration source edit. A link the engine rejects returns `422 unsupported_value` with the parser's static reason as `error.message`, such as `XHTTP xPaddingBytes must stay within 1-8192`, and `details.fields: ["name","link"]`; submitted names, links and option values are never echoed, and nothing is written. `POST /api/v1/providers` reports a rejected subscription entry the same way. Other refusals keep the generic message.
+
 | Method | Path | Meaning |
 | --- | --- | --- |
 | GET | `/api` | Public discovery: authentication state and sign-in links for every caller; the fixed `/api/v1` base and all contract links for an admitted caller. |

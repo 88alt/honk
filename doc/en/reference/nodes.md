@@ -25,6 +25,8 @@ In quoted tags and links, a backslash escapes the next character when locating t
 
 A malformed recognized link is dropped with a warning. Known invalid fields retain a specific safe reason and schema path; unknown parse failures use `invalid-node-entry`. Diagnostics carry the original node-entry ordinal and source location, never the raw link, value, or node name. Data entrypoints return them without logging; plain entrypoints report them once. An unknown scheme or removed VLESS `vless_mode` is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS packet and carrier choices belong in that link's exact `packetEncoding=`, `mux=`, and `udp=` query parameters.
 
+A link that is accepted only ever warns with `legacy-*` codes. Any other warning on a node entry means the entry was dropped, so a client can validate a single `node { name: 'link' }` declaration in `syntax` mode and tell a skipped link from an accepted one by code alone.
+
 In the legacy `ss://base64(method:password@host:port)` form, decoded credentials are literal text, not URL-decoded: `%20` stays `%20`, and `?`, `/`, `#`, `:` and `@` remain password characters. The last `@` separates the endpoint; the userinfo may itself be `base64(method:password)`. A decoded payload without `@`, or credentials that cannot supply a method and password, is rejected. URL userinfo forms still percent-decode their credentials. The endpoint, path, query (including `/?plugin=...`) and fragment keep the usual URL handling.
 
 ## Node identity

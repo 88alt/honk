@@ -10,6 +10,8 @@
 
 `Node.stream_transport` 是可选、可为 null 的字符串，投影已接受的 Trojan/VMess/VLESS 配置：`tcp`、`ws`、`grpc` 或 `xhttp`（包括 `splithttp` 别名）。无法识别或不适用时，honk 返回 null。该字段表示配置的传输方式，不表示协商结果或健康状态；`protocol` 与 TCP/UDP 健康传输字段的含义不变。它不暴露凭据、host、path、extra 选项或链接。测试 fixture 复制 doona 契约 bundle，保留其 `read_only_reason` 扩展（SHA-256 `ef3e1ce08392c26d256b70277318d61a7ec932f4f5825ac8117d839944a33646`）；此固定版本不代表已发布的前端版本。
 
+`POST /api/v1/nodes` 接受 1–8192 个字符的链接；更长的声明（例如接近 16 KiB header 上限的 XHTTP `extra`）应通过编辑配置源写入。引擎拒绝的链接返回 `422 unsupported_value`，`error.message` 为解析器给出的静态原因，例如 `XHTTP xPaddingBytes must stay within 1-8192`，`details.fields` 为 `["name","link"]`；不会回显提交的名称、链接或选项值，也不会写入任何内容。`POST /api/v1/providers` 以同样方式报告被拒绝的订阅条目。其他拒绝仍使用通用消息。
+
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
 | GET | `/api` | 公共 discovery：所有请求都能获得认证状态与登录 links；已放行的请求另外获得固定 `/api/v1` base 与全部契约 links。 |

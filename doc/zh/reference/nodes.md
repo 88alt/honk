@@ -25,6 +25,8 @@ VMess JSON 的 `ps` 备注缺失或为空时，先使用 `vmess-{host}` 通过�
 
 协议已识别但格式错误的链接会被丢弃并产生 warning。已知的无效字段保留具体的安全原因及 schema 路径；未知解析失败使用 `invalid-node-entry`。诊断携带原始节点条目序号与来源位置，不包含原始链接、值或节点名称。数据接口返回诊断而不记录日志；普通接口只报告一次。未知协议或已删除的 VLESS `vless_mode` 属于配置硬错误。独立的 `mux:` 或 `mux=` 行也会被拒绝；VLESS 数据包与 carrier 选择必须写在该链接精确的 `packetEncoding=`、`mux=` 和 `udp=` query 参数中。
 
+被接受的链接只会产生 `legacy-*` 代码的 warning。节点条目上的其他任何 warning 都表示该条目已被丢弃，因此客户端可以用 `syntax` 模式校验单个 `node { name: 'link' }` 声明，仅凭代码区分被跳过与被接受的链接。
+
 旧版 `ss://base64(method:password@host:port)` 格式按字面值读取解码后的凭据，不做 URL 解码：`%20` 保持为 `%20`，`?`、`/`、`#`、`:` 和 `@` 仍是密码字符。最后一个 `@` 分隔凭据与端点；userinfo 本身也可以是 `base64(method:password)`。解码后的载荷缺少 `@`，或凭据无法解析为方法与密码时，拒绝解析。URL userinfo 格式仍按百分号解码凭据。端点、路径、query（包括 `/?plugin=...`）和 fragment 继续按 URL 处理。
 
 ## 节点身份
