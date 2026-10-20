@@ -280,19 +280,11 @@ impl AuthRate {
 
     fn failed_at(&self, peer: std::net::IpAddr, now: Instant) {
         let mut state = self.inner.lock();
-        // A slow credential check can outlive its attempt window and the pruned entry.
-        let index = match state.peers.iter().position(|entry| entry.peer == peer) {
-            Some(index) => index,
-            None => {
-                state.peers.push(PeerFailures {
-                    peer,
-                    failures: 0,
-                    locked_until: None,
-                });
-                state.peers.len() - 1
-            }
-        };
-        let entry = &mut state.peers[index];
+        let entry = state
+            .peers
+            .iter_mut()
+            .find(|entry| entry.peer == peer)
+            .expect("credential failure belongs to an admitted peer");
         entry.failures += 1;
         if entry.failures >= FAILURES_BEFORE_LOCK {
             entry.locked_until = Some(now + LOCK);
