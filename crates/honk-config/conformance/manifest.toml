@@ -1609,7 +1609,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-01"
-source = { file = "doc/en/how-to-start.md", lines = "168-179" }
+source = { file = "doc/en/how-to-start.md", lines = "174-185" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1620,7 +1620,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-02"
-source = { file = "doc/en/how-to-start.md", lines = "200-213" }
+source = { file = "doc/en/how-to-start.md", lines = "206-219" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1631,7 +1631,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-03"
-source = { file = "doc/en/how-to-start.md", lines = "219-219" }
+source = { file = "doc/en/how-to-start.md", lines = "225-225" }
 wrap = "global"
 layer = "structure"
 honk = "accept"
@@ -1642,7 +1642,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-04"
-source = { file = "doc/en/how-to-start.md", lines = "321-330" }
+source = { file = "doc/en/how-to-start.md", lines = "327-336" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1926,7 +1926,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-01"
-source = { file = "doc/zh/how-to-start.md", lines = "168-179" }
+source = { file = "doc/zh/how-to-start.md", lines = "174-185" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1937,7 +1937,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-02"
-source = { file = "doc/zh/how-to-start.md", lines = "200-213" }
+source = { file = "doc/zh/how-to-start.md", lines = "206-219" }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1948,7 +1948,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-03"
-source = { file = "doc/zh/how-to-start.md", lines = "219-219" }
+source = { file = "doc/zh/how-to-start.md", lines = "225-225" }
 wrap = "global"
 layer = "structure"
 honk = "accept"
@@ -1959,7 +1959,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-04"
-source = { file = "doc/zh/how-to-start.md", lines = "321-330" }
+source = { file = "doc/zh/how-to-start.md", lines = "327-336" }
 wrap = ""
 layer = "structure"
 honk = "accept"
