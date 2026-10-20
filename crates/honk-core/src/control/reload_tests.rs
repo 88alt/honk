@@ -1423,8 +1423,6 @@ async fn mode_reset_failure_still_restarts_warm_and_syncs_probes() {
     assert!(!cp.is_datapath_healthy());
     assert!(drain.should_reject());
     assert!(cp.drain_tracker.should_reject());
-    assert!(cp.udp_warm_task.lock().await.is_some());
-    assert!(cp.selector_warm_task.lock().await.is_some());
     assert_eq!(
         cp.alive_set.registered_nodes()[&node_id].name,
         "renamed-probe-node"

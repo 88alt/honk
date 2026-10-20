@@ -157,17 +157,25 @@ fn weak_non_loopback_tokens_warn_once_per_activation_without_logging_the_secret(
         return;
     }
     const SECRET: &str = "123456789abcdef";
-    const MESSAGE: &str =
-        "native API token secret is shorter than 16 bytes on a non-loopback listener";
     let sink = Sink::default();
     let writer = sink.clone();
     let dispatch = tracing::Dispatch::new(
         tracing_subscriber::fmt()
             .without_time()
+            .json()
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .finish(),
     );
+    let warnings = || {
+        let bytes = std::mem::take(&mut *sink.0.lock());
+        assert!(!String::from_utf8_lossy(&bytes).contains(SECRET));
+        serde_json::Deserializer::from_slice(&bytes)
+            .into_iter::<serde_json::Value>()
+            .map(Result::unwrap)
+            .filter(|event| event["level"] == "WARN")
+            .collect::<Vec<_>>()
+    };
     tracing::dispatcher::with_default(&dispatch, || {
         let mut config = Config::default();
         config.experimental.native_api.enabled = true;
@@ -177,21 +185,13 @@ fn weak_non_loopback_tokens_warn_once_per_activation_without_logging_the_secret(
             .validate_detailed()
             .expect("a short token is still accepted");
         let owner = NativeObservation::new(&config);
-        let startup = String::from_utf8(std::mem::take(&mut *sink.0.lock())).unwrap();
-        assert_eq!(startup.matches(MESSAGE).count(), 1, "startup warns once");
-        assert!(startup.contains("WARN"));
-        assert!(startup.contains("listen=0.0.0.0:9527"));
-        assert!(startup.contains("secret_length=15"));
-        assert!(!startup.contains(SECRET));
+        let startup = warnings();
+        assert_eq!(startup.len(), 1, "startup warns once");
+        assert_eq!(startup[0]["fields"]["listen"], "0.0.0.0:9527");
+        assert_eq!(startup[0]["fields"]["secret_length"], SECRET.len());
 
         owner.settings.activate(&owner, &config);
-        let reloaded = String::from_utf8(std::mem::take(&mut *sink.0.lock())).unwrap();
-        assert_eq!(
-            reloaded.matches(MESSAGE).count(),
-            1,
-            "reactivation warns once"
-        );
-        assert!(!reloaded.contains(SECRET));
+        assert_eq!(warnings().len(), 1, "reactivation warns once");
 
         for (enabled, listen, secret, password_auth) in [
             (true, "0.0.0.0:9527", "123456789abcdef0", false),
@@ -210,11 +210,7 @@ fn weak_non_loopback_tokens_warn_once_per_activation_without_logging_the_secret(
             native.allow_anonymous_loopback = secret.is_empty() && !password_auth;
             config.validate_detailed().unwrap();
             owner.settings.activate(&owner, &config);
-            let output = String::from_utf8(std::mem::take(&mut *sink.0.lock())).unwrap();
-            assert!(
-                !output.contains(MESSAGE),
-                "no weak-token warning for {listen}"
-            );
+            assert!(warnings().is_empty(), "no weak-token warning for {listen}");
         }
     });
 }

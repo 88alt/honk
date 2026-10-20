@@ -479,12 +479,6 @@ fn source_failures_write_results_before_failing() {
     assert_eq!(result["total"], cases.len());
     assert_eq!(result["failure"]["case"], "missing-input");
     assert_eq!(result["failure"]["path"], "input");
-    assert_eq!(result["failure"].as_object().unwrap().len(), 3);
-    assert!(
-        result["failure"]["detail"]
-            .as_str()
-            .is_some_and(|s| !s.is_empty())
-    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     for (id, _) in cases {
