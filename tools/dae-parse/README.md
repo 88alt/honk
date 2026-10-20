@@ -16,14 +16,8 @@ printf 'global {\n  log_file: honk.log\n}\n' | /tmp/dae-parse
 commit, and verifies each against the manifest's SHA-256; a mismatch fails with
 the file name. Nothing from dae is committed to this repository.
 
-The conformance manifest selects repository documentation with
-`source = { file = "doc/en/how-to-start.md", fence = 3 }`: the body of that
-file's third ```dae fence, counted from one. Pinned upstream sources keep
-`source = { dae = "example.dae", lines = "a-b" }`, with one-based inclusive
-lines. Missing or unreadable source selections are collected as case failures;
-`CONFORMANCE_RESULT` still records counts and the first `failure: {case, path,
-detail}` before the test fails, so CI can name the case rather than missing
-results.
+See [conformance cases](../../crates/honk-config/conformance/README.md) for
+source selectors and failure reporting.
 
 ## Licence
 
