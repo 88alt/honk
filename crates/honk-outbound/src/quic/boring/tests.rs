@@ -101,25 +101,105 @@ async fn chacha20_handshake_and_echo() {
     assert_eq!(echoed, b"ping");
 }
 
-#[test]
-fn ticket_cache_keys_separate_certificate_verification_policies() {
-    for ticket_key in [None, Some("server.test|443|sni.test|h3".to_owned())] {
-        let verified = BoringQuicClientConfig::new(BoringQuicOptions {
-            ticket_key: ticket_key.clone(),
-            ..Default::default()
-        })
-        .unwrap();
-        let unverified = BoringQuicClientConfig::new(BoringQuicOptions {
-            ticket_key,
-            skip_cert_verify: true,
-            ..Default::default()
-        })
-        .unwrap();
-        assert_ne!(
-            verified.session_ticket_key("sni.test"),
-            unverified.session_ticket_key("sni.test")
+#[tokio::test]
+async fn ticket_resumption_separates_certificate_verification_policies() {
+    let (server, addr) = crate::quic::testutil::server_endpoint(&[b"h3"], true).unwrap();
+    let endpoint = crate::quic::client_endpoint(false).unwrap();
+    let identity = format!("verification-policy|{addr}");
+    let crypto = |skip_cert_verify| {
+        Arc::new(
+            BoringQuicClientConfig::new(BoringQuicOptions {
+                alpn_wire: b"\x02h3".to_vec(),
+                ticket_key: Some(identity.clone()),
+                skip_cert_verify,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+    };
+    let echo = async {
+        while let Some(incoming) = server.accept().await {
+            let Ok(conn) = incoming.await else { continue };
+            if let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                let buf = recv.read_to_end(16).await.unwrap();
+                send.write_all(&buf).await.unwrap();
+                send.finish().unwrap();
+            }
+            conn.closed().await;
+        }
+    };
+    let dial = async {
+        let config = crypto(true);
+        let ticket_key = config.session_ticket_key("localhost");
+        let conn = endpoint
+            .connect_with(quinn::ClientConfig::new(config), addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let data = conn
+            .handshake_data()
+            .and_then(|data| data.downcast::<BoringHandshakeData>().ok())
+            .expect("handshake data");
+        assert!(
+            !data.session_reused,
+            "isolated identity must start with a full handshake"
         );
-    }
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(b"ping").await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(recv.read_to_end(16).await.unwrap(), b"ping");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if SESSION_TICKETS.lock().contains_key(&ticket_key) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("peer did not issue a session ticket");
+        conn.close(0u32.into(), b"done");
+        let error = endpoint
+            .connect_with(quinn::ClientConfig::new(crypto(false)), addr, "localhost")
+            .unwrap()
+            .await
+            .expect_err(
+                "verification must reject the self-signed peer, not resume its unverified ticket",
+            );
+        assert!(
+            matches!(
+                &error,
+                quinn::ConnectionError::TransportError(error)
+                    if error.code
+                        == TransportErrorCode::crypto(boring_sys::SSL_AD_UNKNOWN_CA as u8)
+            ),
+            "expected certificate validation failure, got: {error}"
+        );
+        // The rejected verified dial must leave the insecure ticket usable.
+        let conn = endpoint
+            .connect_with(quinn::ClientConfig::new(crypto(true)), addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let data = conn
+            .handshake_data()
+            .and_then(|data| data.downcast::<BoringHandshakeData>().ok())
+            .expect("handshake data");
+        assert!(
+            data.session_reused,
+            "a fresh SSL_CTX must resume the same-policy ticket"
+        );
+        conn.close(0u32.into(), b"done");
+        endpoint.close(0u32.into(), b"done");
+        server.close(0u32.into(), b"done");
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::join!(echo, dial);
+        endpoint.wait_idle().await;
+        server.wait_idle().await;
+    })
+    .await
+    .expect("verification-policy loopback test timed out");
 }
 
 /// A ticket cached under a rebuilt client config (post-reload SSL_CTX)
