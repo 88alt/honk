@@ -45,6 +45,8 @@
 10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
 `RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查时会记录 warning 并关闭；服务准入后的失败仍为 fatal。
 
+对象准入会在进程名 probe 或任何 Aya loader 运行前拒绝隐式 `ByName` map pinning。外部对象必须声明未 pin 的 map；包括持久分配器在内，所有 pin 路径均由 core 显式提供，避免 loader 创建的别名逃出启动回滚。
+
 真实 backend 在 pin map 后启动失败时，启动 guard 只删除本次成功创建的临时 pin。未能替换的已有 pin 与无关的已有 pin 不归本次所有。`UDP_DECISION_SEQUENCE` 和 `ROUTING_GENERATION_SEQUENCE` 在启动失败和普通清理后都会保留；启动成功时，临时 pin 的所有权转交 backend 清理。
 
 关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。

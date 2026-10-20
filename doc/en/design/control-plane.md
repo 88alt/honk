@@ -46,6 +46,8 @@ Startup keeps kernel admission closed until userspace can receive every redirect
 
 `RealEbpfBackend` owns aya programs, maps, links, persistent allocator handling, and real NFQUEUE integration. `MockEbpfBackend` provides the same control-plane interface without privileged kernel resources. A requested NFQUEUE path that cannot pass the post-lock fixed-queue preflight is disabled with a warning; failures after the service is admitted remain fatal.
 
+Object admission rejects implicit `ByName` map pinning before the process-name probe or any Aya loader runs. External objects must declare unpinned maps; core supplies all pin paths explicitly, including the persistent allocators, so no loader-created alias can escape startup rollback.
+
 If real-backend startup fails after pinning maps, a startup guard removes only the transient pins this attempt successfully created. Pins it could not replace and unrelated pre-existing pins are not claimed. `UDP_DECISION_SEQUENCE` and `ROUTING_GENERATION_SEQUENCE` survive failed startup as well as ordinary cleanup; a successful start transfers the transient pin ownership to backend cleanup.
 
 Shutdown reverses ownership before resources disappear: fence NFQUEUE, close datapath admission, reject new userspace work, cancel and drain held verdicts and UDP initializers, stop UDP drivers and removal processing, stop the interface watcher, detach BPF hooks, drain accepted flows for up to five seconds, retire the outbound runtime, stop NFQUEUE, stop the DNS controller and persistence, and clean up generation-owned BPF state. Ordinary cleanup preserves the pinned allocator. Listener and `daens`/link-pair ownership then falls out of scope.
