@@ -678,7 +678,8 @@ replay windows per destination), one Juicity bidirectional stream, one SOCKS5
 control connection with one relay socket, one Trojan associate stream, one
 non-connect UoT v2 stream or one H2MUX PacketAddr stream. `recv_packet` returns
 the real peer the server reports: an IPv4-mapped peer is IPv4, a domain source is
-accepted only as the captured domain and port, any other domain is dropped
+accepted only as the captured domain and port, any other domain (including an
+empty or non-UTF-8 name) is dropped
 without DNS, and stream protocols consume a dropped frame whole before reading
 the next; an unknown address type stays terminal. `send_packet` and `send_to`
 share one unboxed helper; `confirmed` reaches the transport only on each view's

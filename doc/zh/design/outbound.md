@@ -594,7 +594,7 @@ UoT v2/H2MUX 共用的通用 source transport（Hysteria2、TUIC 与 VLESS XUDP/
 变化重置 session ID、包计数器或重放窗口）、一条 Juicity 双向流、一条 SOCKS5
 控制连接加一个中继 socket、一条 Trojan associate 流、一条 non-connect UoT v2
 流或一条 H2MUX PacketAddr 流。`recv_packet` 返回服务端报告的真实 peer：IPv4 映射
-的 peer 规范化为 IPv4；域名来源仅在等于捕获的域名与端口时接受，其他域名不经
+的 peer 规范化为 IPv4；域名来源仅在等于捕获的域名与端口时接受，其他域名（包括空名或非 UTF-8 名字）不经
 DNS 直接丢弃，流式协议会整帧消费被丢弃的帧后再读下一帧；未知地址类型仍是终止性
 错误。`send_packet` 与 `send_to` 共用一个未装箱 helper；`confirmed` 只在各 view 的
 首个 datagram 上传给 transport，`admitted` 在 datagram 进入线路或 writer 队列时
