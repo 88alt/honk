@@ -1373,6 +1373,71 @@ async fn post_publication_datapath_failure_is_committed_degraded() {
     );
 }
 
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn mode_reset_failure_still_restarts_warm_and_syncs_probes() {
+    let cp = test_cp_with_nfq(true).await;
+    *cp.mode_state.as_ref().unwrap().write() = crate::mode::ModeState::native();
+    let mut config = score_reload_config(1);
+    config.global.udp_warm_node_count = 1;
+    assert!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await
+            .accepted()
+    );
+    let before_generation = cp.dns_controller.runtime_provider().current_generation();
+    let mut config = score_reload_config(2);
+    config.global.udp_warm_node_count = 1;
+    config.nodes[0].name = "renamed-probe-node".into();
+    let node_id = config.nodes[0].id;
+    config.groups[0].policy = GroupPolicy::URLTest;
+    config.groups[0].idle_timeout = Some(0);
+    config.groups[0].check_url = Some("http://127.0.0.1/probe".into());
+    {
+        let mut ebpf = cp.ebpf.write().await;
+        ebpf.clear_datapath_flags_write_log();
+        ebpf.arm_datapath_flags_write_fault(2).unwrap();
+    }
+    let drain = DrainTracker::new();
+    let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
+    let sources = source_update("# mode reset fails after commit\n");
+    assert_eq!(
+        cp.apply_sighup_config(
+            config,
+            Vec::new(),
+            &drain,
+            &mut authorizations,
+            Some(&sources),
+            None,
+        )
+        .await
+        .unwrap(),
+        ReloadOutcome::CommittedDegraded {
+            generation: before_generation.get() + 1,
+        }
+    );
+    let trace = cp.ebpf.read().await.datapath_flags_write_trace();
+    assert_eq!(trace.len(), 2, "failed mode reset must not reopen NFQUEUE");
+    assert!(trace[1].failed);
+    assert_eq!(trace[1].origin, DatapathFlagsWriteOrigin::Other);
+    assert!(!cp.is_datapath_healthy());
+    assert!(drain.should_reject());
+    assert!(cp.drain_tracker.should_reject());
+    assert!(cp.udp_warm_task.lock().await.is_some());
+    assert!(cp.selector_warm_task.lock().await.is_some());
+    assert_eq!(
+        cp.alive_set.registered_nodes()[&node_id].name,
+        "renamed-probe-node"
+    );
+    assert!(cp.alive_set.is_probe_suspended(node_id));
+    assert_eq!(
+        cp.alive_set.group_check_urls(),
+        vec![("score".into(), "http://127.0.0.1/probe".into())]
+    );
+    cp.stop_udp_warm_coordinator().await;
+    cp.stop_selector_warm_coordinator().await;
+}
+
 /// A fence failure rejects the reload before anything was torn down, so the
 /// datapath must stay healthy and keep admitting: restore old flags, reopen
 /// NFQUEUE, and leave both drain trackers alone.
@@ -3711,6 +3776,122 @@ async fn reload_retires_only_the_old_warm_generation_and_starts_the_new_one() {
 
     cp.stop_udp_warm_coordinator().await;
     new_generation.shutdown().await;
+}
+
+#[tokio::test]
+async fn stopping_warm_coordinators_does_not_wait_for_retention_cleanup() {
+    use honk_outbound::runtime::{NodeRuntime, ProtocolRuntime, QuicRuntimeClient};
+
+    #[derive(Clone, Debug, Default)]
+    struct GatedQuicRelease {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        finished: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl QuicRuntimeClient for GatedQuicRelease {
+        fn into_erased(self: Arc<Self>) -> Arc<dyn std::any::Any + Send + Sync> {
+            self
+        }
+
+        async fn force_close(&self) {
+            self.release.notify_one();
+        }
+
+        async fn release_warm(&self) {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.finished.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl honk_outbound::proxy::TcpOutbound for GatedQuicRelease {
+        async fn dial(
+            &self,
+            _node: &Node,
+            _target: std::net::SocketAddr,
+            _target_domain: Option<&str>,
+            _connect_timeout: Duration,
+        ) -> anyhow::Result<honk_outbound::proxy::ProxyStream> {
+            anyhow::bail!("warm-only test handler")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl honk_outbound::proxy::WarmableOutbound for GatedQuicRelease {
+        async fn warm(
+            &self,
+            runtime: Arc<NodeRuntime>,
+            _connect_timeout: Duration,
+            _requirement: honk_outbound::proxy::WarmRequirement,
+        ) -> anyhow::Result<()> {
+            let ProtocolRuntime::Quic(quic) = &runtime.runtime else {
+                anyhow::bail!("QUIC runtime required");
+            };
+            quic.client(|| async { Ok(Arc::new(self.clone())) }).await?;
+            Ok(())
+        }
+    }
+
+    for selector in [false, true] {
+        let mut node = canonical_socks5("warm-release", "127.0.0.1:443", 443, None);
+        node.outbound = honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Hysteria2);
+        node.id = node.derive_id();
+        let mut config = Config::default();
+        config.global.udp_warm_node_count = 1;
+        config.nodes = vec![node.clone()];
+        let mut cp = control_plane(config);
+        let gate = Arc::new(GatedQuicRelease::default());
+        let mut registry = ProxyRegistry::new();
+        registry.register(
+            honk_outbound::proxy::ProtocolEntry::new(NodeProtocol::Hysteria2, gate.clone())
+                .with_warmable(gate.clone()),
+        );
+        cp.proxy_registry = Arc::new(registry);
+        let generation = cp.runtime_registry.read().clone();
+        let warmed = if selector {
+            cp.proxy_registry
+                .warm_session(Arc::clone(&generation), node.id, Duration::from_secs(1))
+                .await
+        } else {
+            cp.proxy_registry
+                .warm_udp(Arc::clone(&generation), node.id, Duration::from_secs(1))
+                .await
+        };
+        assert!(matches!(
+            warmed.unwrap(),
+            honk_outbound::proxy::WarmOutcome::Ready
+        ));
+        if selector {
+            cp.selector_warm_ids.lock().insert(node.id);
+            cp.start_selector_warm_coordinator(Arc::clone(&generation))
+                .await;
+        } else {
+            cp.udp_warm_ids.lock().insert(node.id);
+            cp.start_udp_warm_coordinator(Arc::clone(&generation)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(1), gate.started.notified())
+            .await
+            .expect("coordinator must enter retained-client cleanup");
+        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            if selector {
+                cp.stop_selector_warm_coordinator().await
+            } else {
+                cp.stop_udp_warm_coordinator().await
+            }
+        })
+        .await;
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), gate.finished.notified())
+            .await
+            .expect("runtime-owned cleanup must survive coordinator cancellation");
+        cp.stop_udp_warm_coordinator().await;
+        cp.stop_selector_warm_coordinator().await;
+        generation.shutdown().await;
+        assert!(matches!(stopped, Ok(true)), "selector={selector}");
+    }
 }
 
 async fn ready_pool_reload_fixture() -> (
