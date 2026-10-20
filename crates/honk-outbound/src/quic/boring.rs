@@ -640,7 +640,7 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
         // ticket (server restart, different server behind the same SNI, or
         // a session minted under a pre-reload SSL_CTX) must not poison every
         // subsequent dial until process restart.
-        let mut resume_key = None;
+        let mut offered_session = None;
         let lookup_key = self.session_ticket_key(server_name);
         if !self.has_pin
             && let Some(&session) = SESSION_TICKETS.lock().get(&lookup_key)
@@ -650,7 +650,7 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
             };
             // Remember the exact entry offered so a failure evicts it only
             // if it is still the current one.
-            resume_key = Some((lookup_key.clone(), session));
+            offered_session = Some(session);
             tracing::debug!(server_name, "QUIC TLS: offering cached session ticket");
         }
         ssl.set_alpn_protos(&self.alpn_wire)
@@ -707,7 +707,7 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
             got_handshake_data: false,
             driven: false,
             cur_1rtt: None,
-            resume_key,
+            offered_session,
         }))
     }
 }
@@ -737,9 +737,8 @@ struct BoringQuicSession {
     driven: bool,
     /// Current 1-RTT (read, write) secrets for key updates.
     cur_1rtt: Option<(TrafficSecrets, TrafficSecrets)>,
-    /// Hostname whose cached ticket was offered on this handshake, plus the
-    /// offered session — evicted on failure only if still current.
-    resume_key: Option<(String, usize)>,
+    /// Offered session, evicted on failure only if still current.
+    offered_session: Option<usize>,
 }
 
 impl BoringQuicSession {
@@ -785,9 +784,10 @@ impl BoringQuicSession {
         // SSL_CTX). Evict ONLY if the entry is still the session we offered
         // — a concurrent connection may already have cached a fresh one,
         // and deleting that would repeat the failure once more.
-        if let Some((key, offered)) = self.resume_key.take() {
+        if let Some(offered) = self.offered_session.take() {
+            let key = &self.state.ticket_key;
             tracing::debug!(server_name = %key, error = %reason, "QUIC TLS: evicting rejected session ticket");
-            SESSION_TICKETS.lock().remove_if_current(&key, offered);
+            SESSION_TICKETS.lock().remove_if_current(key, offered);
         } else {
             tracing::debug!(error = %reason, "QUIC TLS: handshake failed with no ticket offered");
         }
