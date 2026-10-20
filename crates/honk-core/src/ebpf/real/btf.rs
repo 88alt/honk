@@ -7,6 +7,8 @@ pub(super) const BTF_HEADER_LEN: usize = 24;
 
 // Only raw BTF parses here; an ELF debug vmlinux needs HONK_VMLINUX_BTF pointed at its extracted `.BTF`.
 const VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
+// OpenWrt's vmlinux-btf package installs a detached raw BTF blob here for kernels built without BTF.
+const VMLINUX_BTF_FALLBACK_PATH: &str = "/usr/lib/debug/boot/vmlinux";
 const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
 
 pub(super) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
@@ -18,9 +20,13 @@ pub(super) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
             )
         })?
     } else {
-        std::fs::read(VMLINUX_BTF_PATH).with_context(|| {
-            format!("reading kernel BTF from {VMLINUX_BTF_PATH}; set {VMLINUX_BTF_ENV}")
-        })?
+        std::fs::read(VMLINUX_BTF_PATH)
+            .or_else(|_| std::fs::read(VMLINUX_BTF_FALLBACK_PATH))
+            .with_context(|| {
+                format!(
+                    "reading kernel BTF from {VMLINUX_BTF_PATH} or {VMLINUX_BTF_FALLBACK_PATH}; set {VMLINUX_BTF_ENV}"
+                )
+            })?
     };
     let btf = aya::Btf::parse(&data, Default::default()).context("parsing selected kernel BTF")?;
     Ok((data, btf))
