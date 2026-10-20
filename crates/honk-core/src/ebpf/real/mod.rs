@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 
 #[cfg(test)]
 use super::TcpSocketOwnership;
+use super::retirement::AuxDeleteTally;
 use super::{
     EbpfBackend, FlowExpiryHint, RETIRE_BATCH_CAPACITY, RETIRE_FENCE_MAP, RetireCounts,
     RetireError, RetireKind, RetireOutcome, RetireRequest, UDP_DECISION_SEQUENCE_MAP,
@@ -96,6 +97,7 @@ pub struct RealEbpfBackend {
     #[cfg(feature = "native-api")]
     receive_trace_attempted: bool,
     udp_staging_quiesce_incomplete: bool,
+    aux_deletes: AuxDeleteTally,
 }
 
 /// Find cgroup2 in the calling thread's mount namespace, not its thread-group leader's.
@@ -308,12 +310,28 @@ impl RealEbpfBackend {
         chunk_size: usize,
         visit: &mut ChunkVisitor<'_, K, V>,
     ) -> anyhow::Result<()> {
+        self.flow_scan_from(
+            name,
+            chunk_size,
+            &mut crate::ebpf::FlowScanCursor::default(),
+            visit,
+        )
+    }
+
+    fn flow_scan_from<K: Pod, V: Pod>(
+        &self,
+        name: &str,
+        chunk_size: usize,
+        cursor: &mut crate::ebpf::FlowScanCursor,
+        visit: &mut ChunkVisitor<'_, K, V>,
+    ) -> anyhow::Result<()> {
         let mut projected = Vec::with_capacity(syscall::BPF_BATCH_CHUNK);
         if syscall::bpf_lookup_batch_scan_cb_flags::<K, FlowMapValue<V>>(
             self.bpf()?,
             &self.cap_flow_lookup_batch,
             name,
             aya_obj::generated::BPF_F_LOCK as u64,
+            &mut cursor.batch,
             &mut |chunk| {
                 projected.clear();
                 projected.extend(chunk.iter().map(|(key, value)| (*key, value.value)));
@@ -324,15 +342,25 @@ impl RealEbpfBackend {
         }
         // backend R excludes userspace reclamation; kernel never deletes tuple
         // elements. Enumerate keys only, then copy each payload under its lock.
-        let map = self.hash_map::<K, FlowMapValue<V>>(name)?;
+        anyhow::ensure!(
+            core::mem::size_of::<K>() == 40,
+            "tuple scan key must be 40 bytes"
+        );
+        let fd = syscall::map_fd(self.bpf()?, name)?;
+        let mut next = match cursor.next_key.take() {
+            Some(key) => Some(key),
+            None => syscall::next_flow_key(fd, None)?,
+        };
         projected.clear();
-        for key in map.keys() {
-            let key =
-                key.map_err(|error| anyhow::anyhow!("map '{name}' key iteration: {error}"))?;
+        while let Some(raw) = next {
+            let key = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast::<K>()) };
+            // Save an unvisited key, not one this sweep may retire after backend R.
+            next = syscall::next_flow_key(fd, Some(&raw))?;
             if let Some(value) = self.flow_lookup(name, &key)? {
                 projected.push((key, value));
                 if projected.len() == chunk_size.max(1) {
                     if !visit(&projected) {
+                        cursor.next_key = next;
                         return Ok(());
                     }
                     projected.clear();
@@ -343,6 +371,35 @@ impl RealEbpfBackend {
             visit(&projected);
         }
         Ok(())
+    }
+
+    /// Sum each slot of a per-CPU `u64` array over all CPUs; a map the object
+    /// lacks reads as zero.
+    fn percpu_totals<const N: usize>(
+        &self,
+        name: &str,
+        slots: [u32; N],
+    ) -> anyhow::Result<[u64; N]> {
+        let mut totals = [0u64; N];
+        let Some(map) = self.bpf()?.map(name) else {
+            return Ok(totals);
+        };
+        let array = AyaPerCpuArray::<_, u64>::try_from(map)
+            .map_err(|error| anyhow::anyhow!("map '{name}': {error}"))?;
+        for (total, slot) in totals.iter_mut().zip(slots) {
+            match array.get(&slot, 0) {
+                Ok(values) => {
+                    *total = values
+                        .iter()
+                        .fold(0u64, |sum, value| sum.wrapping_add(*value));
+                }
+                Err(MapError::KeyNotFound) => {}
+                Err(error) => {
+                    return Err(anyhow::anyhow!("map '{name}' get[{slot}]: {error}"));
+                }
+            }
+        }
+        Ok(totals)
     }
 
     fn hash_remove<K: Pod, V: Pod>(&mut self, name: &str, key: &K) -> anyhow::Result<()> {
@@ -617,7 +674,19 @@ impl EbpfBackend for RealEbpfBackend {
         token: u32,
         transition: UdpDecisionTransition,
     ) -> anyhow::Result<UdpDecisionCommitResult> {
-        self.commit_udp_fenced(key, token, transition)
+        if matches!(transition, UdpDecisionTransition::ActivateDirect(_)) {
+            self.activate_udp_direct(key, token, transition)
+        } else {
+            self.commit_udp_fenced(key, token, transition)
+        }
+    }
+
+    fn commit_udp_batch(
+        &mut self,
+        requests: &[crate::ebpf::UdpDecisionCommit],
+        visit: &mut crate::ebpf::UdpCommitVisit<'_>,
+    ) -> anyhow::Result<()> {
+        self.commit_udp_decisions(requests, visit)
     }
 
     fn retire_batch(
@@ -805,57 +874,57 @@ impl EbpfBackend for RealEbpfBackend {
     fn redirect_track_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut crate::ebpf::FlowScanCursor,
         visit: &mut crate::ebpf::RedirectTrackChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        self.flow_for_each_chunk("REDIRECT_TRACK", chunk_size, visit)
+        self.flow_scan_from("REDIRECT_TRACK", chunk_size, cursor, visit)
     }
 
     fn routing_handoff_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut crate::ebpf::FlowScanCursor,
         visit: &mut crate::ebpf::RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        self.flow_for_each_chunk("ROUTING_HANDOFF_MAP", chunk_size, visit)
+        self.flow_scan_from("ROUTING_HANDOFF_MAP", chunk_size, cursor, visit)
     }
 
     fn conn_state_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut crate::ebpf::FlowScanCursor,
         visit: &mut crate::ebpf::ConnStateChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        self.flow_for_each_chunk("CONN_STATE_MAP", chunk_size, visit)
+        self.flow_scan_from("CONN_STATE_MAP", chunk_size, cursor, visit)
     }
 
     fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {
-        let bpf = self.bpf()?;
-        let Some(map) = bpf.map("CONN_STATE_OCCUPANCY") else {
-            return Ok((0, 0));
-        };
-        let array = AyaPerCpuArray::<_, u64>::try_from(map)
-            .map_err(|error| anyhow::anyhow!("map 'CONN_STATE_OCCUPANCY': {error}"))?;
-        let mut totals = [0u64; 2];
-        for (index, slot) in [
-            honk_ebpf_common::conn::OCCUPANCY_INSERTS,
-            honk_ebpf_common::conn::OCCUPANCY_EBPF_DELETES,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            match array.get(&slot, 0) {
-                Ok(values) => {
-                    totals[index] = values
-                        .iter()
-                        .fold(0u64, |total, value| total.wrapping_add(*value));
-                }
-                Err(MapError::KeyNotFound) => {}
-                Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "map 'CONN_STATE_OCCUPANCY' get[{slot}]: {error}"
-                    ));
-                }
-            }
-        }
-        Ok((totals[0], totals[1]))
+        let [inserts, deletes] = self.percpu_totals(
+            "CONN_STATE_OCCUPANCY",
+            [
+                honk_ebpf_common::conn::OCCUPANCY_INSERTS,
+                honk_ebpf_common::conn::OCCUPANCY_EBPF_DELETES,
+            ],
+        )?;
+        Ok((inserts, deletes))
+    }
+
+    fn aux_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        let [redirect, handoff] = self.percpu_totals(
+            "AUX_OCCUPANCY",
+            [
+                honk_ebpf_common::conn::AUX_OCCUPANCY_REDIRECT_INSERTS,
+                honk_ebpf_common::conn::AUX_OCCUPANCY_HANDOFF_INSERTS,
+            ],
+        )?;
+        Ok((
+            redirect.saturating_sub(self.aux_deletes.redirect),
+            handoff.saturating_sub(self.aux_deletes.handoff),
+        ))
+    }
+
+    fn set_admission_pressure(&mut self, pressured: bool) -> anyhow::Result<()> {
+        self.array_set("ADMISSION_PRESSURE", 0, &u32::from(pressured))
     }
 
     fn set_outbound_alive(
@@ -899,35 +968,20 @@ impl EbpfBackend for RealEbpfBackend {
     }
 
     fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
-        // Ensure clsact qdisc exists on dae0 and dae0peer before attaching the
-        // TC programs; otherwise netlink returns EINVAL.
-        for iface in &["dae0", "dae0peer"] {
-            if let Err(e) = aya::programs::tc::qdisc_add_clsact(iface)
-                && !e.to_string().contains("File exists")
-            {
-                debug!("failed to add clsact qdisc to {}: {}", iface, e);
-            }
-        }
-
-        // dae0_ingress runs on dae0 (host namespace) and rewrites reply traffic
-        // back to the original LAN interface.
-        match Self::attach_tc(self.bpf_mut()?, "dae0_ingress", "dae0") {
-            Ok(id) => {
-                let p: &mut aya::programs::SchedClassifier = self
-                    .bpf_mut()?
-                    .program_mut("dae0_ingress")
-                    .ok_or_else(|| anyhow::anyhow!("dae0_ingress program disappeared"))?
-                    .try_into()?;
-                self.dae0_ingress_link = Some(
-                    p.take_link(id)
-                        .map_err(|e| anyhow::anyhow!("failed to take dae0_ingress link: {}", e))?,
-                );
-                info!("dae0_ingress attached and link held");
-            }
-            Err(e) => {
-                warn!("dae0_ingress attach failed (non-fatal): {}", e);
-            }
-        }
+        // Both LAN and WAN-only deployments need this link to deliver proxied replies.
+        let id = Self::attach_tc(self.bpf_mut()?, "dae0_ingress", "dae0")
+            .map_err(|error| anyhow::anyhow!("attach dae0_ingress: {error}"))?;
+        let program: &mut aya::programs::SchedClassifier = self
+            .bpf_mut()?
+            .program_mut("dae0_ingress")
+            .ok_or_else(|| anyhow::anyhow!("dae0_ingress program disappeared"))?
+            .try_into()?;
+        self.dae0_ingress_link = Some(
+            program
+                .take_link(id)
+                .map_err(|error| anyhow::anyhow!("take dae0_ingress link: {error}"))?,
+        );
+        info!("dae0_ingress attached and link held");
 
         Ok(())
     }
@@ -935,17 +989,10 @@ impl EbpfBackend for RealEbpfBackend {
     fn attach_dae0peer_ingress(&mut self) -> anyhow::Result<()> {
         // dae0peer lives in the daens namespace; enter it with a scoped
         // `with_daens_netns` switch for the attach (the process otherwise
-        // stays in the host netns).  The netlink sockets used by
-        // qdisc_add_clsact/attach_tc resolve interface names in the netns
-        // they are created in, so both must run inside daens.  The link
-        // handle persists after switching back to the host netns.
+        // stays in the host netns). Interface names for the TCX link resolve
+        // in the attaching thread's netns; the link handle persists after
+        // switching back to the host netns.
         crate::daens::with_daens_netns("attach dae0peer_ingress", move || {
-            if let Err(error) = aya::programs::tc::qdisc_add_clsact("dae0peer")
-                && !error.to_string().contains("File exists")
-            {
-                debug!("failed to add clsact qdisc to dae0peer: {}", error);
-            }
-
             let id = Self::attach_tc(self.bpf_mut()?, "dae0peer_ingress", "dae0peer")
                 .map_err(|error| anyhow::anyhow!("attach dae0peer_ingress: {error}"))?;
             let program: &mut aya::programs::SchedClassifier = self

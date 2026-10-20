@@ -476,23 +476,28 @@ fn flow_owners() -> (ConnState, RoutingHandoffEntry, RedirectEntry) {
 fn deletes_are_counted_for_success_and_partial_failure() {
     let counts = RetireCounts {
         conn: 3,
+        redirect: 2,
         handoff: 5,
-        ..Default::default()
     };
-    assert_eq!(conn_deletes(&Ok(counts)), 3);
-    assert_eq!(
-        conn_deletes(&Err(RetireError {
+    let mut tally = AuxDeleteTally::default();
+    for result in [
+        Ok(counts),
+        Err(RetireError {
             counts,
             source: anyhow::anyhow!("fault after partial progress"),
-        })),
-        3,
-    );
+        }),
+    ] {
+        assert_eq!(conn_deletes(&result), 3);
+        tally.record(&result);
+    }
+    assert_eq!((tally.redirect, tally.handoff), (4, 10));
 }
 
 #[test]
 fn only_removed_absent_or_superseded_owners_are_settled() {
     use UdpDecisionCommitResult::*;
     assert!(!RetireOutcome::default().settled());
+    assert!(RetireOutcome::ConnRetired.settled());
     for (result, settled) in [
         (Applied, true),
         (Missing, true),
@@ -523,10 +528,10 @@ fn flow_plan_removes_auxiliaries_with_conn_and_refuses_foreign_owners() {
         conn: 1,
         ..Default::default()
     };
-    assert_eq!(plan.outcome(removed), UdpDecisionCommitResult::Applied);
+    assert_eq!(plan.outcome(removed), RetireOutcome::ConnRetired);
     assert_eq!(
         plan.outcome(RetireCounts::default()),
-        UdpDecisionCommitResult::Missing,
+        RetireOutcome::Done(UdpDecisionCommitResult::Missing),
     );
 
     let plan = plan_retirement(&request, &owners(Some(&state), None, None)).unwrap();
@@ -573,7 +578,7 @@ fn auxiliary_plans_decide_from_their_own_snapshot() {
     assert!(plan.redirect && !plan.conn && !plan.handoff);
     assert_eq!(
         plan.outcome(RetireCounts::default()),
-        UdpDecisionCommitResult::Applied,
+        RetireOutcome::Done(UdpDecisionCommitResult::Applied),
     );
     let newer = RedirectEntry {
         incarnation: 2,

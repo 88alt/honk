@@ -1,7 +1,7 @@
 //! TC egress programs ported from daed/wing/dae-core/control/kern/tproxy.c
 //!
 //! Contains:
-//! - `tproxy_lan_egress_l2` / `tproxy_lan_egress_l3` — update reverse conn state
+//! - `tproxy_lan_egress_l2` / `tproxy_lan_egress_l3` — refresh forward lifecycle from replies
 //! - `tproxy_wan_egress_l2` / `tproxy_wan_egress_l3` — routing + redirect to control plane
 
 #![allow(clippy::too_many_arguments)]
@@ -35,10 +35,13 @@ use crate::{
     },
     route::{OUTBOUND_BLOCK, OUTBOUND_DIRECT},
     socket_identity,
-    transport::{ETH_HLEN, ETH_P_IP, IPPROTO_TCP, IPPROTO_UDP, PASS_NDP_REDIRECT, parse_packet},
+    transport::{
+        ETH_HLEN, ETH_P_IP, IPPROTO_TCP, IPPROTO_UDP, PARSE_FRAGMENT, PASS_NDP_REDIRECT,
+        parse_packet,
+    },
 };
 
-use crate::action::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict, flatten};
+use crate::action::{TC_ACT_OK, TC_ACT_SHOT, TC_ACT_UNSPEC, Verdict, flatten};
 
 /// Ingress ifindex for locally-generated packets (not from any interface).
 const NOWHERE_IFINDEX: u32 = 0;
@@ -56,15 +59,13 @@ fn skb_mark(ctx: &TcContext) -> u32 {
     unsafe { (*ctx.skb.skb).mark }
 }
 
-const DOMAIN_DNS: u32 = 1;
 const DOMAIN_UDP_OTHER: u32 = 2;
 const DOMAIN_DEFAULT: u32 = 0;
 
 /// Check whether the selected outbound is currently alive.
 ///
-/// DNS UDP (dport == 53) is always considered alive because user-space DNS
-/// routing is responsible for fallback/rejection.  For all other traffic the
-/// function consults `OUTBOUND_CONNECTIVITY_MAP`.
+/// DNS uses userspace fallback/rejection regardless of transport, so destination
+/// port 53 is exempt. Other traffic consults `OUTBOUND_CONNECTIVITY_MAP`.
 ///
 /// Map key layout (mirrors C):
 ///   key = outbound * 6 + domain_idx * 2 + ip_idx
@@ -72,13 +73,12 @@ const DOMAIN_DEFAULT: u32 = 0;
 ///   - ip_idx: 0 = IPv4, 1 = IPv6
 #[inline(always)]
 pub fn wan_outbound_is_alive(ctx: &TcContext, outbound: u8, l4proto: u8, dport: u16) -> bool {
-    if l4proto == IPPROTO_UDP && dport == 53u16 {
+    if dport == 53 {
         return true;
     }
 
-    let domain_idx: u32 = match (l4proto, dport) {
-        (IPPROTO_UDP, 53) => DOMAIN_DNS,
-        (IPPROTO_UDP, _) => DOMAIN_UDP_OTHER,
+    let domain_idx: u32 = match l4proto {
+        IPPROTO_UDP => DOMAIN_UDP_OTHER,
         _ => DOMAIN_DEFAULT,
     };
 
@@ -127,8 +127,8 @@ pub fn redirect_to_control_plane_egress() -> Verdict {
     Ok(unsafe { bpf_redirect(param.dae0_ifindex, 0) } as c_long)
 }
 
-/// LAN egress: update reverse-direction connection tracking state so the
-/// server/local FIN/RST keeps the client-side lifecycle in sync.
+/// LAN egress: server/local FIN/RST must keep the existing client-side TCP
+/// lifecycle in sync; unsolicited reverse SYNs have no publication authority.
 ///
 /// Also drops NDP REDIRECT packets originated from localhost to prevent
 /// kernel ND proxy from interfering with dae's routing.
@@ -147,32 +147,22 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         if ret < 0 || (ret == PASS_NDP_REDIRECT && skb_ingress_ifindex(ctx) == NOWHERE_IFINDEX) {
             return Err(TC_ACT_SHOT);
         }
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     // Broadcast/multicast (DHCPOFFER, mDNS, NetBIOS) is never conn-tracked.
     if crate::transport::dst_is_special(pkt, link_h_len) {
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     match pkt.l4proto {
         IPPROTO_TCP => {
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-            let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
-                &reversed_key,
-                crate::contrack::tcp::TcpSynRole::ObservedReverse,
-            );
-            if is_new_tcp_connection(&pkt.tcph) {
-                if !tcp_publisher.acquire(ctx, &pkt.tcph) {
-                    return Err(TC_ACT_SHOT);
-                }
-                pkt.incarnation = tcp_publisher.incarnation;
-            }
-            mark_tcp_seen(
+            let tcp_publisher = crate::contrack::tcp::TcpPublisher::new(&reversed_key);
+            let seen = mark_tcp_seen(
                 &reversed_key,
                 &pkt.tcph,
-                1u8,  // is_wan_ingress_direction
                 None, // outbound
                 None, // mark
                 None, // must
@@ -183,7 +173,7 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
                 0,
                 &tcp_publisher,
             );
-            if crate::contrack::tuple_unavailable(&reversed_key) {
+            if seen.is_none() && crate::contrack::tuple_unavailable(&reversed_key) {
                 return Err(TC_ACT_SHOT);
             }
         }
@@ -196,42 +186,23 @@ pub fn do_tproxy_lan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
             }
             // Skip DNS traffic to reduce state churn.
             if u16::from_be_bytes(pkt.udph.src) == 53 || u16::from_be_bytes(pkt.udph.dst) == 53 {
-                return Err(TC_ACT_PIPE);
+                return Err(TC_ACT_UNSPEC);
             }
             let mut reversed_key: TuplesKey = unsafe { mem::zeroed() };
             copy_reversed_tuples(&pkt.tuples.five, &mut reversed_key);
-            if crate::contrack::tuple_unavailable(&reversed_key) {
-                return Err(TC_ACT_SHOT);
-            }
             // A reply leaving dae0 answers a flow honk already owns. Creating a
             // WAN-direction entry for a peer the client never contacted would
             // make the client's first packet to that peer bypass the proxy.
             let dae0_ifindex = PARAM.load().dae0_ifindex;
-            if dae0_ifindex != 0 && skb_ingress_ifindex(ctx) == dae0_ifindex {
-                let _ = lookup_udp_seen(&reversed_key);
-            } else {
-                mark_udp_seen(
-                    &reversed_key,
-                    1u8,  // is_wan_ingress_direction
-                    None, // outbound
-                    None, // mark
-                    None, // must
-                    None, // mac
-                    0,    // dscp
-                    None, // pname
-                    0,    // pid
-                    0,    // trace_id
-                    0,    // routing_meta_flags
-                );
-            }
-            if crate::contrack::tuple_unavailable(&reversed_key) {
+            let learn = dae0_ifindex == 0 || skb_ingress_ifindex(ctx) != dae0_ifindex;
+            if !crate::contrack::udp::reverse_udp_available(&reversed_key, learn) {
                 return Err(TC_ACT_SHOT);
             }
         }
         _ => {}
     }
 
-    Ok(TC_ACT_PIPE)
+    Ok(TC_ACT_UNSPEC)
 }
 
 /// WAN egress TCP handler: route new connections and cache the decision;
@@ -272,7 +243,7 @@ fn do_tproxy_wan_egress_tcp(
         if let Some(pid_pname) = pid_pname_opt {
             let param = PARAM.load();
             if pid_pname.pid == param.control_plane_pid {
-                return Err(TC_ACT_OK);
+                return Err(TC_ACT_UNSPEC);
             }
 
             handoff_pname = Some(&pid_pname.pname);
@@ -336,7 +307,6 @@ fn do_tproxy_wan_egress_tcp(
         let tcp_conn = mark_tcp_seen(
             &tuples.five,
             tcph,
-            0u8, // is_wan_ingress_direction
             outbound_ptr,
             mark_ptr,
             must_ptr,
@@ -353,7 +323,7 @@ fn do_tproxy_wan_egress_tcp(
                 return Err(TC_ACT_SHOT);
             }
             if outbound == OUTBOUND_DIRECT && mark == 0 {
-                return Err(TC_ACT_OK);
+                return Err(TC_ACT_UNSPEC);
             }
             return Err(TC_ACT_SHOT);
         }
@@ -363,7 +333,6 @@ fn do_tproxy_wan_egress_tcp(
         let tcp_conn = mark_tcp_seen(
             &tuples.five,
             tcph,
-            0u8,  // is_wan_ingress_direction
             None, // outbound
             None, // mark
             None, // must
@@ -388,14 +357,14 @@ fn do_tproxy_wan_egress_tcp(
                 pkt.incarnation = conn.incarnation;
             } else {
                 // No cached routing — direct connection, pass through.
-                return Err(TC_ACT_OK);
+                return Err(TC_ACT_UNSPEC);
             }
         } else {
             if wire_pure_syn || crate::contrack::tuple_unavailable(&tuples.five) {
                 return Err(TC_ACT_SHOT);
             }
             // No state at all — pass through.
-            return Err(TC_ACT_OK);
+            return Err(TC_ACT_UNSPEC);
         }
     }
 
@@ -408,7 +377,8 @@ fn do_tproxy_wan_egress_tcp(
         return Err(TC_ACT_SHOT);
     }
 
-    if !wan_outbound_is_alive(ctx, outbound, IPPROTO_TCP, tuples.five.dst_port) {
+    if fresh_publication && !wan_outbound_is_alive(ctx, outbound, IPPROTO_TCP, tuples.five.dst_port)
+    {
         return Err(TC_ACT_SHOT);
     }
 
@@ -557,7 +527,7 @@ fn fast_path_decision(
         (*ctx.skb.skb).cb[1] = IPPROTO_UDP as u32;
         (*ctx.skb.skb).cb[2] = dns_route_mark;
         (*ctx.skb.skb).cb[3] = trace_id;
-        (*ctx.skb.skb).cb[4] = 0;
+        (*ctx.skb.skb).cb[4] = crate::sk_lookup::udp_listener_marker(&tuples.five);
     }
 
     // Must UDP53 ownership (including the direct mark index) is entirely
@@ -634,7 +604,7 @@ fn do_tproxy_wan_egress_udp(
     if let Some(pid_pname) = pid_pname_opt {
         let param = PARAM.load();
         if pid_pname.pid == param.control_plane_pid {
-            return Err(TC_ACT_OK);
+            return Err(TC_ACT_UNSPEC);
         }
     }
 
@@ -650,7 +620,7 @@ fn do_tproxy_wan_egress_udp(
             return Err(TC_ACT_SHOT);
         }
         if conn_state.is_wan_ingress_direction != 0 {
-            return Err(TC_ACT_OK);
+            return Err(TC_ACT_UNSPEC);
         }
 
         let meta_raw = unsafe { conn_state.meta.raw };
@@ -752,13 +722,13 @@ fn do_tproxy_wan_egress_udp(
             routing_meta_flags,
         );
         if state.is_none() {
-            if crate::contrack::tuple_unavailable(&tuples.five)
+            if crate::maps::tuple_retiring(&tuples.five)
                 || crate::maps::CONN_STATE_MAP.get_ptr(&tuples.five).is_some()
             {
                 return Err(TC_ACT_SHOT);
             }
             if outbound == OUTBOUND_DIRECT && mark == 0 {
-                return Err(TC_ACT_OK);
+                return Err(TC_ACT_UNSPEC);
             }
             return Err(TC_ACT_SHOT);
         }
@@ -799,8 +769,11 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     // that ctx.skb.skb is a valid non-null pointer.
     let ret = parse_packet(ctx, link_h_len, pkt);
     if ret != 0 {
+        if ret == PARSE_FRAGMENT as c_long && crate::fragment::condemned(pkt) {
+            return Err(TC_ACT_SHOT);
+        }
         // Unsupported or malformed traffic is left untouched.
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     // An owned queue carrier must not escape through a WAN-role bridge port either.
@@ -811,12 +784,12 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         return Err(TC_ACT_SHOT);
     }
     if !crate::maps::datapath_ready() {
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     // Broadcast/multicast is never re-routed into daens.
     if crate::transport::dst_is_special(pkt, link_h_len) {
-        return Err(TC_ACT_OK);
+        return Err(TC_ACT_UNSPEC);
     }
 
     // Bypass locally-generated traffic destined for the honk host itself.
@@ -827,7 +800,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         let dst_ip = pkt.tuples.five.dst_ip;
         let dst_ipv4 = unsafe { dst_ip.u6_addr32[3] };
         if dst_ip.is_v4_mapped() && dst_ipv4 == param.local_ip {
-            return Err(TC_ACT_OK);
+            return Err(TC_ACT_UNSPEC);
         }
     }
 
@@ -850,10 +823,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if pkt.l4proto != IPPROTO_TCP && crate::contrack::tuple_unavailable(&pkt.tuples.five) {
         return Err(TC_ACT_SHOT);
     }
-    let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(
-        &pkt.tuples.five,
-        crate::contrack::tcp::TcpSynRole::InterceptedForward,
-    );
+    let mut tcp_publisher = crate::contrack::tcp::TcpPublisher::new(&pkt.tuples.five);
     if pkt.l4proto == IPPROTO_TCP && is_new_tcp_connection(&pkt.tcph) {
         if !tcp_publisher.acquire(ctx, &pkt.tcph) {
             return Err(TC_ACT_SHOT);
@@ -864,7 +834,7 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     match pkt.l4proto {
         IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt, &tcp_publisher),
         IPPROTO_UDP => do_tproxy_wan_egress_udp(ctx, link_h_len, pkt),
-        _ => Ok(TC_ACT_OK),
+        _ => Ok(TC_ACT_UNSPEC),
     }
 }
 
@@ -885,11 +855,11 @@ pub fn lan_egress_l3(ctx: *mut __sk_buff) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l2(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 14))
+    crate::fragment::record(flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 14)))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l3(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 0))
+    crate::fragment::record(flatten(do_tproxy_wan_egress(&TcContext::new(ctx), 0)))
 }

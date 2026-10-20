@@ -8,6 +8,12 @@ use honk_ebpf_common::conn::{
 };
 use honk_ebpf_common::{RedirectEntry, RedirectTuple, TuplesKey};
 
+mod admission;
+mod cadence;
+mod cursor;
+mod redirect_retention;
+mod telemetry;
+
 const IPPROTO_TCP: u8 = 6;
 
 #[test]
@@ -134,7 +140,7 @@ fn test_pressure_state_enter_on_overflow_delta() {
     let mut state = PressureState::default();
     assert!(!state.active);
 
-    update_pressure_state(&mut state, true, 0.0);
+    update_pressure_state(&mut state, true, [0.0; 3]);
     assert!(state.active);
     assert_eq!(state.quiet_rounds, 0);
 }
@@ -144,7 +150,11 @@ fn test_pressure_state_enter_on_high_watermark() {
     let mut state = PressureState::default();
     assert!(!state.active);
 
-    update_pressure_state(&mut state, false, CONN_STATE_PRESSURE_WATERMARK + 0.01);
+    update_pressure_state(
+        &mut state,
+        false,
+        [CONN_STATE_PRESSURE_WATERMARK + 0.01, 0.0, 0.0],
+    );
     assert!(state.active);
     assert_eq!(state.quiet_rounds, 0);
 }
@@ -153,7 +163,11 @@ fn test_pressure_state_enter_on_high_watermark() {
 fn test_pressure_state_stays_inactive_below_watermark() {
     let mut state = PressureState::default();
     for _ in 0..10 {
-        update_pressure_state(&mut state, false, CONN_STATE_PRESSURE_WATERMARK - 0.01);
+        update_pressure_state(
+            &mut state,
+            false,
+            [CONN_STATE_PRESSURE_WATERMARK - 0.01, 0.0, 0.0],
+        );
         assert!(!state.active);
     }
 }
@@ -171,7 +185,7 @@ fn test_pressure_state_exit_after_quiet_rounds() {
     // consecutive ticks → exit.
     for _ in 0..PRESSURE_EXIT_ROUNDS {
         assert!(state.active);
-        update_pressure_state(&mut state, false, 0.0);
+        update_pressure_state(&mut state, false, [0.0; 3]);
     }
     assert!(!state.active);
 }
@@ -186,16 +200,16 @@ fn test_pressure_state_overflow_resets_quiet_counter() {
     };
 
     // A new overflow restarts the quiet-period countdown.
-    update_pressure_state(&mut state, true, 0.0);
+    update_pressure_state(&mut state, true, [0.0; 3]);
     assert!(state.active);
     assert_eq!(state.quiet_rounds, 0);
 
     // And it still takes the full run of quiet ticks to exit.
     for _ in 0..PRESSURE_EXIT_ROUNDS - 1 {
-        update_pressure_state(&mut state, false, 0.0);
+        update_pressure_state(&mut state, false, [0.0; 3]);
         assert!(state.active);
     }
-    update_pressure_state(&mut state, false, 0.0);
+    update_pressure_state(&mut state, false, [0.0; 3]);
     assert!(!state.active);
 }
 
@@ -203,7 +217,7 @@ fn test_pressure_state_overflow_resets_quiet_counter() {
 fn test_pressure_state_inactive_stays_inactive_without_overflow() {
     let mut state = PressureState::default();
     for _ in 0..10 {
-        update_pressure_state(&mut state, false, 0.0);
+        update_pressure_state(&mut state, false, [0.0; 3]);
         assert!(!state.active);
     }
 }
@@ -280,8 +294,10 @@ async fn aux_pressure_detects_bounded_scan_and_recovers() -> anyhow::Result<()> 
         .await?;
     assert_eq!(second.deleted, 1);
     assert_eq!(second.scanned, 1);
-    assert!(second.complete);
-    assert!(!aux_scan_is_pressured(second.scanned, second.complete));
+    assert!(
+        !second.complete,
+        "a resumed tail is not an exact map cardinality"
+    );
 
     Ok(())
 }
@@ -306,7 +322,7 @@ async fn map_health_warnings_rearm_after_pressure_ends() {
             scans
         };
         let mut health = HealthLatches::default();
-        for (utilization, pressure, scans, aux_expected, occupancy_expected) in [
+        for (episode, (utilization, pressure, scans, aux_expected, occupancy_expected)) in [
             (
                 CONN_STATE_PRESSURE_WATERMARK,
                 true,
@@ -324,12 +340,29 @@ async fn map_health_warnings_rearm_after_pressure_ends() {
                 true,
                 true,
             ),
-        ] {
+            (0.1, true, scans(high, true), true, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut utilizations = [utilization, 0.0, 0.0];
+            if pressure {
+                utilizations[1 + map as usize] = 0.9;
+            }
             janitor
-                .check_map_health(utilization, pressure, scans, &mut health)
+                .check_map_health(utilizations, scans, &mut health)
                 .await;
             assert_eq!(health.aux_pressure_warned[map as usize], aux_expected);
             assert_eq!(health.occupancy_warned, occupancy_expected);
+            assert_eq!(
+                (
+                    health.overflow_warned,
+                    health.udp_pressure_warned,
+                    health.tcp_pressure_warned
+                ),
+                (episode == 0, episode == 0, episode == 0),
+                "unchanged overflow history must not be promoted during an occupancy episode",
+            );
             for key in BpfStatsKey::ALL {
                 assert_eq!(health.last_failures[key as usize], 101 + key as u64);
             }
@@ -480,26 +513,34 @@ async fn pinned_tcp_prefix_does_not_consume_candidate_budget() -> anyhow::Result
         // Replacing values below does not insert/remove keys or reorder buckets.
         let mut order = Vec::new();
         match map {
-            "conn" => model.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
-                order.extend(chunk.iter().map(|(key, _)| *key));
-                true
-            })?,
-            "redirect" => {
-                model.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+            "conn" => model.conn_state_for_each_chunk(
+                JANITOR_SCAN_CHUNK,
+                &mut crate::ebpf::FlowScanCursor::default(),
+                &mut |chunk| {
+                    order.extend(chunk.iter().map(|(key, _)| *key));
+                    true
+                },
+            )?,
+            "redirect" => model.redirect_track_for_each_chunk(
+                JANITOR_SCAN_CHUNK,
+                &mut crate::ebpf::FlowScanCursor::default(),
+                &mut |chunk| {
                     order.extend(
                         chunk
                             .iter()
                             .map(|(key, _)| test_tuple(key.src_port, IPPROTO_TCP)),
                     );
                     true
-                })?
-            }
-            "handoff" => {
-                model.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+                },
+            )?,
+            "handoff" => model.routing_handoff_for_each_chunk(
+                JANITOR_SCAN_CHUNK,
+                &mut crate::ebpf::FlowScanCursor::default(),
+                &mut |chunk| {
                     order.extend(chunk.iter().map(|(key, _)| *key));
                     true
-                })?
-            }
+                },
+            )?,
             _ => unreachable!(),
         }
         let stale = order[JANITOR_BASE_CANDIDATES];
@@ -536,7 +577,7 @@ async fn pinned_tcp_prefix_does_not_consume_candidate_budget() -> anyhow::Result
         match map {
             "conn" => {
                 let (deleted, scanned) = janitor
-                    .cleanup_conn_state_at(now_ns, &mut gauge, ((0, 0), 0), tuning)
+                    .cleanup_conn_state_at(now_ns, &mut gauge, Some(((0, 0), 0)), tuning)
                     .await?;
                 assert_eq!((deleted, scanned), (1, order.len()));
                 assert_eq!(gauge.estimate(0, 0, 0), order.len() as u64);
@@ -671,7 +712,7 @@ async fn retirement_error_keeps_actual_partial_map_counts() -> anyhow::Result<()
         .cleanup_conn_state_at(
             UDP_CONN_STATE_TIMEOUT_NS + 1,
             &mut gauge,
-            ((10, 0), 0),
+            Some(((10, 0), 0)),
             scan_tuning(0.0),
         )
         .await
@@ -688,13 +729,14 @@ async fn retirement_error_keeps_actual_partial_map_counts() -> anyhow::Result<()
         }
     );
     let mut remaining = 0;
-    backend
-        .read()
-        .await
-        .conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, &mut |chunk| {
+    backend.read().await.conn_state_for_each_chunk(
+        JANITOR_SCAN_CHUNK,
+        &mut crate::ebpf::FlowScanCursor::default(),
+        &mut |chunk| {
             remaining += chunk.len();
             true
-        })?;
+        },
+    )?;
     assert_eq!(remaining, 1);
     Ok(())
 }

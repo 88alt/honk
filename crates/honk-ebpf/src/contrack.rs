@@ -47,8 +47,7 @@ pub struct ConntrackArgs {
     trace_id: u32,
     incarnation: u64,
     tcp_syn_isn: u32,
-    is_wan_ingress_direction: u8,
-    tcp_padding: [u8; 3],
+    tcp_padding: [u8; 4],
 }
 
 impl ConntrackArgs {
@@ -212,13 +211,21 @@ pub fn is_new_tcp_connection(tcph: &TcpHdr) -> bool {
 /// Expiry refuses this invocation rather than masquerading as a lookup miss.
 #[inline(always)]
 pub fn tuple_unavailable(key: &TuplesKey) -> bool {
+    available_tuple_lifecycle(key, None).is_err()
+}
+
+#[inline(always)]
+pub(crate) fn available_tuple_lifecycle(
+    key: &TuplesKey,
+    now: Option<u64>,
+) -> Result<Option<crate::flow::ConnLifecycle>, ()> {
     if tuple_retiring(key) {
-        return true;
+        return Err(());
     }
     let Some(state) = crate::flow::conn_lifecycle(key) else {
-        return false;
+        return Ok(None);
     };
-    let now = unsafe { bpf_ktime_get_ns() };
+    let now = now.unwrap_or_else(|| unsafe { bpf_ktime_get_ns() });
     let expired = if key.l4proto == crate::transport::IPPROTO_TCP {
         state.state == TcpState::TcpStateClosing as u8
             && now.saturating_sub(state.last_seen_ns) > TCP_CONN_STATE_CLOSING_TIMEOUT_NS
@@ -230,9 +237,14 @@ pub fn tuple_unavailable(key: &TuplesKey) -> bool {
     if expired {
         send_flow_expired(key, state.incarnation);
     }
-    expired
+    if expired
         || (key.l4proto == crate::transport::IPPROTO_UDP
             && state.state == UdpDecisionState::Preparing as u8)
+    {
+        Err(())
+    } else {
+        Ok(Some(state))
+    }
 }
 
 #[inline(always)]

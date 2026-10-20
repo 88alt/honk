@@ -13,6 +13,26 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error};
 
+// Conn-state survives this shorter auxiliary deadline: a late TCP packet must
+// still be intercepted rather than routed as an untracked native flow.
+pub(super) const UNPINNED_REDIRECT_TIMEOUT_NS: u64 = 30_000_000_000;
+
+fn redirect_timeout_ns(
+    key: &honk_ebpf_common::RedirectTuple,
+    entry: &honk_ebpf_common::RedirectEntry,
+) -> u64 {
+    if key.l4proto == libc::IPPROTO_TCP as u8
+        || (key.l4proto == libc::IPPROTO_UDP as u8
+            && honk_ebpf_common::conn::is_stateless_udp_ports(key.src_port, key.dst_port)
+            && entry.decision_token == 0
+            && entry.incarnation == 0)
+    {
+        UNPINNED_REDIRECT_TIMEOUT_NS
+    } else {
+        REDIRECT_TRACK_TIMEOUT_NS
+    }
+}
+
 impl BpfJanitor {
     pub(super) async fn run_blocking_read<T, F>(&self, label: &'static str, work: F) -> Option<T>
     where
@@ -54,12 +74,13 @@ impl BpfJanitor {
     {
         let ebpf = Arc::clone(&self.ebpf);
         let pins = Arc::clone(&self.tcp_flow_pins);
+        let udp_pool = self.udp_pool.clone();
         #[cfg(test)]
         let before_delete_hook = self.before_delete_hook.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut counts = RetireCounts::default();
             let mut requests = Vec::with_capacity(JANITOR_DELETE_CHUNK);
-            let mut outcomes = [RetireOutcome::NotRun; JANITOR_DELETE_CHUNK];
+            let mut outcomes = vec![RetireOutcome::NotRun; JANITOR_DELETE_CHUNK.min(entries.len())];
             #[cfg(test)]
             if let Some(hook) = before_delete_hook {
                 hook();
@@ -77,7 +98,21 @@ impl BpfJanitor {
                 if requests.is_empty() {
                     continue;
                 }
-                match ebpf.retire_batch(&requests, &mut outcomes[..requests.len()]) {
+                let batch = ebpf.retire_batch(&requests, &mut outcomes[..requests.len()]);
+                drop(ebpf);
+                // Deletes before a failure are real, so their endpoints retire too.
+                if let Some(pool) = &udp_pool {
+                    for (request, outcome) in requests.iter().zip(&outcomes) {
+                        if let (
+                            RetireKind::ExpiredConn { expected, .. },
+                            RetireOutcome::ConnRetired,
+                        ) = (request.kind, outcome)
+                        {
+                            pool.retire_reclaimed(&request.key, expected.incarnation);
+                        }
+                    }
+                }
+                match batch {
                     Ok(progress) => counts += progress,
                     Err(error) => {
                         counts += error.counts;
@@ -101,9 +136,13 @@ impl BpfJanitor {
     // Keep scan facts on retirement errors so conn-state drift still recalibrates.
     async fn sweep<K, V>(
         &self,
-        label: &'static str,
+        (label, cursor_index): (&'static str, usize),
         tuning: ScanTuning,
-        for_each: impl FnOnce(&dyn EbpfBackend, &mut dyn FnMut(&[(K, V)]) -> bool) -> anyhow::Result<()>
+        for_each: impl FnOnce(
+            &dyn EbpfBackend,
+            &mut crate::ebpf::FlowScanCursor,
+            &mut dyn FnMut(&[(K, V)]) -> bool,
+        ) -> anyhow::Result<()>
         + Send
         + 'static,
         stale: impl Fn(&K, &V) -> bool + Send + 'static,
@@ -115,13 +154,16 @@ impl BpfJanitor {
         V: Copy + Send + 'static,
     {
         let pins = Arc::clone(&self.tcp_flow_pins);
+        let cursor = Arc::clone(&self.scan_cursors[cursor_index]);
         let scanned = self
             .run_blocking_read(label, move |ebpf| {
+                let mut cursor = cursor.lock();
+                let from_start = cursor.is_start();
                 let deadline = Instant::now() + tuning.budget;
                 let mut expired = Vec::with_capacity(tuning.candidates);
                 let mut total = 0;
                 let mut complete = true;
-                for_each(ebpf, &mut |chunk| {
+                for_each(ebpf, &mut cursor, &mut |chunk| {
                     total += chunk.len();
                     for entry in chunk {
                         if expired.len() == tuning.candidates {
@@ -134,7 +176,7 @@ impl BpfJanitor {
                     complete = expired.len() < tuning.candidates && Instant::now() < deadline;
                     complete
                 })?;
-                anyhow::Ok((expired, total, complete))
+                anyhow::Ok((expired, total, complete && from_start && cursor.is_start()))
             })
             .await;
         let (expired, total, complete) = match scanned {
@@ -164,14 +206,16 @@ impl BpfJanitor {
         &self,
         now_ns: u64,
         gauge: &mut OccupancyGauge,
-        occ_counters: ((u64, u64), u64),
+        occ_counters: Option<((u64, u64), u64)>,
         tuning: ScanTuning,
     ) -> anyhow::Result<(u64, usize)> {
         let (scan, retired) = self
             .sweep(
-                "conn-state",
+                ("conn-state", 0),
                 tuning,
-                |ebpf, visit| ebpf.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, visit),
+                |ebpf, cursor, visit| {
+                    ebpf.conn_state_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit)
+                },
                 move |key, state| conn_expired(key.l4proto, state, now_ns),
                 move |(key, expected)| RetireRequest {
                     key: *key,
@@ -184,8 +228,9 @@ impl BpfJanitor {
                 |counts| counts.conn,
             )
             .await;
-        if scan.complete {
-            let ((inserts, ebpf_deletes), userspace_deletes) = occ_counters;
+        if scan.complete
+            && let Some(((inserts, ebpf_deletes), userspace_deletes)) = occ_counters
+        {
             gauge.calibrate(
                 scan.scanned as u64,
                 inserts,
@@ -204,11 +249,13 @@ impl BpfJanitor {
     ) -> anyhow::Result<AuxScanResult> {
         let (scan, retired) = self
             .sweep(
-                "redirect-track",
+                ("redirect-track", 1),
                 tuning,
-                |ebpf, visit| ebpf.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, visit),
-                move |_, entry| {
-                    now_ns.saturating_sub(entry.last_seen_ns) > REDIRECT_TRACK_TIMEOUT_NS
+                |ebpf, cursor, visit| {
+                    ebpf.redirect_track_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit)
+                },
+                move |key, entry| {
+                    now_ns.saturating_sub(entry.last_seen_ns) > redirect_timeout_ns(key, entry)
                 },
                 move |(key, expected)| RetireRequest {
                     key: TuplesKey {
@@ -221,7 +268,8 @@ impl BpfJanitor {
                     },
                     kind: RetireKind::ExpiredRedirect {
                         expected,
-                        expired_before_ns: now_ns.saturating_sub(REDIRECT_TRACK_TIMEOUT_NS),
+                        expired_before_ns: now_ns
+                            .saturating_sub(redirect_timeout_ns(key, expected)),
                     },
                 },
                 |counts| counts.redirect,
@@ -244,9 +292,11 @@ impl BpfJanitor {
     ) -> anyhow::Result<AuxScanResult> {
         let (scan, retired) = self
             .sweep(
-                "routing-handoff",
+                ("routing-handoff", 2),
                 tuning,
-                |ebpf, visit| ebpf.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, visit),
+                |ebpf, cursor, visit| {
+                    ebpf.routing_handoff_for_each_chunk(JANITOR_SCAN_CHUNK, cursor, visit)
+                },
                 move |_, entry| {
                     now_ns.saturating_sub(entry.last_seen_ns) > ROUTING_HANDOFF_TIMEOUT_NS
                 },

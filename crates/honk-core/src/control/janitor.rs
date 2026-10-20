@@ -9,19 +9,17 @@
 //! All swept maps are plain hashes: the kernel never evicts on its own
 //! (silent LRU eviction could re-route or break live flows mid-flight), so
 //! occupancy management lives here. Accepted TCP owners pin conn-state and
-//! redirect metadata for their full relay lifetime; unpinned TCP ACTIVE and
-//! UDP entries keep the 120-second userspace backstop, while TCP CLOSING uses
-//! the datapath's strict 10-second rule. `CONN_STATE_OCCUPANCY` drives
-//! conn-state pressure; auxiliary scans use their current completion and
-//! coverage to accelerate cleanup when stale work or map occupancy warrants it:
-//!
-//! - `< 70%` full: steady sweep interval (60 s)
-//! - `70–85%`: elevated interval (15 s)
-//! - `>= 85%`: conn-state pressure mode — sweep every tick
-//! - a bounded auxiliary scan or `>= 85%` current auxiliary coverage selects
-//!   the aggressive auxiliary cadence
+//! redirect metadata for their full relay lifetime. Unpinned TCP ACTIVE and
+//! UDP conn-state keep the 120-second backstop; TCP CLOSING uses 10 seconds.
+//! Unpinned TCP and stateless UDP/53 redirects need only 30 seconds because
+//! the next forward packet can rebuild them without losing conn authority.
+//! Conn, redirect and handoff occupancy
+//! jointly select the cadence and candidate bound: 60 s below 70%, 15 s below
+//! 85%, and every two-second tick / 4096 candidates under pressure. A bounded
+//! auxiliary scan keeps that aggressive cadence until its backlog is drained.
 
 use super::connection::TcpFlowPins;
+use super::udp_endpoint::UdpEndpointPool;
 use crate::ebpf::{EbpfBackend, RETIRE_BATCH_CAPACITY};
 use health::{AuxMap, HealthLatches};
 use honk_ebpf_common::conn::{BpfStatsKey, MAX_CONN_STATE_NUM};
@@ -32,8 +30,6 @@ use tracing::{debug, error, info, warn};
 
 /// Janitor tick interval: 2 seconds.
 const JANITOR_TICK_INTERVAL_SECS: u64 = 2;
-const AUX_STEADY_INTERVAL_SECS: u64 = 60;
-const AUX_PRESSURE_INTERVAL_SECS: u64 = 8;
 /// Map health check interval: 5 seconds.
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 
@@ -140,6 +136,8 @@ struct PressureState {
 pub struct BpfJanitor {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     tcp_flow_pins: Arc<TcpFlowPins>,
+    udp_pool: Option<Arc<UdpEndpointPool>>,
+    scan_cursors: [Arc<parking_lot::Mutex<crate::ebpf::FlowScanCursor>>; 3],
     #[cfg(test)]
     blocking_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -155,11 +153,19 @@ impl BpfJanitor {
         Self {
             ebpf,
             tcp_flow_pins,
+            udp_pool: None,
+            scan_cursors: std::array::from_fn(|_| Arc::default()),
             #[cfg(test)]
             blocking_read_hook: None,
             #[cfg(test)]
             before_delete_hook: None,
         }
+    }
+
+    /// Retire the endpoints of UDP flows whose conn this janitor deletes.
+    pub(super) fn with_udp_pool(mut self, pool: Arc<UdpEndpointPool>) -> Self {
+        self.udp_pool = Some(pool);
+        self
     }
 
     /// Spawn with a guard that reports unexpected task death to the control plane.
@@ -177,17 +183,7 @@ impl BpfJanitor {
             // Skip the first immediate tick.
             interval.tick().await;
 
-            let mut pressure = PressureState::default();
-            let mut gauge = OccupancyGauge::default();
-            let mut aux_scan_results = [AuxScanResult {
-                complete: true,
-                ..AuxScanResult::default()
-            }; AuxMap::COUNT];
-            let mut health = HealthLatches::default();
-
-            let mut last_aux_cleanup = tokio::time::Instant::now();
-            let mut last_health_check = tokio::time::Instant::now();
-            let mut last_conn_state_cleanup = tokio::time::Instant::now();
+            let mut state = tick::TickState::new(tokio::time::Instant::now());
 
             info!(
                 "BPF janitor: started (tick={}s; conn-state sweep is watermark-driven)",
@@ -220,120 +216,9 @@ impl BpfJanitor {
                     }
                 };
 
-                let (overflow_delta, utilization, occ_counters) = {
-                    let ebpf = self.ebpf.read().await;
-                    let udp = ebpf
-                        .get_bpf_stats(BpfStatsKey::UdpConnOverflow as u32)
-                        .unwrap_or(None)
-                        .unwrap_or(0);
-                    let tcp = ebpf
-                        .get_bpf_stats(BpfStatsKey::TcpConnOverflow as u32)
-                        .unwrap_or(None)
-                        .unwrap_or(0);
-                    let delta =
-                        udp > pressure.last_udp_overflow || tcp > pressure.last_tcp_overflow;
-                    pressure.last_udp_overflow = udp;
-                    pressure.last_tcp_overflow = tcp;
-                    let counters = ebpf.conn_state_occupancy().unwrap_or((0, 0));
-                    let userspace_deletes = crate::ebpf::USERSPACE_CONN_STATE_DELETES
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let occupancy = gauge.estimate(counters.0, counters.1, userspace_deletes);
-                    (
-                        delta,
-                        occupancy as f64 / f64::from(MAX_CONN_STATE_NUM),
-                        (counters, userspace_deletes),
-                    )
-                };
-                update_pressure_state(&mut pressure, overflow_delta, utilization);
-
-                let aux_pressure = aux_scan_results
-                    .iter()
-                    .any(|result| aux_scan_is_pressured(result.scanned, result.complete));
-                let aux_interval = if pressure.active || aux_pressure {
-                    Duration::from_secs(AUX_PRESSURE_INTERVAL_SECS)
-                } else {
-                    Duration::from_secs(AUX_STEADY_INTERVAL_SECS)
-                };
-
-                let conn_state_interval = if pressure.active {
-                    Duration::from_secs(JANITOR_TICK_INTERVAL_SECS)
-                } else if utilization >= CONN_STATE_ELEVATED_WATERMARK {
-                    Duration::from_secs(CONN_STATE_ELEVATED_INTERVAL_SECS)
-                } else {
-                    Duration::from_secs(CONN_STATE_STEADY_INTERVAL_SECS)
-                };
-
-                if last_conn_state_cleanup + conn_state_interval <= now {
-                    let tuning = scan_tuning(utilization);
-                    let (deleted, total) = if let Some(now_ns) = now_ns {
-                        match self
-                            .cleanup_conn_state_at(now_ns, &mut gauge, occ_counters, tuning)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(error) => {
-                                error!(%error, "BPF janitor: conn-state retirement failed");
-                                return;
-                            }
-                        }
-                    } else {
-                        (0, 0)
-                    };
-                    last_conn_state_cleanup = now;
-                    if utilization >= CONN_STATE_ELEVATED_WATERMARK || deleted > 0 {
-                        debug!(
-                            "BPF janitor: conn-state sweep removed {}/{} entries (occupancy ~{:.1}%)",
-                            deleted,
-                            total,
-                            utilization * 100.0
-                        );
-                    }
-                }
-                let auxiliary_pressure_floor = if pressure.active || aux_pressure {
-                    CONN_STATE_PRESSURE_WATERMARK
-                } else {
-                    0.0
-                };
-
-                if last_aux_cleanup + aux_interval <= now {
-                    for map in AuxMap::ALL {
-                        let index = map as usize;
-                        let utilization = (aux_scan_results[index].scanned as f64
-                            / AUX_MAP_CAPACITY as f64)
-                            .max(auxiliary_pressure_floor);
-                        let tuning = scan_tuning(utilization);
-                        let cleanup = if let Some(now_ns) = now_ns {
-                            match map {
-                                AuxMap::RedirectTrack => {
-                                    self.cleanup_redirect_track_at(now_ns, tuning).await
-                                }
-                                AuxMap::RoutingHandoff => {
-                                    self.cleanup_routing_handoff_at(now_ns, tuning).await
-                                }
-                            }
-                        } else {
-                            Ok(AuxScanResult::default())
-                        };
-                        aux_scan_results[index] = match cleanup {
-                            Ok(result) => result,
-                            Err(error) => {
-                                error!(%error, map = map.label(), "BPF janitor: auxiliary retirement failed");
-                                return;
-                            }
-                        };
-                    }
-                    last_aux_cleanup = now;
-                }
-
-                if last_health_check + Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS) <= now {
-                    self.check_map_health(
-                        utilization,
-                        pressure.active,
-                        aux_scan_results,
-                        &mut health,
-                    )
-                    .await;
-                    last_health_check = now;
+                if let Err(error) = self.tick(&mut state, now, now_ns).await {
+                    error!(error = %format_args!("{error:#}"), "BPF janitor: tick failed");
+                    return;
                 }
             }
         })
@@ -345,7 +230,7 @@ impl BpfJanitor {
         self.cleanup_conn_state_at(
             now_ns,
             &mut gauge,
-            ((0, 0), 0),
+            Some(((0, 0), 0)),
             ScanTuning {
                 candidates: JANITOR_MAX_CANDIDATES,
                 budget: Duration::from_secs(1),
@@ -380,25 +265,27 @@ pub(super) fn monotonic_now_ns() -> anyhow::Result<u64> {
     Ok(ts.tv_sec() as u64 * 1_000_000_000 + ts.tv_nsec() as u64)
 }
 
-/// Update the pressure state from the conn-state overflow counters and the
-/// live occupancy watermark.
+/// Update pressure from conn-state overflow and separate conn/redirect/handoff
+/// utilization samples, so an auxiliary episode is not attributed to conn-state.
 ///
 /// Pressure mode latches on when either the kernel's UDP/TCP overflow
 /// counters grow (insert failures — the fail-closed last resort) or the
 /// estimated occupancy crosses `CONN_STATE_PRESSURE_WATERMARK`.  It switches
 /// off after `PRESSURE_EXIT_ROUNDS` consecutive ticks with neither signal.
-fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utilization: f64) {
-    let high_water = utilization >= CONN_STATE_PRESSURE_WATERMARK;
+fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utilizations: [f64; 3]) {
+    let [conn_utilization, redirect_utilization, handoff_utilization] = utilizations;
+    let high_water = utilizations
+        .into_iter()
+        .any(|utilization| utilization >= CONN_STATE_PRESSURE_WATERMARK);
     if overflow_delta || high_water {
         if !state.active {
-            if overflow_delta {
-                warn!("BPF janitor: entering pressure mode (conn state overflow)");
-            } else {
-                warn!(
-                    "BPF janitor: entering pressure mode (conn-state occupancy ~{:.1}%)",
-                    utilization * 100.0
-                );
-            }
+            warn!(
+                conn_overflow = overflow_delta,
+                conn_utilization_pct = conn_utilization * 100.0,
+                redirect_utilization_pct = redirect_utilization * 100.0,
+                handoff_utilization_pct = handoff_utilization * 100.0,
+                "BPF janitor: entering pressure mode"
+            );
         }
         state.active = true;
         state.quiet_rounds = 0;
@@ -412,14 +299,18 @@ fn update_pressure_state(state: &mut PressureState, overflow_delta: bool, utiliz
         state.active = false;
         state.quiet_rounds = 0;
         info!(
-            "BPF janitor: exiting pressure mode (quiet for {} rounds)",
-            PRESSURE_EXIT_ROUNDS
+            quiet_rounds = PRESSURE_EXIT_ROUNDS,
+            conn_utilization_pct = conn_utilization * 100.0,
+            redirect_utilization_pct = redirect_utilization * 100.0,
+            handoff_utilization_pct = handoff_utilization * 100.0,
+            "BPF janitor: exiting pressure mode"
         );
     }
 }
 
 mod health;
 mod sweep;
+mod tick;
 
 #[cfg(test)]
 mod tests;

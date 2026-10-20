@@ -14,9 +14,11 @@ pub mod egress;
 pub mod errno;
 pub mod event;
 pub mod flow;
+pub mod fragment;
 pub mod ingress;
 pub mod log_shim;
 pub mod maps;
+pub mod new_flow_limit;
 #[cfg(feature = "routing-test")]
 mod preparing_claim_test;
 pub mod process_name;

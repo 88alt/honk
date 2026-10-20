@@ -116,10 +116,12 @@ pub enum BpfStatsKey {
     SocketIdentityCaptureFailure = 4,
     TcpChildProofStorageFailure = 5,
     TcpPublisherClaimFailure = 6,
+    NewFlowRateLimited = 7,
+    UdpReverseLearningSuspended = 8,
 }
 
 impl BpfStatsKey {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::UdpConnOverflow,
         Self::TcpConnOverflow,
         Self::RedirectTrackInsertFailure,
@@ -127,6 +129,8 @@ impl BpfStatsKey {
         Self::SocketIdentityCaptureFailure,
         Self::TcpChildProofStorageFailure,
         Self::TcpPublisherClaimFailure,
+        Self::NewFlowRateLimited,
+        Self::UdpReverseLearningSuspended,
     ];
     pub const COUNT: u32 = Self::ALL.len() as u32;
 
@@ -139,9 +143,41 @@ impl BpfStatsKey {
             Self::SocketIdentityCaptureFailure => "socket_identity_capture_failure",
             Self::TcpChildProofStorageFailure => "tcp_child_proof_storage_failure",
             Self::TcpPublisherClaimFailure => "tcp_publisher_claim_failure",
+            Self::NewFlowRateLimited => "new_flow_rate_limited",
+            Self::UdpReverseLearningSuspended => "udp_reverse_learning_suspended",
         }
     }
 }
+
+/// New flows (pure SYN, first non-DNS UDP packet, every UDP/53 packet) one LAN
+/// source may start per second on each CPU before further attempts are dropped.
+pub const NEW_FLOW_LIMIT_PER_CPU_SECOND: u32 = 256;
+
+/// How long a redirected or blocked first fragment condemns the rest of its datagram.
+pub const FRAGMENT_VERDICT_TTL_NS: u64 = 30_000_000_000;
+
+/// Identity of one IP datagram under reassembly; every byte is initialized.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FragmentKey {
+    pub src_ip: crate::dae_ip::In6Addr,
+    pub dst_ip: crate::dae_ip::In6Addr,
+    pub id: u32,
+    pub l4proto: u8,
+    pub padding: [u8; 3],
+}
+
+/// First-fragment outcome that later fragments of the same datagram inherit.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FragmentVerdict {
+    pub verdict: u32,
+    pub padding: u32,
+    pub ktime_ns: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<FragmentKey>() == 40);
+const _: () = assert!(core::mem::size_of::<FragmentVerdict>() == 16);
 
 /// CONN_STATE_MAP capacity, shared by the eBPF map and userspace pressure gauge.
 pub const MAX_CONN_STATE_NUM: u32 = 65536 * 8;
@@ -170,6 +206,13 @@ pub const fn is_stateless_udp_ports(src_port: u16, dst_port: u16) -> bool {
 /// count on every janitor sweep.
 pub const OCCUPANCY_INSERTS: u32 = 0;
 pub const OCCUPANCY_EBPF_DELETES: u32 = 1;
+
+/// Slots of the `AUX_OCCUPANCY` per-CPU array: cumulative successful NOEXIST
+/// inserts into REDIRECT_TRACK / ROUTING_HANDOFF_MAP. The datapath never
+/// deletes these elements, so userspace derives live occupancy as
+/// `inserts - userspace deletes`, including retirement and UDP decision commits.
+pub const AUX_OCCUPANCY_REDIRECT_INSERTS: u32 = 0;
+pub const AUX_OCCUPANCY_HANDOFF_INSERTS: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -291,6 +334,7 @@ pub struct ParseTransportCtx {
     pub l4proto: u8,          // Actual L4 protocol
     pub listener_l4proto: u8, // Listener protocol
     pub is_fragmented: u8,
+    pub frag_id: u32, // IPv4 identification or IPv6 fragment identification, host order
 }
 
 #[cfg(not(target_arch = "bpf"))]
@@ -301,6 +345,10 @@ unsafe impl aya::Pod for UdpDecisionSequence {}
 unsafe impl aya::Pod for FlowIncarnationSequence {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RetirementFence {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for FragmentKey {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for FragmentVerdict {}
 
 #[cfg(test)]
 mod tests {

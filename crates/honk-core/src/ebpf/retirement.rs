@@ -10,7 +10,7 @@ use honk_ebpf_common::redirect_need::TcpSocketBinding;
 use honk_ebpf_common::{ConnState, RedirectEntry, RoutingHandoffEntry, TuplesKey};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const RETIRE_BATCH_CAPACITY: usize = 128;
+pub const RETIRE_BATCH_CAPACITY: usize = 1024;
 
 /// Cumulative conn-state entries physically deleted by userspace retirement,
 /// for the janitor's occupancy gauge. eBPF-side inserts/deletes are counted by
@@ -139,10 +139,13 @@ impl std::ops::AddAssign for RetireCounts {
 
 /// Per-request result of `retire_batch`. `NotRun` is the pre-filled value and
 /// survives only where the batch failed first, so it is never settled.
+/// `ConnRetired` means this request physically deleted the flow's conn entry;
+/// `Done(Applied)` acknowledges only auxiliary retirement, not a conn deletion.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RetireOutcome {
     #[default]
     NotRun,
+    ConnRetired,
     Done(UdpDecisionCommitResult),
 }
 
@@ -151,7 +154,10 @@ impl RetireOutcome {
     /// newer incarnation that retirement must not touch.
     pub fn settled(self) -> bool {
         use UdpDecisionCommitResult::*;
-        matches!(self, Self::Done(Applied | Missing | Superseded))
+        matches!(
+            self,
+            Self::ConnRetired | Self::Done(Applied | Missing | Superseded)
+        )
     }
 }
 
@@ -389,16 +395,13 @@ impl RetirePlan {
     }
 
     /// `removed` is what the executor just deleted for this request.
-    pub(crate) fn outcome(&self, removed: RetireCounts) -> UdpDecisionCommitResult {
-        let decided = if self.conn {
-            removed.conn
+    pub(crate) fn outcome(&self, removed: RetireCounts) -> RetireOutcome {
+        if self.conn && removed.conn != 0 {
+            RetireOutcome::ConnRetired
+        } else if !self.conn && removed.handoff + removed.redirect != 0 {
+            UdpDecisionCommitResult::Applied.into()
         } else {
-            removed.handoff + removed.redirect
-        };
-        if decided != 0 {
-            UdpDecisionCommitResult::Applied
-        } else {
-            self.unchanged
+            self.unchanged.into()
         }
     }
 }
@@ -482,8 +485,8 @@ pub(crate) struct UdpCommitPlan {
     pub redirect: Option<RedirectEffect>,
 }
 
-/// Authorize a UDP decision transition from post-grace snapshots whose conn
-/// token and incarnation the caller already matched, or refuse.
+/// Authorize a UDP decision transition from coherent snapshots whose conn token
+/// and incarnation the caller already matched, or refuse.
 pub(crate) fn plan_udp_commit(
     mut state: ConnState,
     token: u32,
@@ -498,6 +501,11 @@ pub(crate) fn plan_udp_commit(
     let initial = !matches!(transition, UdpDecisionTransition::ActivateDirect(_));
     if initial && (handoff.is_none() || track.is_none()) {
         return Err(UdpDecisionCommitResult::Missing);
+    }
+    // ArmDirect removed both auxiliaries. Activation must never turn an
+    // unexpected publication into unfenced map reclamation.
+    if !initial && (handoff.is_some() || track.is_some()) {
+        return Err(UdpDecisionCommitResult::StateMismatch);
     }
     Ok(UdpCommitPlan {
         state,
@@ -520,13 +528,14 @@ pub(crate) fn retire_staged_udp(
         &mut [RetireOutcome],
     ) -> Result<RetireCounts, RetireError>,
 ) -> anyhow::Result<()> {
+    let capacity = RETIRE_BATCH_CAPACITY.min(staged.len());
+    let mut requests = Vec::with_capacity(capacity);
+    let mut outcomes = vec![RetireOutcome::NotRun; capacity];
     for chunk in staged.chunks(RETIRE_BATCH_CAPACITY) {
-        let mut requests =
-            [RetireRequest::pending_udp(TuplesKey::default(), 0, None); RETIRE_BATCH_CAPACITY];
-        let mut outcomes = [RetireOutcome::NotRun; RETIRE_BATCH_CAPACITY];
-        for (request, (key, token, incarnation)) in requests.iter_mut().zip(chunk) {
-            *request = RetireRequest::pending_udp(*key, *token, Some(*incarnation));
-        }
+        requests.clear();
+        requests.extend(chunk.iter().map(|(key, token, incarnation)| {
+            RetireRequest::pending_udp(*key, *token, Some(*incarnation))
+        }));
         let outcomes = &mut outcomes[..chunk.len()];
         retire(&requests[..chunk.len()], outcomes)?;
         for (outcome, (_, token, _)) in outcomes.iter().zip(chunk) {
@@ -557,10 +566,33 @@ pub fn retire_pending(
     Ok(outcome[0])
 }
 
-fn conn_deletes(result: &Result<RetireCounts, RetireError>) -> u64 {
+fn retired_counts(result: &Result<RetireCounts, RetireError>) -> RetireCounts {
     match result {
-        Ok(counts) => counts.conn,
-        Err(error) => error.counts.conn,
+        Ok(counts) => *counts,
+        Err(error) => error.counts,
+    }
+}
+
+fn conn_deletes(result: &Result<RetireCounts, RetireError>) -> u64 {
+    retired_counts(result).conn
+}
+
+#[cfg(any(feature = "ebpf", test))]
+/// Redirect and handoff elements one backend's userspace removed. The datapath
+/// only inserts them, so this is what `aux_occupancy` subtracts from its counters.
+#[derive(Debug, Default)]
+pub(crate) struct AuxDeleteTally {
+    pub redirect: u64,
+    pub handoff: u64,
+}
+
+#[cfg(any(feature = "ebpf", test))]
+impl AuxDeleteTally {
+    /// Count a finished batch, including deletes made before a failure.
+    pub(crate) fn record(&mut self, result: &Result<RetireCounts, RetireError>) {
+        let counts = retired_counts(result);
+        self.redirect += counts.redirect;
+        self.handoff += counts.handoff;
     }
 }
 
@@ -580,8 +612,10 @@ pub(crate) fn retire_fixture(
     let counts = backend
         .retire_batch(&[RetireRequest { key, kind }], &mut outcomes)
         .unwrap();
-    let RetireOutcome::Done(result) = outcomes[0] else {
-        panic!("singleton retirement skipped a request");
+    let result = match outcomes[0] {
+        RetireOutcome::ConnRetired => UdpDecisionCommitResult::Applied,
+        RetireOutcome::Done(result) => result,
+        RetireOutcome::NotRun => panic!("singleton retirement skipped a request"),
     };
     (counts, result)
 }

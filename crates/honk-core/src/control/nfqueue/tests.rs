@@ -2,6 +2,8 @@ use super::*;
 
 use honk_ebpf_common::{ConnState, NFQUEUE_PENDING_MARK, RoutingMeta};
 
+mod batching;
+mod kernel_reclamation;
 mod retirement;
 
 fn identity(token: u32, generation: u64) -> PendingUdpIdentity {
@@ -161,7 +163,7 @@ fn held_guards_preserve_fifo_without_retaining_payloads() {
 }
 
 struct DecisionFixture {
-    pending: PendingUdpVerdicts,
+    pending: Arc<PendingUdpVerdicts>,
     backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
     lease: UdpInitLease,
     identity: PendingUdpIdentity,
@@ -171,8 +173,14 @@ struct DecisionFixture {
 }
 
 fn pending_fixture(token: u32) -> DecisionFixture {
+    pending_fixture_with(token, crate::ebpf::mock::MockEbpfBackend::new())
+}
+
+fn pending_fixture_with(
+    token: u32,
+    mut mock: crate::ebpf::mock::MockEbpfBackend,
+) -> DecisionFixture {
     let key = identity(token, 0).key;
-    let mut mock = crate::ebpf::mock::MockEbpfBackend::new();
     mock.seed_staged_udp_flow(
         &key.tuples(),
         ConnState {
@@ -220,7 +228,7 @@ fn pending_fixture(token: u32) -> DecisionFixture {
     );
     stats.increment_udp_nfqueue_active_flows();
     DecisionFixture {
-        pending,
+        pending: Arc::new(pending),
         backend,
         lease,
         identity,
@@ -386,18 +394,17 @@ async fn armed_direct_backend_wait_is_bounded_by_hold_deadline() {
     let DecisionFixture {
         pending,
         backend,
-        mut lease,
+        lease,
         identity,
         sink,
         mut fatal,
         ..
     } = pending_fixture(26);
-    let pending = Arc::new(pending);
     let initial_reader = backend.read().await;
     let activation_pending = Arc::clone(&pending);
     let activation = tokio::spawn(async move {
         activation_pending
-            .activate_direct(identity, &mut lease, 0x1200)
+            .activate_direct(identity, lease, 0x1200)
             .await
     });
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -547,7 +554,7 @@ async fn direct_arms_accepts_fifo_then_activates_without_copying_payload() {
 
     fixture
         .pending
-        .activate_direct(fixture.identity, &mut fixture.lease, 0x1200)
+        .activate_direct(fixture.identity, fixture.lease, 0x1200)
         .await
         .unwrap();
 
@@ -625,7 +632,7 @@ async fn block_commits_then_drops_original_and_retires_initializer() {
     let mut fixture = pending_fixture(23);
     fixture
         .pending
-        .block(fixture.identity, &mut fixture.lease)
+        .block(fixture.identity, fixture.lease)
         .await
         .unwrap();
 

@@ -192,8 +192,12 @@ fn lookup_udp_seen_at(key: &TuplesKey, now: u64) -> Option<&'static mut ConnStat
     unsafe { bpf_spin_lock(&mut (*ptr).lock) };
     let state = unsafe { &mut (*ptr).value };
     let expired = udp_conn_state_expired(state, now);
+    // Staging lasts at most three seconds. Freezing these snapshots makes the
+    // backend the sole writer between its locked read and in-place activation.
     if !expired
         && state.state != UdpDecisionState::Preparing as u8
+        && state.state != UdpDecisionState::Pending as u8
+        && state.state != UdpDecisionState::DirectArmed as u8
         && now.saturating_sub(state.last_seen_ns) > UDP_CONN_STATE_UPDATE_INTERVAL_NS
     {
         state.last_seen_ns = now;
@@ -214,6 +218,51 @@ fn lookup_udp_seen_at(key: &TuplesKey, now: u64) -> Option<&'static mut ConnStat
 #[inline(always)]
 pub fn lookup_udp_seen(key: &TuplesKey) -> Option<&'static mut ConnState> {
     lookup_udp_seen_at(key, unsafe { bpf_ktime_get_ns() })
+}
+
+/// A live hit already decided expiry and renewal under one lock. A failed
+/// lookup may be a fence/expired hit, never permission to replace that owner.
+#[inline(always)]
+pub(crate) fn lookup_udp_available(key: &TuplesKey) -> Result<Option<&'static mut ConnState>, ()> {
+    match lookup_udp_seen(key) {
+        Some(state) if state.state == UdpDecisionState::Preparing as u8 => Err(()),
+        Some(state) => Ok(Some(state)),
+        None if tuple_retiring(key) || CONN_STATE_MAP.get_ptr(key).is_some() => Err(()),
+        None => Ok(None),
+    }
+}
+
+/// Queued decisions keep a userspace-owned clock until their final state is published.
+#[inline(always)]
+pub fn renew_udp_reply(
+    key: &TuplesKey,
+    snapshot: &crate::flow::ConnLifecycle,
+    redirect: &honk_ebpf_common::RedirectEntry,
+    now: u64,
+) {
+    if redirect.incarnation == 0
+        || snapshot.incarnation != redirect.incarnation
+        || (snapshot.state != UdpDecisionState::None as u8
+            && snapshot.state != UdpDecisionState::Proxy as u8)
+        || now.saturating_sub(snapshot.last_seen_ns) < UDP_CONN_STATE_UPDATE_INTERVAL_NS
+        || tuple_retiring(key)
+    {
+        return;
+    }
+    let Some(ptr) = CONN_STATE_MAP.get_ptr_mut(key) else {
+        return;
+    };
+    unsafe { bpf_spin_lock(&mut (*ptr).lock) };
+    let current = unsafe { &mut (*ptr).value };
+    if current.incarnation == redirect.incarnation
+        && current.decision_token == redirect.decision_token
+        && current.state == snapshot.state
+        && !udp_conn_state_expired(current, now)
+        && now.saturating_sub(current.last_seen_ns) >= UDP_CONN_STATE_UPDATE_INTERVAL_NS
+    {
+        current.last_seen_ns = now;
+    }
+    unsafe { bpf_spin_unlock(&mut (*ptr).lock) };
 }
 
 /// Returns an invocation-local snapshot after publication, never a map payload pointer.
@@ -316,4 +365,56 @@ pub fn mark_udp_seen(
     } else {
         Some(unsafe { &mut *result })
     }
+}
+
+/// Reverse observations cannot claim new conn capacity while the janitor's
+/// conn-only pressure latch is set. Existing forward authority stays untouched.
+#[inline(always)]
+pub fn observe_reverse_udp(key: &TuplesKey) {
+    if super::is_short_lived_udp_traffic(key) {
+        return;
+    }
+    if crate::maps::admission_pressure() {
+        if lookup_udp_seen(key).is_none() {
+            crate::maps::increment_bpf_stat(BpfStatsKey::UdpReverseLearningSuspended);
+        }
+    } else {
+        let _ = mark_udp_seen(key, 1, None, None, None, None, 0, None, 0, 0, 0);
+    }
+}
+
+/// Established replies decide availability and renewal in one lock. Only a
+/// genuine miss reaches learning, and dae0 replies remain lookup-only.
+#[inline(always)]
+pub fn reverse_udp_available(key: &TuplesKey, learn: bool) -> bool {
+    match lookup_udp_available(key) {
+        Err(()) => false,
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            if learn {
+                observe_reverse_udp(key);
+            }
+            !super::tuple_unavailable(key)
+        }
+    }
+}
+
+// Keep reversed tuple storage off the LAN classifier's near-limit stack.
+#[inline(never)]
+pub fn local_udp_reply_seen(key: &TuplesKey) -> bool {
+    if super::is_short_lived_udp_traffic(key) {
+        return false;
+    }
+    let mut reversed = TuplesKey::default();
+    super::copy_reversed_tuples(key, &mut reversed);
+    lookup_udp_seen(&reversed).is_some_and(|state| state.is_wan_ingress_direction != 0)
+}
+
+#[inline(never)]
+pub fn observe_local_udp_reply(key: &TuplesKey, reversed: &mut TuplesKey) {
+    if super::is_short_lived_udp_traffic(key) || !crate::new_flow_limit::try_acquire(&key.src_ip) {
+        return;
+    }
+    super::copy_reversed_tuples(key, reversed);
+    observe_reverse_udp(reversed);
 }

@@ -1,12 +1,14 @@
 use aya_ebpf::Global;
 use aya_ebpf::btf_maps::{
-    Array, ArrayOfMaps, HashMap, LruHashMap, PerCpuArray, RingBuf, SkStorage, SockMap,
+    Array, ArrayOfMaps, HashMap, LruHashMap, LruPerCpuHashMap, PerCpuArray, RingBuf, SkStorage,
+    SockMap,
 };
 use aya_ebpf::macros::btf_map;
 use honk_ebpf_common::conn::{
-    BpfStatsKey, ConnState, FlowIncarnationSequence, FlowMapValue, MAX_CONN_STATE_NUM,
-    ParseTransportCtx, RetirementFence, UdpDecisionSequence,
+    BpfStatsKey, ConnState, FlowIncarnationSequence, FlowMapValue, FragmentKey, FragmentVerdict,
+    MAX_CONN_STATE_NUM, ParseTransportCtx, RetirementFence, UdpDecisionSequence,
 };
+use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::event::DaeEvent;
 use honk_ebpf_common::redirect_need::{
     RoutingHandoffEntry, SocketIdentity, TcpSocketBinding, TuplesKey,
@@ -69,6 +71,18 @@ pub fn datapath_flags() -> u32 {
     DATAPATH_FLAGS_MAP.get(0).copied().unwrap_or(0)
 }
 
+/// Only conn-state occupancy gates reverse UDP learning; auxiliary pressure
+/// must not change the semantics of incoming UDP services.
+#[btf_map]
+pub static ADMISSION_PRESSURE: Array<u32, 1> = Array::new();
+
+#[inline(always)]
+pub fn admission_pressure() -> bool {
+    ADMISSION_PRESSURE
+        .get(0)
+        .is_some_and(|pressure| *pressure != 0)
+}
+
 /// Persistent across process reloads so no live held skb can observe token reuse.
 #[btf_map]
 pub static UDP_DECISION_SEQUENCE: Array<UdpDecisionSequence, 1, 0> = Array::new();
@@ -122,6 +136,26 @@ pub static REDIRECT_TRACK: HashMap<RedirectTuple, FlowMapValue<RedirectEntry>, 6
 /// the map is full. That only restores the previous behaviour for that client,
 /// unlike the plain hashes above, so no userspace sweep owns it.
 pub static CLIENT_REPLY_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 16384> = LruHashMap::new();
+
+/// Fixed one-second window of a source's new-flow budget on one CPU.
+#[repr(C)]
+pub struct NewFlowWindow {
+    pub second: u32,
+    pub count: u32,
+}
+
+/// New-flow budget per LAN source address. Per-CPU values let each CPU count
+/// without atomics, which LRU maps cannot back with a spin lock; the effective
+/// limit is the CPU count times `NEW_FLOW_LIMIT_PER_CPU_SECOND`. Eviction only
+/// forgets a source's recent count.
+#[btf_map]
+pub static NEW_FLOW_RATE: LruPerCpuHashMap<In6Addr, NewFlowWindow, 16384> = LruPerCpuHashMap::new();
+
+/// Datagrams whose first fragment was redirected or dropped; later fragments
+/// of the same datagram are dropped too. Forgetting an entry only lets later
+/// fragments pass as they did before the record existed.
+#[btf_map]
+pub static FRAG_VERDICT: LruHashMap<FragmentKey, FragmentVerdict, 4096> = LruHashMap::new();
 
 #[btf_map]
 /// Plain hash with BPF_F_NO_PREALLOC: swept by the userspace janitor (30 s
@@ -187,6 +221,11 @@ pub static CONN_STATE_MAP: HashMap<
 #[btf_map]
 pub static CONN_STATE_OCCUPANCY: PerCpuArray<u64, 2> = PerCpuArray::new();
 
+/// Successful redirect/handoff insertions; only fenced userspace reclamation
+/// removes these elements, so userspace subtracts its own deletes.
+#[btf_map]
+pub static AUX_OCCUPANCY: PerCpuArray<u64, 2> = PerCpuArray::new();
+
 /// Conn UDP/TCP, redirect/handoff insertion, socket identity capture, TCP child proof
 /// storage and non-collision SYN claim failures.
 #[btf_map]
@@ -213,6 +252,18 @@ pub static OUTBOUND_STATS: PerCpuArray<
 
 #[btf_map]
 pub static EVENT_RINGBUF: RingBuf<DaeEvent, 262144> = RingBuf::new();
+
+#[repr(C)]
+pub struct FlowExpiryHint {
+    pub incarnation: u64,
+    pub last_hint_ns: u64,
+}
+
+/// Advisory hint suppression only. Each CPU retains the last hinted owner of
+/// a tuple; LRU eviction may forget it, while the janitor remains lossless.
+#[btf_map]
+pub static FLOW_EXPIRY_HINT: LruPerCpuHashMap<TuplesKey, FlowExpiryHint, 4096> =
+    LruPerCpuHashMap::new();
 
 #[btf_map]
 pub static PKT_SCRATCH_KEY: PerCpuArray<ParsedPacket, 1> = PerCpuArray::new();

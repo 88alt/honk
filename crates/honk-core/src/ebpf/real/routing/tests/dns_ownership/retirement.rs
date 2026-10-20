@@ -6,10 +6,12 @@ use aya::maps::RingBuf;
 use honk_ebpf_common::conn::{FlowIncarnationSequence, RetirementFence, UDP_CONN_STATE_TIMEOUT_NS};
 use honk_ebpf_common::event::{DaeEvent, DaeEventType};
 
+mod expiry_hints;
 mod publication;
+mod reverse_syn;
 mod stable_values;
+mod udp_keepalive;
 
-const TC_ACT_PIPE: u32 = 3;
 const LAST_INCARNATION: u64 = 0x00ff_ffff_ffff_ffff;
 const PEERS: [(IpAddr, IpAddr); 2] = [
     (
@@ -114,8 +116,8 @@ fn retirement_fence_refuses_forward_reverse_and_reply_writers_without_mutation()
                 for (index, (side, reverse, expected)) in [
                     ("lan_ingress_l2", false, TC_ACT_REDIRECT),
                     ("wan_egress_l2", false, TC_ACT_REDIRECT),
-                    ("lan_egress_l2", true, TC_ACT_PIPE),
-                    ("wan_ingress_l2", true, TC_ACT_PIPE),
+                    ("lan_egress_l2", true, TC_ACT_UNSPEC),
+                    ("wan_ingress_l2", true, TC_ACT_UNSPEC),
                     ("dae0_ingress", true, TC_ACT_REDIRECT),
                 ]
                 .into_iter()
@@ -223,7 +225,7 @@ fn retirement_fence_prevents_missing_tuple_publication_and_reply_fallback() {
 
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
-fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_directions() {
+fn forward_syn_publisher_refuses_busy_and_releases_for_reuse_while_reverse_syn_is_ignored() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
         for name in ["lan_egress_l2", "wan_ingress_l2"] {
@@ -233,8 +235,8 @@ fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_direction
         for (index, (side, reverse, expected)) in [
             ("lan_ingress_l2", false, TC_ACT_REDIRECT),
             ("wan_egress_l2", false, TC_ACT_REDIRECT),
-            ("lan_egress_l2", true, TC_ACT_PIPE),
-            ("wan_ingress_l2", true, TC_ACT_PIPE),
+            ("lan_egress_l2", true, TC_ACT_UNSPEC),
+            ("wan_ingress_l2", true, TC_ACT_UNSPEC),
         ]
         .into_iter()
         .enumerate()
@@ -252,7 +254,7 @@ fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_direction
             };
             assert_eq!(
                 run(&backend, side, &syn, SkbInput::default()).verdict,
-                TC_ACT_SHOT,
+                if reverse { TC_ACT_UNSPEC } else { TC_ACT_SHOT },
                 "{side} {src}"
             );
             assert_eq!(owned_values(&backend, &key), before);
@@ -287,8 +289,12 @@ fn same_tuple_syn_publisher_refuses_busy_and_releases_for_reuse_on_all_direction
                     .unwrap()
                     .unwrap()
                     .incarnation;
-                assert_ne!(current, previous);
-                assert_ne!(current, 0);
+                if reverse {
+                    assert_eq!(current, previous, "{side} reverse SYN must not publish");
+                } else {
+                    assert_ne!(current, previous);
+                    assert_ne!(current, 0);
+                }
                 assert_eq!(
                     backend
                         .hash_lookup::<_, u64>("TCP_PUBLISHING", &key)
@@ -543,7 +549,7 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
             assert_eq!(
                 outcomes,
                 [
-                    RetireOutcome::Done(UdpDecisionCommitResult::Applied),
+                    RetireOutcome::ConnRetired,
                     RetireOutcome::Done(UdpDecisionCommitResult::Superseded),
                     RetireOutcome::Done(UdpDecisionCommitResult::StateMismatch)
                 ]

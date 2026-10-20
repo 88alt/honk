@@ -27,6 +27,36 @@ use async_trait::async_trait;
 use honk_ebpf_common::*;
 use std::collections::HashMap;
 
+// Stable ordering models a kernel bucket cursor without relying on HashMap's
+// randomized order, which can change when a previous scan retires elements.
+fn scan_model<K, V: Copy>(
+    entries: impl Iterator<Item = ([u8; 40], V)>,
+    chunk_size: usize,
+    cursor: &mut super::FlowScanCursor,
+    decode: impl Fn(&[u8; 40]) -> K,
+    mut visit: impl FnMut(&[(K, V)]) -> bool,
+) {
+    let mut entries: Vec<_> = entries
+        .filter(|(key, _)| cursor.next_key.is_none_or(|next| *key >= next))
+        .collect();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    let size = chunk_size.max(1);
+    let mut chunk = Vec::with_capacity(size);
+    for (index, entries_chunk) in entries.chunks(size).enumerate() {
+        chunk.clear();
+        chunk.extend(
+            entries_chunk
+                .iter()
+                .map(|(key, value)| (decode(key), *value)),
+        );
+        cursor.next_key = entries.get((index + 1) * size).map(|(key, _)| *key);
+        if !visit(&chunk) {
+            return;
+        }
+    }
+    cursor.next_key = None;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MockRoutingSnapshot {
     pub active_slot: u32,
@@ -57,6 +87,14 @@ struct MockRoutingGeneration {
     domain: HashMap<[u32; 4], DomainRouting>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct MockTelemetryFaults {
+    pub stats: bool,
+    pub conn_occupancy: bool,
+    pub aux_occupancy: bool,
+}
+
 /// In-memory transactional routing backend used by control-plane tests.
 #[derive(Debug, Default)]
 pub struct MockEbpfBackend {
@@ -84,14 +122,34 @@ pub struct MockEbpfBackend {
     pub routing_handoffs: parking_lot::Mutex<HashMap<[u8; 40], RoutingHandoffEntry>>,
     /// Tuple fences retained by model fixtures for allocator conflict checks.
     retire_fences: HashMap<[u8; 40], RetirementFence>,
+    /// Model grace latency; a batch waits once rather than once per item.
+    #[cfg(test)]
+    pub commit_delay: Option<std::time::Duration>,
+    #[cfg(test)]
+    pub commit_barrier_fault: bool,
+    #[cfg(test)]
+    pub commit_release_fault: bool,
+    #[cfg(test)]
+    pub commit_release_delay: Option<std::time::Duration>,
+    #[cfg(test)]
+    pub commit_fence_unresolved: bool,
+    #[cfg(test)]
+    pub commit_item_delay: Option<(usize, std::time::Duration)>,
+    #[cfg(test)]
+    pub commit_batch_sizes: std::sync::Arc<parking_lot::Mutex<Vec<usize>>>,
+    #[cfg(test)]
+    pub commit_trace: std::sync::Arc<parking_lot::Mutex<Vec<(u32, UdpDecisionTransition)>>>,
     #[cfg(test)]
     pub retire_fault_after: Option<usize>,
     /// Outbound alive bitmap: (outbound*6 + domain*2 + ipver) → 0|1
     pub outbound_alive: HashMap<u32, u32>,
     /// BPF statistics overflow counters
     pub bpf_stats: HashMap<u32, u64>,
+    #[cfg(test)]
+    pub telemetry_faults: std::sync::Arc<parking_lot::Mutex<MockTelemetryFaults>>,
     /// Whether TC entry points may redirect traffic into the control plane.
     pub datapath_ready: bool,
+    pub admission_pressure: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub listener_sockets_published: bool,
     listener_socket_slots: HashMap<u32, std::os::fd::RawFd>,
     #[cfg(test)]
@@ -239,7 +297,7 @@ impl MockEbpfBackend {
         &mut self,
         request: &RetireRequest<'_>,
         counts: &mut RetireCounts,
-    ) -> UdpDecisionCommitResult {
+    ) -> RetireOutcome {
         let raw = Self::tuples_key_bytes(&request.key);
         let track_raw = Self::redirect_tuple_bytes(&RedirectTuple::from_tuples(&request.key));
         let reads = request.kind.owner_reads();
@@ -262,7 +320,7 @@ impl MockEbpfBackend {
         };
         let plan = match plan_retirement(request, &owners) {
             Ok(plan) => plan,
-            Err(result) => return result,
+            Err(result) => return result.into(),
         };
         let before = *counts;
         if plan.handoff {
@@ -303,7 +361,7 @@ impl MockEbpfBackend {
             }
             #[cfg(not(test))]
             let _ = index;
-            *outcome = self.retire_model_request(request, counts).into();
+            *outcome = self.retire_model_request(request, counts);
         }
         Ok(())
     }
@@ -837,6 +895,11 @@ impl EbpfBackend for MockEbpfBackend {
         token: u32,
         state: Option<ConnState>,
     ) -> anyhow::Result<super::UdpFlowOwner> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.commit_fence_unresolved,
+            "retirement ownership is unresolved"
+        );
         let Some(state) = state else {
             anyhow::ensure!(token == 0, "model staged UDP admission has no conn-state");
             return super::UdpFlowOwner::new(token, None);
@@ -861,6 +924,15 @@ impl EbpfBackend for MockEbpfBackend {
         token: u32,
         transition: UdpDecisionTransition,
     ) -> anyhow::Result<UdpDecisionCommitResult> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.commit_fence_unresolved,
+            "retirement ownership is unresolved"
+        );
+        #[cfg(test)]
+        if let Some(delay) = self.commit_delay {
+            std::thread::sleep(delay);
+        }
         validate_udp_decision_transition(transition)?;
         if token == 0 {
             return Ok(UdpDecisionCommitResult::TokenMismatch);
@@ -871,6 +943,12 @@ impl EbpfBackend for MockEbpfBackend {
         };
         if state.decision_token != token {
             return Ok(UdpDecisionCommitResult::TokenMismatch);
+        }
+        #[cfg(test)]
+        if !matches!(transition, UdpDecisionTransition::ActivateDirect(_))
+            && std::mem::take(&mut self.commit_barrier_fault)
+        {
+            anyhow::bail!("injected UDP commit barrier failure");
         }
         let handoff = self.routing_handoffs.lock().get(&key_bytes).copied();
         // Explicit model fixtures may commit a zero-identity staged flow.
@@ -894,7 +972,87 @@ impl EbpfBackend for MockEbpfBackend {
             None => {}
         }
         self.udp_conn_states.insert(key_bytes, plan.state);
+        #[cfg(test)]
+        self.commit_trace.lock().push((token, transition));
         Ok(UdpDecisionCommitResult::Applied)
+    }
+
+    fn commit_udp_batch(
+        &mut self,
+        requests: &[super::UdpDecisionCommit],
+        visit: &mut super::UdpCommitVisit<'_>,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.commit_fence_unresolved,
+            "retirement ownership is unresolved"
+        );
+        anyhow::ensure!(
+            requests.len() <= RETIRE_BATCH_CAPACITY,
+            "UDP commit batch exceeds capacity"
+        );
+        for request in requests {
+            validate_udp_decision_transition(request.transition)?;
+            anyhow::ensure!(
+                !matches!(request.transition, UdpDecisionTransition::ActivateDirect(_)),
+                "direct activation cannot enter a fenced batch"
+            );
+            anyhow::ensure!(
+                request.key.padding == [0; 3] && request.key.l4proto == libc::IPPROTO_UDP as u8,
+                "noncanonical UDP commit tuple"
+            );
+        }
+        #[cfg(test)]
+        let delay = self.commit_delay.take();
+        #[cfg(test)]
+        let fenced = requests.iter().any(|request| {
+            request.token != 0
+                && self
+                    .udp_conn_states
+                    .contains_key(&Self::tuples_key_bytes(&request.key))
+        });
+        let result = (|| {
+            #[cfg(test)]
+            {
+                self.commit_batch_sizes.lock().push(requests.len());
+                if let Some(delay) = delay
+                    && fenced
+                {
+                    std::thread::sleep(delay);
+                }
+                if fenced && std::mem::take(&mut self.commit_barrier_fault) {
+                    anyhow::bail!("injected UDP commit barrier failure");
+                }
+            }
+            for (index, request) in requests.iter().enumerate() {
+                #[cfg(test)]
+                if let Some((delayed, duration)) = self.commit_item_delay
+                    && delayed == index
+                {
+                    std::thread::sleep(duration);
+                }
+                visit(index, &mut || {
+                    self.commit_udp_decision(&request.key, request.token, request.transition)
+                })?;
+            }
+            #[cfg(test)]
+            if let Some(delay) = self.commit_release_delay
+                && fenced
+            {
+                std::thread::sleep(delay);
+            }
+            #[cfg(test)]
+            if fenced && std::mem::take(&mut self.commit_release_fault) {
+                self.commit_fence_unresolved = true;
+                anyhow::bail!("injected UDP commit fence release failure");
+            }
+            Ok(())
+        })();
+        #[cfg(test)]
+        {
+            self.commit_delay = delay;
+        }
+        result
     }
     fn adopt_tcp(
         &self,
@@ -934,6 +1092,33 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn take_expiry_hints(&mut self) -> Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>> {
         None
+    }
+
+    fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.telemetry_faults.lock().conn_occupancy,
+            "injected conn occupancy read failure"
+        );
+        Ok((0, 0))
+    }
+
+    fn aux_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.telemetry_faults.lock().aux_occupancy,
+            "injected auxiliary occupancy read failure"
+        );
+        Ok((
+            self.redirect_tracks.len() as u64,
+            self.routing_handoffs.lock().len() as u64,
+        ))
+    }
+
+    fn set_admission_pressure(&mut self, pressured: bool) -> anyhow::Result<()> {
+        self.admission_pressure
+            .store(pressured, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     fn retire_batch(
@@ -1093,73 +1278,67 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>> {
+        #[cfg(test)]
+        anyhow::ensure!(
+            !self.telemetry_faults.lock().stats,
+            "injected BPF stats read failure"
+        );
         Ok(self.bpf_stats.get(&key).copied())
     }
 
     fn redirect_track_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut super::FlowScanCursor,
         visit: &mut super::RedirectTrackChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        let mut chunk = Vec::with_capacity(chunk_size.max(1));
-        for (key, entry) in &self.redirect_tracks {
-            chunk.push((Self::bytes_to_redirect_tuple(key), *entry));
-            if chunk.len() == chunk_size.max(1) {
-                if !visit(&chunk) {
-                    return Ok(());
-                }
-                chunk.clear();
-            }
-        }
-        if !chunk.is_empty() {
-            visit(&chunk);
-        }
+        scan_model(
+            self.redirect_tracks
+                .iter()
+                .map(|(key, value)| (*key, *value)),
+            chunk_size,
+            cursor,
+            Self::bytes_to_redirect_tuple,
+            visit,
+        );
         Ok(())
     }
 
     fn routing_handoff_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut super::FlowScanCursor,
         visit: &mut super::RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        let mut chunk = Vec::with_capacity(chunk_size.max(1));
-        for (key, entry) in self.routing_handoffs.lock().iter() {
-            chunk.push((Self::bytes_to_tuples_key(key), *entry));
-            if chunk.len() == chunk_size.max(1) {
-                if !visit(&chunk) {
-                    return Ok(());
-                }
-                chunk.clear();
-            }
-        }
-        if !chunk.is_empty() {
-            visit(&chunk);
-        }
+        scan_model(
+            self.routing_handoffs
+                .lock()
+                .iter()
+                .map(|(key, value)| (*key, *value)),
+            chunk_size,
+            cursor,
+            Self::bytes_to_tuples_key,
+            visit,
+        );
         Ok(())
     }
 
     fn conn_state_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut super::FlowScanCursor,
         visit: &mut super::ConnStateChunkVisitor<'_>,
     ) -> anyhow::Result<()> {
-        let mut chunk = Vec::with_capacity(chunk_size.max(1));
-        for (key, entry) in self
-            .tcp_conn_states
-            .iter()
-            .chain(self.udp_conn_states.iter())
-        {
-            chunk.push((Self::bytes_to_tuples_key(key), *entry));
-            if chunk.len() == chunk_size.max(1) {
-                if !visit(&chunk) {
-                    return Ok(());
-                }
-                chunk.clear();
-            }
-        }
-        if !chunk.is_empty() {
-            visit(&chunk);
-        }
+        scan_model(
+            self.tcp_conn_states
+                .iter()
+                .chain(self.udp_conn_states.iter())
+                .map(|(key, value)| (*key, *value)),
+            chunk_size,
+            cursor,
+            Self::bytes_to_tuples_key,
+            visit,
+        );
         Ok(())
     }
 
@@ -1195,6 +1374,8 @@ impl EbpfBackend for MockEbpfBackend {
 
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         self.datapath_ready = false;
+        self.admission_pressure
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         self.listener_sockets_published = false;
         self.listener_socket_slots.clear();
         self.routing_generation = None;
@@ -1567,14 +1748,19 @@ mod batch_retirement_tests {
         assert_eq!(counts, RetireCounts::default());
         assert_eq!(outcome, UdpDecisionCommitResult::Superseded);
         assert!(backend.routing_handoff_lookup(&key).unwrap().is_some());
-        let (counts, outcome) = retire_fixture(
-            &mut backend,
-            key,
-            RetireKind::ExpiryHint {
-                incarnation: 1,
-                now_ns: 31_000_000_000,
-            },
-        );
+        let mut outcomes = [RetireOutcome::NotRun];
+        let counts = backend
+            .retire_batch(
+                &[RetireRequest {
+                    key,
+                    kind: RetireKind::ExpiryHint {
+                        incarnation: 1,
+                        now_ns: 31_000_000_000,
+                    },
+                }],
+                &mut outcomes,
+            )
+            .unwrap();
         assert_eq!(
             counts,
             RetireCounts {
@@ -1582,7 +1768,10 @@ mod batch_retirement_tests {
                 ..Default::default()
             }
         );
-        assert_eq!(outcome, UdpDecisionCommitResult::Applied);
+        assert_eq!(
+            outcomes,
+            [RetireOutcome::Done(UdpDecisionCommitResult::Applied)]
+        );
         assert!(backend.routing_handoff_lookup(&key).unwrap().is_none());
         assert!(
             backend
@@ -1620,16 +1809,20 @@ mod batch_retirement_tests {
                 .incarnation,
             1
         );
-        let (counts, outcome) = retire_fixture(
-            &mut backend,
-            key,
-            RetireKind::ExpiryHint {
-                incarnation: 1,
-                now_ns: 31_000_000_001 + honk_ebpf_common::conn::UDP_CONN_STATE_TIMEOUT_NS,
-            },
-        );
+        let counts = backend
+            .retire_batch(
+                &[RetireRequest {
+                    key,
+                    kind: RetireKind::ExpiryHint {
+                        incarnation: 1,
+                        now_ns: 31_000_000_001 + honk_ebpf_common::conn::UDP_CONN_STATE_TIMEOUT_NS,
+                    },
+                }],
+                &mut outcomes,
+            )
+            .unwrap();
         assert_eq!(counts.conn, 1);
-        assert_eq!(outcome, UdpDecisionCommitResult::Applied);
+        assert_eq!(outcomes, [RetireOutcome::ConnRetired]);
         assert!(backend.conn_state_lookup(&key).unwrap().is_none());
     }
 
@@ -1771,7 +1964,7 @@ mod batch_retirement_tests {
         assert_eq!(
             outcomes,
             [
-                RetireOutcome::Done(UdpDecisionCommitResult::Applied),
+                RetireOutcome::ConnRetired,
                 RetireOutcome::Done(UdpDecisionCommitResult::Missing),
                 RetireOutcome::NotRun
             ]
@@ -1888,6 +2081,7 @@ mod tests {
                 .unwrap(),
             UdpDecisionCommitResult::StateMismatch
         );
+        backend.commit_barrier_fault = true;
         assert_eq!(
             backend
                 .commit_udp_decision(&key, 7, UdpDecisionTransition::ActivateDirect(0x1234))
@@ -1899,6 +2093,12 @@ mod tests {
         assert_eq!(active.state, UdpDecisionState::None as u8);
         assert_eq!((active_raw >> 8) & 0xffff_ffff, 0x1234);
         assert_ne!(active_raw & ROUTING_META_FLAG_OFFLOAD, 0);
+        assert!(
+            backend.commit_barrier_fault,
+            "activation used a grace barrier"
+        );
+        assert_eq!(active.last_seen_ns, armed.last_seen_ns);
+        assert_eq!(active.incarnation, armed.incarnation);
         assert_eq!(
             backend
                 .commit_udp_decision(&key, 7, UdpDecisionTransition::ActivateDirect(0x1234))

@@ -18,7 +18,8 @@ impl PendingUdpVerdicts {
                 decision_token,
             } => (key.tuples(), decision_token, None),
         };
-        match crate::ebpf::retire_pending(backend, key, token, incarnation) {
+        match blocking_section(|| crate::ebpf::retire_pending(backend, key, token, incarnation)) {
+            Ok(crate::ebpf::RetireOutcome::ConnRetired) => Ok(None),
             Ok(outcome) if outcome.settled() => Ok(None),
             Ok(crate::ebpf::RetireOutcome::Done(refusal)) => Ok(Some(refusal)),
             Ok(crate::ebpf::RetireOutcome::NotRun) => Err(self.fatal_error(
@@ -74,7 +75,7 @@ impl PendingUdpVerdicts {
             }
         }
         for identity in overdue {
-            let _ = self.cancel(identity).await;
+            let _ = self.cancel_unarmed(identity).await;
         }
         for (key, cell) in expired {
             self.remove_if_expired(key, &cell, now);
@@ -91,7 +92,7 @@ impl PendingUdpVerdicts {
                 return;
             };
             let retry = match request {
-                CleanupRequest::Flow(identity) => match self.cancel(identity).await {
+                CleanupRequest::Flow(identity) => match self.cancel_unarmed(identity).await {
                     Ok(()) | Err(PendingUdpDecisionError::StaleIdentity) => false,
                     Err(PendingUdpDecisionError::ArmedInProgress) => true,
                     Err(PendingUdpDecisionError::ReservedDirectMark) => unreachable!(),
@@ -150,7 +151,6 @@ impl PendingUdpVerdicts {
     pub(super) async fn backend_before_deadline<'a>(
         &'a self,
         cell: &Arc<FlowCell>,
-        identity: PendingUdpIdentity,
     ) -> Result<tokio::sync::RwLockWriteGuard<'a, Box<dyn EbpfBackend>>, PendingUdpDecisionError>
     {
         let deadline = {
@@ -164,7 +164,7 @@ impl PendingUdpVerdicts {
             .await
         {
             Ok(backend) => Ok(backend),
-            Err(_) => Err(self.expire_unarmed_pending(cell, identity)),
+            Err(_) => Err(self.expire_commit(cell)),
         }
     }
 
@@ -433,7 +433,7 @@ impl PendingUdpVerdicts {
     }
 
     pub(in crate::control) fn is_empty(&self) -> bool {
-        self.cells.is_empty() && self.scheduled_cleanups.lock().is_empty()
+        self.cells.is_empty() && self.scheduled_cleanups.lock().is_empty() && self.commits.is_idle()
     }
 
     pub(in crate::control) async fn wait_empty(&self) {
@@ -474,15 +474,7 @@ impl PendingUdpVerdicts {
                 break;
             }
             for cell in armed {
-                let notified = cell.changed.notified();
-                if matches!(&*cell.state.lock(), CellState::Pending { armed: true, .. }) {
-                    tokio::select! {
-                        _ = notified => {}
-                        _ = tokio::time::sleep(WATCHDOG_INTERVAL) => {
-                            self.fail_armed(&cell, cell.identity);
-                        }
-                    }
-                }
+                let _ = self.wait_armed(&cell, cell.identity).await;
             }
         }
         self.drain_scheduled_cleanups().await;

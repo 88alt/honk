@@ -11,6 +11,21 @@ pub mod real;
 #[cfg(feature = "ebpf")]
 pub use real::TcpKernelPin;
 
+/// Resume state for a bounded traversal of one tuple map. A completed traversal
+/// resets it, so the next scan starts a new pass. Batch cursors name buckets,
+/// not keys that retirement can remove between scans.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlowScanCursor {
+    pub(crate) batch: Option<[u8; 4]>,
+    pub(crate) next_key: Option<[u8; 40]>,
+}
+
+impl FlowScanCursor {
+    pub(crate) fn is_start(self) -> bool {
+        self.batch.is_none() && self.next_key.is_none()
+    }
+}
+
 pub type TcpPinErrorSink =
     std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::mpsc::UnboundedSender<anyhow::Error>>>>;
 
@@ -105,6 +120,16 @@ pub enum UdpDecisionTransition {
     ActivateProxy(u8, u32),
     Block,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct UdpDecisionCommit {
+    pub key: TuplesKey,
+    pub token: u32,
+    pub transition: UdpDecisionTransition,
+}
+
+pub type UdpCommitApply<'a> = dyn FnMut() -> anyhow::Result<UdpDecisionCommitResult> + 'a;
+pub type UdpCommitVisit<'a> = dyn FnMut(usize, &mut UdpCommitApply<'_>) -> anyhow::Result<()> + 'a;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpDecisionCommitResult {
@@ -267,11 +292,11 @@ pub enum IfaceRole {
     /// slave (mirrors the startup expansion).
     LanBridgeSlave,
     /// Slave of a configured LAN bond master: packets may arrive/leave on the
-    /// slave without touching the master's qdiscs, so it gets
+    /// slave without touching the master's TC hooks, so it gets
     /// lan_ingress + wan_egress (mirrors the startup expansion).
     LanBondSlave,
     /// Slave of a WAN bond master: locally-originated traffic can bypass the
-    /// master's egress qdisc, so only wan_egress belongs on this interface.
+    /// master's egress hook, so only wan_egress belongs on this interface.
     WanBondSlave,
 }
 
@@ -637,7 +662,7 @@ pub trait EbpfBackend: Send + Sync {
     /// Locked snapshot of one tuple's conn state, for either protocol.
     fn conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
     /// Raw fixture writes bypass fencing; production mutation goes through
-    /// `commit_udp_decision` and `retire_batch`.
+    /// `commit_udp_decision`, `commit_udp_batch` and `retire_batch`.
     #[cfg(test)]
     fn tcp_conn_state_store(&mut self, _key: &TuplesKey, _state: &ConnState) -> anyhow::Result<()> {
         anyhow::bail!("raw TCP conn-state fixture writes are unsupported")
@@ -695,6 +720,17 @@ pub trait EbpfBackend: Send + Sync {
         token: u32,
         transition: UdpDecisionTransition,
     ) -> anyhow::Result<UdpDecisionCommitResult>;
+
+    /// Fence a bounded batch of initial UDP decisions once. After grace, visit
+    /// each item in order with its exact-owner recheck/mutation. The visitor may
+    /// skip an expired item or hold its cell lock across the apply call. Success
+    /// includes exact fence release; callers must not acknowledge before return.
+    /// ActivateDirect uses `commit_udp_decision`, never this fenced batch.
+    fn commit_udp_batch(
+        &mut self,
+        requests: &[UdpDecisionCommit],
+        visit: &mut UdpCommitVisit<'_>,
+    ) -> anyhow::Result<()>;
 
     /// Retire captured owners under one bounded tuple-fence/grace batch.
     fn retire_batch(
@@ -787,6 +823,7 @@ pub trait EbpfBackend: Send + Sync {
     fn conn_state_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut FlowScanCursor,
         visit: &mut ConnStateChunkVisitor<'_>,
     ) -> anyhow::Result<()>;
 
@@ -799,17 +836,29 @@ pub trait EbpfBackend: Send + Sync {
         Ok((0, 0))
     }
 
+    /// Live `(redirect, handoff)` element estimates: the datapath's cumulative
+    /// inserts minus what userspace retirement removed. Backends without the
+    /// gauge return `(0, 0)`.
+    fn aux_occupancy(&self) -> anyhow::Result<(u64, u64)> {
+        Ok((0, 0))
+    }
+
+    /// Publish the janitor's conn-only reverse-UDP admission latch.
+    fn set_admission_pressure(&mut self, pressured: bool) -> anyhow::Result<()>;
+
     /// Stream REDIRECT_TRACK in bounded chunks. The callback can stop at a
     /// chunk boundary so callers can retain a wall-clock budget.
     fn redirect_track_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut FlowScanCursor,
         visit: &mut RedirectTrackChunkVisitor<'_>,
     ) -> anyhow::Result<()>;
 
     fn routing_handoff_for_each_chunk(
         &self,
         chunk_size: usize,
+        cursor: &mut FlowScanCursor,
         visit: &mut RoutingHandoffChunkVisitor<'_>,
     ) -> anyhow::Result<()>;
 }
