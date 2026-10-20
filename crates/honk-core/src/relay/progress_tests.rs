@@ -22,6 +22,8 @@ async fn copy_reports_response_while_client_blocked_and_progress_before_eof() {
         let progress = RelayProgress {
             upload: Arc::new(AtomicU64::new(0)),
             download: Arc::new(AtomicU64::new(0)),
+            outbound_upload: None,
+            outbound_download: None,
             first_response: Some(Arc::new({
                 let responses = responses.clone();
                 let response_ready = response_ready.clone();
@@ -196,6 +198,18 @@ async fn copy_errors_preserve_endpoint_origin_original_error_and_accepted_bytes(
                 true,
             ),
             (
+                Read,
+                ErrorKind::HostUnreachable,
+                Some(libc::EHOSTUNREACH),
+                true,
+            ),
+            (
+                Write,
+                ErrorKind::NetworkUnreachable,
+                Some(libc::ENETUNREACH),
+                true,
+            ),
+            (
                 EofFlush,
                 ErrorKind::ConnectionAborted,
                 Some(libc::ECONNABORTED),
@@ -253,6 +267,8 @@ async fn copy_errors_preserve_endpoint_origin_original_error_and_accepted_bytes(
                 let progress = RelayProgress {
                     upload: upload.clone(),
                     download: download.clone(),
+                    outbound_upload: None,
+                    outbound_download: None,
                     first_response: None,
                     on_transfer: Some(Arc::new({
                         let accepted = accepted.clone();

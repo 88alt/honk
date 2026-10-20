@@ -1,5 +1,9 @@
 use super::*;
+use super::{UdpTerminal, UplinkStall};
 use honk_outbound::proxy::QuicSendAttempt;
+
+mod reply;
+use reply::{is_local_reply_error, receive_loop};
 
 /// How long the endpoint driver waits for proxy data before giving up.
 pub(super) const REPLY_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -36,20 +40,6 @@ fn is_reply_idle_timeout(error: &io::Error) -> bool {
         .get_ref()
         .and_then(|source| source.downcast_ref::<ReplyIdleTimeout>())
         .is_some()
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct LocalReplyError(#[source] io::Error);
-
-fn local_reply_error(error: io::Error) -> io::Error {
-    io::Error::new(error.kind(), LocalReplyError(error))
-}
-
-fn is_local_reply_error(error: &io::Error) -> bool {
-    error
-        .get_ref()
-        .is_some_and(|source| source.is::<LocalReplyError>())
 }
 
 impl PacketSendFailure {
@@ -95,17 +85,20 @@ impl Default for TaskRegistry {
     }
 }
 
-async fn drain_registered_tasks(tasks: &mut tokio::task::JoinSet<()>, label: &str) -> bool {
-    let mut clean = true;
+async fn drain_registered_tasks(
+    tasks: &mut tokio::task::JoinSet<()>,
+    label: &str,
+    disposition: &mut UdpShutdown,
+) {
     while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result
-            && !error.is_cancelled()
-        {
-            clean = false;
-            debug!("UDP {} task join failed during shutdown: {}", label, error);
+        if let Err(error) = result {
+            disposition.graceful = false;
+            if !error.is_cancelled() {
+                disposition.joined = false;
+                debug!("UDP {} task join failed during shutdown: {}", label, error);
+            }
         }
     }
-    clean
 }
 
 pub(super) async fn join_registered_tasks(
@@ -113,38 +106,43 @@ pub(super) async fn join_registered_tasks(
     label: &str,
     graceful_timeout: Duration,
     abort_first: bool,
-) -> bool {
+) -> UdpShutdown {
+    let mut disposition = UdpShutdown {
+        joined: true,
+        graceful: !abort_first,
+    };
     if abort_first {
         tasks.abort_all();
     }
-    match tokio::time::timeout(
+    if tokio::time::timeout(
         if abort_first {
             DRIVER_ABORT_TIMEOUT
         } else {
             graceful_timeout
         },
-        drain_registered_tasks(&mut tasks, label),
+        drain_registered_tasks(&mut tasks, label, &mut disposition),
     )
     .await
+    .is_err()
     {
-        Ok(clean) => clean,
-        Err(_) => {
-            debug!(
-                "Forcing cancellation of UDP {} tasks during shutdown",
-                label
-            );
-            tasks.abort_all();
-            tokio::time::timeout(
-                DRIVER_ABORT_TIMEOUT,
-                drain_registered_tasks(&mut tasks, label),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                debug!("Timed out joining aborted UDP {} tasks", label);
-                false
-            })
+        disposition.graceful = false;
+        debug!(
+            "Forcing cancellation of UDP {} tasks during shutdown",
+            label
+        );
+        tasks.abort_all();
+        if tokio::time::timeout(
+            DRIVER_ABORT_TIMEOUT,
+            drain_registered_tasks(&mut tasks, label, &mut disposition),
+        )
+        .await
+        .is_err()
+        {
+            debug!("Timed out joining aborted UDP {} tasks", label);
+            disposition.joined = false;
         }
     }
+    disposition
 }
 
 pub(super) struct UdpDriverStart {
@@ -250,6 +248,7 @@ pub(super) struct UdpDriverContext {
 
 impl Drop for UdpDriverCleanupGuard {
     fn drop(&mut self) {
+        self.endpoint.native.finish(UdpTerminal::DriverCancelled);
         self.endpoint
             .finish_score(if self.pool.terminal.load(Ordering::Acquire) {
                 ScoreOutcome::Shutdown
@@ -352,6 +351,41 @@ pub(super) fn score_driver_outcome(
     }
 }
 
+#[cfg(feature = "native-api")]
+impl UdpEndpoint {
+    fn finish_native_driver(&self, result: &io::Result<()>) {
+        if let EndpointTransport::Source(source) = &self.transport
+            && let Some(retirement) = source.score_retirement()
+        {
+            self.finish_native_source(retirement);
+            return;
+        }
+        let outcome = if self.dead.load(Ordering::Acquire) {
+            UdpTerminal::IntentionalRetirement
+        } else {
+            match result {
+                Err(error) if is_reply_idle_timeout(error) => {
+                    if self.has_reply() {
+                        UdpTerminal::ReplyIdle
+                    } else if self.native.received_reply() {
+                        UdpTerminal::TimeoutAfterReply
+                    } else {
+                        UdpTerminal::TimeoutBeforeReply
+                    }
+                }
+                Err(error) => match honk_outbound::proxy::packet_error_class(error) {
+                    honk_outbound::proxy::PacketErrorClass::Rejected => UdpTerminal::PacketRejected,
+                    honk_outbound::proxy::PacketErrorClass::Congestion => UdpTerminal::Congestion,
+                    _ if error.kind() == io::ErrorKind::TimedOut => UdpTerminal::TransportTimeout,
+                    _ => UdpTerminal::TransportError,
+                },
+                Ok(()) => UdpTerminal::DriverCompleted,
+            }
+        };
+        self.native.finish(outcome);
+    }
+}
+
 impl UdpEndpointPool {
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) fn spawn_driver(
@@ -365,11 +399,10 @@ impl UdpEndpointPool {
         reply_socket: impl Into<DriverReplySocket>,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         stats: Arc<StatsManager>,
-        outbound_name: String,
+        outbound_tracker: OutboundTracker,
     ) -> UdpDriverHandle {
         let reply_socket = reply_socket.into().into_socket();
         let key = EndpointKey::new(client_addr, client_dst);
-        let outbound_tracker = stats.outbound_tracker(&outbound_name);
         let (ready_tx, ready) = oneshot::channel();
         let (start, start_rx) = oneshot::channel();
         let (first_ack_tx, first_ack) = oneshot::channel();
@@ -392,47 +425,53 @@ impl UdpEndpointPool {
                 task: None,
             };
         }
+        let mut io = endpoint.retirement.0.start_driver();
         let task = drivers.tasks.spawn(async move {
-            // Construct before every await so abort and panic take the same
-            // cleanup path as an ordinary driver return.
-            let mut _cleanup = UdpDriverCleanupGuard::new(
-                Arc::clone(&pool),
-                key,
-                generation,
-                decision_token,
-                Arc::clone(&endpoint),
-            );
-            let _ = ready_tx.send(());
-            let initial = match start_rx.await {
-                Ok(initial) => initial,
-                Err(_) => return,
-            };
-            let driver_result = run_endpoint_driver(
-                UdpDriverContext {
-                    endpoint: Arc::clone(&endpoint),
-                    queue_rx,
-                    reply_socket,
-                    reply_socket_factory: Arc::clone(&pool.reply_socket_factory),
-                    reply_socket_slots: Arc::clone(&pool.reply_socket_slots),
-                    client_addr,
-                    client_dst,
-                    alive_set,
-                    stats,
-                    outbound_tracker,
-                    health_family: endpoint.health_family,
-                },
-                initial,
-                first_ack_tx,
-            )
-            .await;
-            let UdpDriverResult { result, outcome } = driver_result;
-            _cleanup.set_outcome(outcome);
-            if let Err(error) = result {
-                debug!(
-                    "UDP endpoint driver {} -> {} stopped: {}",
-                    client_addr, client_dst, error
+            async move {
+                // Construct before every await so abort and panic take the same
+                // cleanup path as an ordinary driver return.
+                let mut _cleanup = UdpDriverCleanupGuard::new(
+                    Arc::clone(&pool),
+                    key,
+                    generation,
+                    decision_token,
+                    Arc::clone(&endpoint),
                 );
+                let _ = ready_tx.send(());
+                let initial = match start_rx.await {
+                    Ok(initial) => initial,
+                    Err(_) => return,
+                };
+                let driver_result = run_endpoint_driver(
+                    UdpDriverContext {
+                        endpoint: Arc::clone(&endpoint),
+                        queue_rx,
+                        reply_socket,
+                        reply_socket_factory: Arc::clone(&pool.reply_socket_factory),
+                        reply_socket_slots: Arc::clone(&pool.reply_socket_slots),
+                        client_addr,
+                        client_dst,
+                        alive_set,
+                        stats,
+                        outbound_tracker,
+                        health_family: endpoint.health_family,
+                    },
+                    initial,
+                    first_ack_tx,
+                )
+                .await;
+                let UdpDriverResult { result, outcome } = driver_result;
+                _cleanup.set_outcome(outcome);
+                if let Err(error) = result {
+                    debug!(
+                        "UDP endpoint driver {} -> {} stopped: {}",
+                        client_addr, client_dst, error
+                    );
+                }
             }
+            .await;
+            io.completed = true;
+            drop(io);
         });
         drop(drivers);
         #[cfg(not(test))]
@@ -487,6 +526,8 @@ pub(super) async fn run_endpoint_driver(
         let mut result = Err(failure.into_io_error());
         // Health reporting can synchronously retire and mark this endpoint dead.
         let outcome = score_driver_outcome(&endpoint, &result);
+        #[cfg(feature = "native-api")]
+        endpoint.finish_native_driver(&result);
         if !neutral && !endpoint.is_source() && !endpoint.dead.load(Ordering::Acquire) {
             alive_set.report_unavailable_traffic(
                 endpoint.node_id,
@@ -519,12 +560,16 @@ pub(super) async fn run_endpoint_driver(
             Err(PacketSendFailure::Rejected(error)) => {
                 let mut result = Err(error);
                 let outcome = score_driver_outcome(&endpoint, &result);
+                #[cfg(feature = "native-api")]
+                endpoint.finish_native_driver(&result);
                 let _ = first_ack.send(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
                 return UdpDriverResult { result, outcome };
             }
             Err(PacketSendFailure::Transport(error)) => {
                 let mut result = Err(error);
                 let outcome = score_driver_outcome(&endpoint, &result);
+                #[cfg(feature = "native-api")]
+                endpoint.finish_native_driver(&result);
                 if !endpoint.is_source() && !endpoint.dead.load(Ordering::Acquire) {
                     alive_set.report_unavailable_traffic(
                         endpoint.node_id,
@@ -574,6 +619,8 @@ pub(super) async fn run_endpoint_driver(
             result = &mut receiver => result,
         }
     };
+    #[cfg(feature = "native-api")]
+    endpoint.finish_native_driver(&result);
     if endpoint.is_source() && result.as_ref().err().is_some_and(is_reply_idle_timeout) {
         endpoint.source_flow_idle_expired();
     }
@@ -695,15 +742,21 @@ async fn send_one(
         if first {
             stats.record_udp_first_send_failure();
         }
+        endpoint
+            .native
+            .dropped("queue_expired", Some("queue_expired"));
         return Err(PacketSendFailure::Congestion(io::Error::new(
             io::ErrorKind::TimedOut,
             QUEUED_PACKET_EXPIRED,
         )));
     }
-    endpoint
-        .begin_send_attempt()
-        .map_err(PacketSendFailure::Transport)?;
-    let attempt = endpoint.flow_transport().map(QuicSendAttempt::new);
+    if let Err(error) = endpoint.begin_send_attempt() {
+        endpoint
+            .native
+            .dropped("endpoint_retired", Some("send_cancelled"));
+        return Err(PacketSendFailure::Transport(error));
+    }
+    let mut attempt = endpoint.flow_transport().map(QuicSendAttempt::new);
     let source_admitted = endpoint.is_source().then(|| AtomicBool::new(false));
     let timeout = endpoint.send_timeout().max(Duration::from_millis(1));
     send_timeout
@@ -711,17 +764,26 @@ async fn send_one(
         .reset(tokio::time::Instant::now() + timeout);
     let sent = tokio::select! {
         biased;
-        result = endpoint.send_packet_with_admission(&packet.data, first, source_admitted.as_ref()) => Ok(result),
+        result = endpoint.send_packet_with_admission(&packet.data, first, source_admitted.as_ref(), &mut attempt) => Ok(result),
         _ = send_timeout.as_mut() => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "UDP PacketTransport send timed out",
         )),
     };
+    if matches!(&sent, Ok(Ok(_)))
+        && !packet.data.is_empty()
+        && let Some(flow) = endpoint.native.flow()
+    {
+        flow.accepted_send();
+    }
     let timed_out = match &sent {
         Ok(Ok(_)) => false,
         Ok(Err(error)) | Err(error) => error.kind() == io::ErrorKind::TimedOut,
     };
     let endpoint_retired = endpoint.dead.load(Ordering::Acquire);
+    let source_admitted = source_admitted.map(|admitted| admitted.load(Ordering::Acquire));
+    let gate_only =
+        !attempt.as_ref().is_some_and(QuicSendAttempt::is_active) && source_admitted == Some(false);
     if let Some(attempt) = attempt {
         match &sent {
             Ok(Ok(_)) if endpoint_retired => attempt.failure(),
@@ -740,14 +802,27 @@ async fn send_one(
         match sent {
             Ok(Ok(started_at)) => Ok(started_at),
             Ok(Err(error)) => Err(classify_send_error(endpoint, error)),
-            Err(error)
-                if source_admitted
-                    .as_ref()
-                    .is_some_and(|admitted| !admitted.load(Ordering::Acquire)) =>
-            {
-                Err(PacketSendFailure::Congestion(error))
+            Err(error) if gate_only => {
+                let stalled = endpoint
+                    .source_uplink_stall()
+                    .is_some_and(UplinkStall::unadmitted_deadline);
+                Err(if stalled {
+                    PacketSendFailure::Transport(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "UDP source uplink admitted no datagram within the stall limit",
+                    ))
+                } else {
+                    PacketSendFailure::Congestion(error)
+                })
             }
-            Err(error) => Err(classify_send_error(endpoint, error)),
+            Err(error) => {
+                if source_admitted == Some(true)
+                    && let Some(stall) = endpoint.source_uplink_stall()
+                {
+                    stall.admitted();
+                }
+                Err(classify_send_error(endpoint, error))
+            }
         }
     };
     if endpoint.is_source()
@@ -778,127 +853,27 @@ async fn send_one(
             Ok(())
         }
         Err(failure) => {
+            endpoint.native.dropped(
+                if first {
+                    "first_send_failed"
+                } else {
+                    "send_failed"
+                },
+                Some(match &failure {
+                    PacketSendFailure::Congestion(_) => "congestion",
+                    PacketSendFailure::Rejected(_) => "packet_rejected",
+                    PacketSendFailure::Transport(error)
+                        if error.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        "send_timeout"
+                    }
+                    PacketSendFailure::Transport(_) => "transport_error",
+                }),
+            );
             if first {
                 stats.record_udp_first_send_failure();
             }
             Err(failure)
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn receive_loop(
-    endpoint: Arc<UdpEndpoint>,
-    reply_socket: Arc<ReplySocket>,
-    reply_socket_factory: Arc<dyn UdpReplySocketFactory>,
-    reply_socket_slots: Arc<Semaphore>,
-    client_addr: SocketAddr,
-    client_dst: SocketAddr,
-    alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
-    stats: Arc<StatsManager>,
-    outbound_tracker: OutboundTracker,
-) -> io::Result<()> {
-    let ipver = endpoint.health_family;
-    let transport = endpoint
-        .flow_transport()
-        .expect("ordinary UDP receive loop requires a PacketTransport");
-    // The normal fixed-target path keeps using the pre-created socket without
-    // allocating. Full-cone sources populate this small endpoint-local cache.
-    let mut alternate_reply_sockets = Vec::new();
-    let mut buf = [0u8; 65536];
-    let reply_idle_timeout = tokio::time::sleep(REPLY_IDLE_TIMEOUT);
-    tokio::pin!(reply_idle_timeout);
-    loop {
-        reply_idle_timeout
-            .as_mut()
-            .reset(tokio::time::Instant::now() + REPLY_IDLE_TIMEOUT);
-        let received = tokio::select! {
-            biased;
-            packet = transport.recv_packet(&mut buf) => Some(packet),
-            _ = reply_idle_timeout.as_mut() => None,
-        };
-        let (n, source) = match received {
-            Some(Ok(packet)) => packet,
-            Some(Err(error)) => return Err(error),
-            None => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, ReplyIdleTimeout));
-            }
-        };
-        if source != endpoint.relay_addr
-            && !transport.allows_full_cone_replies()
-            && !endpoint.validate_reply_peer(source)
-        {
-            debug!(
-                "UDP endpoint driver rejecting unexpected reply peer {}",
-                source
-            );
-            continue;
-        }
-        // Remote DNS may choose another address or family for the same logical peer.
-        let source = if endpoint.target_is_domain {
-            client_dst
-        } else {
-            source
-        };
-        if source.is_ipv4() != client_addr.is_ipv4() {
-            return Err(local_reply_error(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "UDP reply source {} and client {} use different address families",
-                    source, client_addr
-                ),
-            )));
-        }
-        let reply_socket = if source == client_dst {
-            reply_socket.as_ref()
-        } else {
-            let index = match alternate_reply_sockets
-                .iter()
-                .position(|(cached_source, _)| *cached_source == source)
-            {
-                Some(index) => index,
-                None => {
-                    if alternate_reply_sockets.len() >= MAX_REPLY_SOCKETS_PER_ENDPOINT - 1 {
-                        return Err(local_reply_error(io::Error::new(
-                            io::ErrorKind::AddrNotAvailable,
-                            "UDP endpoint reply-source socket cache is full",
-                        )));
-                    }
-                    let socket = match ReplySocket::create(
-                        reply_socket_factory.as_ref(),
-                        &reply_socket_slots,
-                        source,
-                    ) {
-                        Ok(socket) => socket,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            debug!("UDP reply socket capacity exhausted for {}", source);
-                            continue;
-                        }
-                        Err(error) => return Err(local_reply_error(error)),
-                    };
-                    alternate_reply_sockets.push((source, socket));
-                    alternate_reply_sockets.len() - 1
-                }
-            };
-            &alternate_reply_sockets[index].1
-        };
-        reply_socket
-            .send_to(&buf[..n], client_addr)
-            .await
-            .map_err(local_reply_error)?;
-        endpoint.mark_reply();
-        if let Some(elapsed) = endpoint.take_first_reply_metric() {
-            stats.record_udp_first_reply_latency(elapsed);
-        }
-        endpoint.tracker_download(n as u64);
-        endpoint.score_reply(n as u64);
-        outbound_tracker.add_bytes(0, n as u64);
-        if endpoint.take_alive_report_slot() {
-            alive_set.report_available_traffic(
-                endpoint.node_id,
-                honk_outbound::alive::ProbeDomain::DataUdp,
-                ipver,
-            );
         }
     }
 }

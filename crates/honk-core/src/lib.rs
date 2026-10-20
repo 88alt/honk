@@ -9,24 +9,34 @@
 //! in dae netns"). Trait-based backends (real aya + mock) for testing
 //! without kernel eBPF support.
 
-pub mod cachedb;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;
 pub mod config_diagnostics;
+pub(crate) mod configuration;
 pub mod connection_tracker;
 pub mod control;
+pub mod daens;
+pub(crate) mod degradations;
 pub mod dns;
+pub(crate) mod download_route;
 pub mod ebpf;
+mod logging;
 mod marked_http;
 pub mod mode;
+#[cfg(feature = "native-api")]
+pub mod native_api;
 #[cfg(feature = "ebpf")]
 pub(crate) mod netlink;
+#[cfg_attr(not(feature = "native-api"), path = "observe/inert.rs")]
+pub(crate) mod observe;
 pub mod pool;
 pub mod relay;
 pub mod routing;
 pub mod sniffing;
+pub mod state;
 pub mod stats;
 pub mod subscription;
+mod sysctl;
 
 pub use honk_outbound::alive as outbound;
 pub use honk_outbound::group;
@@ -34,6 +44,10 @@ pub use honk_outbound::proxy;
 
 /// Build-time release tag or Git description; package version without Git metadata.
 pub const VERSION: &str = env!("HONK_VERSION");
+/// The commit this binary was built from; empty when the build had no Git checkout.
+pub const REVISION: &str = env!("HONK_REVISION");
+/// The target triple this binary was built for.
+pub const TARGET: &str = env!("HONK_TARGET");
 
 use clap::Parser;
 use honk_config::Config;
@@ -41,8 +55,14 @@ use honk_config::diagnostic::{
     DetailedDiagnostic, DiagnosticSources, SettingPath, finish_attempt, report_detailed_diagnostics,
 };
 use honk_config::error::{DetailedConfigError, ErrorCategory};
+use logging::{
+    LOG_FILE_LIMIT, LocalTime, QUIET_LOG_TARGETS, RotatingLogFile, console_ansi, console_log_layer,
+    resolved_log_file_path,
+};
+use state::startup::{claim_state, open_state_db};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 /// Raise the soft descriptor limit toward the hard maximum, then return the
 /// one startup snapshot used to size every control-plane descriptor owner.
@@ -81,31 +101,6 @@ fn raise_nofile_rlimit() -> anyhow::Result<usize> {
     Ok(usize::try_from(active_soft)
         .unwrap_or(control::MAX_EFFECTIVE_NOFILE)
         .min(control::MAX_EFFECTIVE_NOFILE))
-}
-async fn request_runtime_reload(
-    reload_tx: &tokio::sync::mpsc::Sender<control::ControlCommand>,
-    subscription_supervisor: &subscription::SubscriptionSupervisorHandle,
-    request_id: u64,
-    config: Config,
-    diagnostics: Vec<DetailedDiagnostic>,
-) -> anyhow::Result<()> {
-    let (result, applied) = tokio::sync::oneshot::channel();
-    reload_tx
-        .send(control::ControlCommand::ReloadConfig {
-            request_id,
-            config: Box::new(config),
-            diagnostics,
-            result,
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!("command send failed: {error}"))?;
-    if let Some(authorized) = applied
-        .await
-        .map_err(|error| anyhow::anyhow!("result channel failed: {error}"))?
-    {
-        subscription_supervisor.reconcile(authorized).await?;
-    }
-    Ok(())
 }
 
 #[cfg(feature = "ebpf")]
@@ -198,6 +193,35 @@ pub enum ClashCommand {
     },
     /// Ask the running instance to reload its configured file
     Reload,
+    /// Read the configuration db
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+    /// Manage the password-mode administrator
+    Admin {
+        #[command(subcommand)]
+        action: AdminCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum AdminCommand {
+    /// Delete the administrator record so that setup opens again; refused while honk-core runs
+    Reset,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Write the active revision as one dae file, listener secrets included
+    Export {
+        /// New file to write; an existing one is refused
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+        /// Leave the listener secrets out
+        #[arg(long)]
+        without_secrets: bool,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -241,19 +265,78 @@ pub struct Cli {
     /// Use mock eBPF backend (for testing without kernel support)
     #[arg(long)]
     pub mock_ebpf: bool,
+
+    /// Where the administered configuration lives: the `-c` file tree, or the
+    /// revisions in `<data-dir>/state/honk.db`
+    #[arg(long, value_enum, default_value = "file")]
+    pub store: ConfigStore,
+
+    /// Runtime data directory holding the state db; must equal `global.data_dir`
+    #[arg(long, value_name = "PATH", default_value = honk_config::paths::DEFAULT_DATA_DIR, global = true)]
+    pub data_dir: PathBuf,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigStore {
+    File,
+    Db,
 }
 
 pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     use std::time::Duration;
 
     let cmd = cli.command.as_ref().expect("subcommand required");
+    let read_config = || -> anyhow::Result<Config> {
+        match cli.store {
+            ConfigStore::File => Ok(Config::from_file(cli.config.to_str().unwrap())?),
+            #[cfg(feature = "native-api")]
+            ConfigStore::Db => {
+                let text = native_api::store::db::export(&cli.data_dir, true)
+                    .map_err(|error| anyhow::anyhow!("configuration db: {error}"))?;
+                Ok(honk_config::parser::parse_dae_config(&text)?)
+            }
+            #[cfg(not(feature = "native-api"))]
+            ConfigStore::Db => anyhow::bail!("--store db needs the native-api feature"),
+        }
+    };
 
     match cmd {
+        #[cfg(feature = "native-api")]
+        ClashCommand::Config {
+            action:
+                ConfigCommand::Export {
+                    out,
+                    without_secrets,
+                },
+        } => {
+            native_api::store::db::export_to(&cli.data_dir, out, !without_secrets)?;
+            println!(
+                "Exported the active configuration revision to {}",
+                out.display()
+            );
+        }
+        #[cfg(not(feature = "native-api"))]
+        ClashCommand::Config { .. } => anyhow::bail!("config export needs the native-api feature"),
+        ClashCommand::Admin {
+            action: AdminCommand::Reset,
+        } => {
+            let deleted = state::reset_admin(&cli.data_dir)
+                .map_err(|error| anyhow::anyhow!("admin reset: {error}"))?;
+            if deleted {
+                println!("Deleted the administrator; setup is open again");
+            } else {
+                println!("No administrator was set up");
+            }
+        }
         ClashCommand::Reload => {
             let pid = request_reload(std::path::Path::new(INSTANCE_LOCK_PATH))?;
             println!("Reload requested for honk-core process {pid}");
         }
         ClashCommand::Mode { mode } => {
+            anyhow::ensure!(
+                cli.store == ConfigStore::File,
+                "mode edits the -c file; with --store db, change default_mode through the native API"
+            );
             let valid_modes = ["rule", "global", "direct"];
             if !valid_modes.contains(&mode.as_str()) {
                 anyhow::bail!(
@@ -270,7 +353,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Mode set to {}", mode);
         }
         ClashCommand::Proxy { group, node } => {
-            let config = Config::from_file(cli.config.to_str().unwrap())?;
+            let config = read_config()?;
             let group_exists = config.groups.iter().any(|g| g.name == *group);
             if !group_exists {
                 anyhow::bail!("Group '{}' not found in configuration", group);
@@ -282,7 +365,7 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
             println!("Proxy group '{}' set to '{}'", group, node);
         }
         ClashCommand::Delay { node, url } => {
-            let config = Config::from_file(cli.config.to_str().unwrap())?;
+            let config = read_config()?;
             config.validate()?;
             honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
             honk_outbound::bootstrap::set_global(
@@ -389,20 +472,24 @@ fn request_reload(path: &std::path::Path) -> anyhow::Result<libc::pid_t> {
 /// under it — the restart race that hung the lab for a day). Waits up
 /// to 240s for the previous instance to exit (busy gateways can take
 /// well over 90s to drain), then fails loudly.
+///
+/// It is taken before the configuration or the state db is opened, so a
+/// successor that fails to take it leaves nothing behind.
 fn acquire_instance_lock(
-    _bpf_pin_root: &std::path::Path,
+    path: &std::path::Path,
+    wait: std::time::Duration,
 ) -> anyhow::Result<nix::fcntl::Flock<std::fs::File>> {
     use nix::fcntl::{Flock, FlockArg};
-    // /run (not the bpffs pin root, which rejects regular files).
-    let path = std::path::PathBuf::from(INSTANCE_LOCK_PATH);
     let mut file = std::fs::File::options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(&path)
+        .open(path)
         .map_err(|e| anyhow::anyhow!("open instance lock {}: {}", path.display(), e))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+    let deadline = std::time::Instant::now() + wait;
+    let holder =
+        || running_instance_pid(path).map_or_else(|_| String::new(), |pid| format!(" (PID {pid})"));
     let mut logged = false;
     loop {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
@@ -413,9 +500,12 @@ fn acquire_instance_lock(
             Err((f, _)) if std::time::Instant::now() < deadline => {
                 file = f; // the failed lock hands the file back for the retry
                 if !logged {
-                    info!(
-                        "another honk-core instance is shutting down; \
-                         waiting for the datapath lock at {}",
+                    // Logging is not set up yet.
+                    eprintln!(
+                        "honk-core: another honk-core instance{} is shutting down; \
+                         waiting up to {}s for the datapath lock at {}",
+                        holder(),
+                        wait.as_secs(),
                         path.display()
                     );
                     logged = true;
@@ -424,13 +514,40 @@ fn acquire_instance_lock(
             }
             Err((_, e)) => {
                 anyhow::bail!(
-                    "another honk-core instance holds {} ({}); refusing to start",
+                    "another honk-core instance{} did not release {} within {}s ({}); \
+                     refusing to start",
+                    holder(),
                     path.display(),
+                    wait.as_secs(),
                     e
                 )
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INSTANCE_LOCK: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Only the real datapath owns fixed dae0/daens/TC resources. Mock mode must
+/// remain usable without access to the process-global /run lock.
+fn instance_lock(mock_mode: bool) -> anyhow::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    #[cfg(test)]
+    if let Some(path) = TEST_INSTANCE_LOCK.with(|path| path.borrow().clone()) {
+        return acquire_instance_lock(&path, std::time::Duration::ZERO).map(Some);
+    }
+    if mock_mode {
+        return Ok(None);
+    }
+    // /run, not the bpffs pin root, which rejects regular files.
+    acquire_instance_lock(
+        std::path::Path::new(INSTANCE_LOCK_PATH),
+        std::time::Duration::from_secs(240),
+    )
+    .map(Some)
 }
 
 fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) {
@@ -517,84 +634,14 @@ fn prepare_runtime_data_dir(
     prepare_runtime_data_dir_with_fallback(requested, std::env::current_dir)
 }
 
-/// Log timestamps in the machine's local time zone with its UTC offset,
-/// e.g. `2026-09-12T02:30:15.123456+10:00`. The default timer prints UTC,
-/// which does not line up with a router's syslog or an operator's clock.
-/// chrono reads the zone itself, so this stays sound after threads exist.
-struct LocalTime;
-
-impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
-    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        write!(
-            w,
-            "{}",
-            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
-        )
-    }
-}
-
-/// The console layer, with or without the local timestamp. The file layer
-/// always stamps: a file has no journal in front of it.
-fn console_log_layer<S, W>(
-    disable_timestamp: bool,
-    writer: W,
-    filter: tracing_subscriber::EnvFilter,
-) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
-where
-    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
-{
-    use tracing_subscriber::Layer as _;
-    if disable_timestamp {
-        Box::new(
-            tracing_subscriber::fmt::layer()
-                .without_time()
-                .with_writer(writer)
-                .with_filter(filter),
-        )
-    } else {
-        Box::new(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime)
-                .with_writer(writer)
-                .with_filter(filter),
-        )
-    }
-}
-
-fn resolved_log_file_path(
-    config: &Config,
-    cli_override: Option<&std::path::Path>,
-) -> Option<PathBuf> {
-    cli_override
-        .map(honk_config::paths::resolve_artifact_path)
-        .or_else(|| match config.global.log_file.trim() {
-            "" => None,
-            path => Some(honk_config::paths::resolve_artifact_path(path)),
-        })
-}
-
-fn open_log_file(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            anyhow::anyhow!("create log directory {}: {error}", parent.display())
-        })?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
-        .map_err(|error| anyhow::anyhow!("open log file {}: {error}", path.display()))?;
-    anyhow::ensure!(
-        file.metadata()?.is_file(),
-        "log destination is not a regular file: {}",
-        path.display()
-    );
-    Ok(file)
+/// A valid cached Clash mode, else `default_mode`, else `Rule`.
+#[cfg(feature = "clash-api")]
+fn startup_clash_mode(mode_db: Option<&state::cache::CacheDb>, default_mode: &str) -> String {
+    mode_db
+        .and_then(|db| db.load_clash_mode())
+        .and_then(|mode| mode::ModeState::normalize(&mode))
+        .or_else(|| mode::ModeState::normalize(default_mode))
+        .unwrap_or_else(|| "Rule".to_owned())
 }
 
 fn load_operator_config(
@@ -608,6 +655,14 @@ fn load_operator_config(
         || DiagnosticSources::new(Some(path.into())).root(),
         |diagnostic| diagnostic.source.sources().root(),
     );
+    admit_operator_config(config, source, diagnostics)
+}
+
+fn admit_operator_config(
+    config: Config,
+    source: honk_config::diagnostic::SourceRef,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<Config, DetailedConfigError> {
     config.append_diagnostics(source.clone(), diagnostics);
     let result = config.validate_detailed().and_then(|()| {
         subscription::validate_subscription_ids(&config.subscriptions).map_err(|_| {
@@ -627,6 +682,47 @@ fn load_operator_config(
     finish_attempt(result.map(|()| config), diagnostics)
 }
 
+#[cfg(feature = "native-api")]
+fn load_operator_config_captured(
+    path: &std::path::Path,
+    diagnostics: &mut Vec<DetailedDiagnostic>,
+) -> Result<(Config, Option<configuration::SourceUpdate>), DetailedConfigError> {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dae"))
+    {
+        return load_operator_config(path.to_str().unwrap_or(""), diagnostics)
+            .map(|config| (config, None));
+    }
+    let start = diagnostics.len();
+    let loaded = match Config::from_dae_file_with_sources(
+        path,
+        &std::collections::HashMap::new(),
+        honk_config::parser::SourceLimits::default(),
+        diagnostics,
+    ) {
+        Ok(loaded) => loaded,
+        Err(captured_error) => {
+            diagnostics.truncate(start);
+            let config = load_operator_config(path.to_str().unwrap_or(""), diagnostics)?;
+            if config.experimental.native_api.config_write {
+                return Err(captured_error);
+            }
+            return Ok((config, None));
+        }
+    };
+    let source = loaded.sources[0].source.clone();
+    let config = admit_operator_config(loaded.config, source, diagnostics)?;
+    Ok((
+        config,
+        Some(configuration::SourceUpdate {
+            sources: loaded.sources,
+            dependencies: Vec::new(),
+            geo_sources: None,
+        }),
+    ))
+}
+
 fn report_startup_failure(diagnostics: &[DetailedDiagnostic]) {
     for diagnostic in diagnostics.iter().filter(|diagnostic| !diagnostic.terminal) {
         eprintln!(
@@ -643,7 +739,7 @@ fn report_startup_failure(diagnostics: &[DetailedDiagnostic]) {
 /// Render one runtime admission rejection at the process reporting boundary.
 pub(crate) fn report_runtime_admission_error(error: &DetailedConfigError) {
     let diagnostic = error.diagnostic.as_ref();
-    tracing::error!(
+    tracing::warn!(
         code = diagnostic.code,
         setting = %diagnostic.setting,
         value = %diagnostic.value,
@@ -652,16 +748,90 @@ pub(crate) fn report_runtime_admission_error(error: &DetailedConfigError) {
     );
 }
 
+/// Startup failed after the backend, watcher and maintenance owners went live;
+/// the singleton lock must outlive their joined cleanup.
+async fn abort_startup(
+    control_plane: &mut control::ControlPlane,
+    subscriptions: subscription::SubscriptionSupervisor,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let error = control_plane.abort_startup(error).await;
+    if let Err(shutdown) = subscriptions.shutdown().await {
+        warn!(%shutdown, "subscription startup state failed to stop");
+    }
+    error
+}
+
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    #[cfg(feature = "native-api")]
+    let started_at = std::time::SystemTime::now();
+    #[cfg(feature = "native-api")]
+    let started = std::time::Instant::now();
     // Load the configuration before initializing logging so `log_level` in
     // the config file is honored (previously only --debug/RUST_LOG had any
     // effect and config log_level was silently ignored).
     let mut diagnostics = Vec::new();
+    #[cfg(feature = "native-api")]
+    let mut native_sources = None;
+    #[cfg(not(feature = "native-api"))]
+    anyhow::ensure!(
+        cli.store == ConfigStore::File,
+        "--store db needs the native-api feature"
+    );
+    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
+    // Everything else in `run` drops before it.
+    let _instance_lock = instance_lock(mock_mode)?;
+    #[cfg(feature = "native-api")]
+    let mut database = None;
     let startup = (|| -> anyhow::Result<_> {
+        #[cfg(feature = "native-api")]
+        let mut config = if cli.store == ConfigStore::Db {
+            std::fs::create_dir_all(&cli.data_dir)?;
+            // DbStore needs an absolute, lexically normal entry; a missing -c
+            // is fine once the db holds a revision.
+            let entry =
+                std::fs::canonicalize(&cli.config).or_else(|_| std::path::absolute(&cli.config))?;
+            let startup =
+                native_api::store::DatabaseStartup::open(&entry, &cli.data_dir, &mut diagnostics)?;
+            native_sources = Some(startup.sources.clone());
+            let config = startup.config.clone();
+            database = Some(startup);
+            config
+        } else {
+            let (config, sources) = load_operator_config_captured(&cli.config, &mut diagnostics)?;
+            anyhow::ensure!(
+                sources.is_some() || !config.experimental.native_api.config_write,
+                "native configuration administration requires a dae source file"
+            );
+            native_sources = sources;
+            config
+        };
+        #[cfg(not(feature = "native-api"))]
         let mut config = load_operator_config(cli.config.to_str().unwrap(), &mut diagnostics)?;
+        #[cfg(not(feature = "native-api"))]
+        anyhow::ensure!(
+            !config.experimental.native_api.enabled,
+            "native-api feature is required"
+        );
         let requested_data_dir = PathBuf::from(&config.global.data_dir);
         let (runtime_data_dir, data_dir_creation_error) =
             prepare_runtime_data_dir(&requested_data_dir)?;
+        #[cfg(feature = "native-api")]
+        anyhow::ensure!(
+            cli.store == ConfigStore::File || runtime_data_dir == requested_data_dir,
+            "the configuration db needs its data directory {}; refusing to fall back to {}",
+            requested_data_dir.display(),
+            runtime_data_dir.display()
+        );
+        #[cfg(feature = "native-api")]
+        anyhow::ensure!(
+            !(config.experimental.native_api.enabled
+                && config.experimental.native_api.password_auth
+                && runtime_data_dir != requested_data_dir),
+            "native API password login needs its configured data directory {}; refusing to fall back to {}",
+            requested_data_dir.display(),
+            runtime_data_dir.display()
+        );
         honk_config::paths::set_data_dir(runtime_data_dir).map_err(|requested| {
             anyhow::anyhow!(
                 "runtime data directory is already {}; cannot switch to {}",
@@ -680,27 +850,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             other => other,
         };
         let default_level = if cli.debug { "debug" } else { config_level };
-        // quinn logs every endpoint-driver death at ERROR; probe/warm endpoints
-        // over retiring AnyTLS sessions die as a matter of course (the SYNACK
-        // watchdog kills them on purpose), so that target is silenced unless
-        // RUST_LOG says otherwise.
         let env_filter =
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new(format!("{default_level},quinn::endpoint=off"))
+                tracing_subscriber::EnvFilter::new(format!("{default_level},{QUIET_LOG_TARGETS}"))
             });
 
         let log_file_path = resolved_log_file_path(&config, cli.log_file.as_deref());
-        let log_file_layer = if let Some(path) = log_file_path.as_ref() {
-            let file = open_log_file(path)?;
-            Some(
-                tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTime)
-                    .with_ansi(false)
-                    .with_writer(std::sync::Mutex::new(file))
-                    .with_filter(env_filter.clone()),
+        let (log_file_layer, log_file_level) = if let Some(path) = log_file_path.as_ref() {
+            let file = RotatingLogFile::open(path, LOG_FILE_LIMIT)?;
+            let (filter, level) = tracing_subscriber::reload::Layer::new(env_filter.clone());
+            (
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_timer(LocalTime)
+                        .with_ansi(false)
+                        .with_writer(std::sync::Mutex::new(file))
+                        .with_filter(filter),
+                ),
+                Some(level),
             )
         } else {
-            None
+            (None, None)
         };
         Ok((
             config,
@@ -708,6 +878,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             data_dir_creation_error,
             log_file_path,
             log_file_layer,
+            log_file_level,
             env_filter,
         ))
     })();
@@ -717,6 +888,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         data_dir_creation_error,
         log_file_path,
         log_file_layer,
+        log_file_level,
         env_filter,
     ) = match startup {
         Ok(startup) => startup,
@@ -730,18 +902,39 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // With no `/logs` subscription, the API layer contributes no callsite interest.
     #[cfg(feature = "clash-api")]
     let (clash_log_layer, clash_log_handle) = clash_api::logs::layer();
+    #[cfg(feature = "native-api")]
+    let (native_log_layer, native_log_binding) = native_api::logs::tracing_layer();
 
     use tracing_subscriber::prelude::*;
+    let (console_filter, console_level) =
+        tracing_subscriber::reload::Layer::new(env_filter.clone());
     let registry = tracing_subscriber::registry()
         .with(console_log_layer(
             cli.disable_timestamp,
+            console_ansi(
+                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                std::env::var_os("NO_COLOR").as_deref(),
+            ),
             std::io::stdout,
-            env_filter,
+            console_filter,
         ))
         .with(log_file_layer);
     #[cfg(feature = "clash-api")]
     let registry = registry.with(clash_log_layer);
+    #[cfg(feature = "native-api")]
+    let registry = registry.with(native_log_layer);
     registry.init();
+    #[cfg(feature = "native-api")]
+    let engine_level = {
+        let mut engine = native_api::logs::EngineLevel::default();
+        engine.push(console_level, env_filter.clone());
+        if let Some(level) = log_file_level {
+            engine.push(level, env_filter);
+        }
+        engine
+    };
+    #[cfg(not(feature = "native-api"))]
+    let _ = (console_level, log_file_level, env_filter);
 
     info!("honk-core {} starting", VERSION);
     info!("Config: {}", cli.config.display());
@@ -755,6 +948,23 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     report_detailed_diagnostics(&diagnostics);
     info!(directory = %honk_config::paths::data_dir().display(), "Runtime data directory configured");
+    let degradations = Arc::new(degradations::Degradations::default());
+    let (state_db, state_reset) =
+        open_state_db(&cli, &config, honk_config::paths::data_dir(), &degradations)?;
+    #[cfg(feature = "native-api")]
+    let state_db = database
+        .as_ref()
+        .map(|database| database.store.state())
+        .or(state_db);
+    let legacy_cache = {
+        let (path, cache_id) = config.experimental.cache_file.legacy_cache_file();
+        let config_dir = cli.config.parent();
+        #[cfg(feature = "native-api")]
+        let config_dir = database
+            .as_ref()
+            .map_or(config_dir, |database| database.store.entry().parent());
+        state::import::LegacyCache::locate(path, cache_id, config_dir)
+    };
     if let Some(path) = log_file_path.as_ref() {
         info!(path = %path.display(), "File logging enabled");
     }
@@ -791,26 +1001,29 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         info!("Bootstrap resolver: {}", config.global.bootstrap_resolver);
     }
 
+    #[cfg(feature = "native-api")]
+    if let Some(database) = database.as_mut() {
+        database.record()?;
+    }
+    let claimed = claim_state(
+        state_db,
+        state_reset,
+        &config,
+        honk_config::paths::data_dir(),
+        subscription::legacy_store_roots(),
+        &degradations,
+    );
+    let state_db = claimed.state_db;
+
     // A valid stored body makes network refresh non-blocking for startup.
     // Missing subscriptions still get the bounded first-fetch grace period;
     // every fetch continues in the background after the control plane starts.
-    let subscription_store = if config.global.store_subscribe {
-        match subscription::SubscriptionStore::in_data_dir() {
-            Ok(store) => {
-                info!(directory = %store.root().display(), "Subscription store ready");
-                Some(store)
-            }
-            Err(error) => {
-                warn!(%error, "Subscription store unavailable; continuing without persistence");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut subscription_supervisor =
-        subscription::SubscriptionSupervisor::prepare(&mut config, subscription_store, diagnostics)
-            .await?;
+    let mut subscription_supervisor = subscription::SubscriptionSupervisor::prepare(
+        &mut config,
+        claimed.subscriptions,
+        diagnostics,
+    )
+    .await?;
     let startup_diagnostics = subscription_supervisor.take_startup_diagnostics();
 
     // Resolve group filters into concrete node IDs. This must run for every
@@ -841,7 +1054,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         config.routing.rules.len()
     );
 
-    let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
     #[cfg(feature = "ebpf")]
     let configured_ifaces = configured_interfaces(&config);
     #[cfg(feature = "ebpf")]
@@ -859,14 +1071,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    // Only the real datapath owns fixed dae0/daens/TC resources. Mock mode
-    // must remain usable without access to the process-global /run lock.
-    let _instance_lock = if mock_mode {
-        None
-    } else {
-        Some(acquire_instance_lock(&cli.bpf_pin_root)?)
-    };
-
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
     // a healthy restart into a permanently degraded process.
@@ -874,9 +1078,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     // Create the dae0 link pair before eBPF load so PARAM.dae0_ifindex is correct.
     // dae0peer stays in the host namespace during the dae0 attach, then moves
-    // to the daens netns in setup_daens_namespace() below.
+    // to the daens netns during namespace setup.
     #[cfg(feature = "ebpf")]
-    let _dae0_guard: Option<Dae0Guard>;
+    let _dae0_guard: Option<daens::Dae0Guard>;
     #[cfg(not(feature = "ebpf"))]
     let _dae0_guard: Option<()>;
     if !mock_mode {
@@ -889,18 +1093,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             ("net.core.rmem_max", "16777216"),
             ("net.core.wmem_max", "16777216"),
         ] {
-            if let Err(e) = set_sysctl(key, val) {
+            if let Err(e) = sysctl::set_sysctl(key, val) {
                 warn!("failed to set {}={}: {}", key, val, e);
             }
         }
         #[cfg(feature = "ebpf")]
         {
             if let Some(lan_ifname) = configured_ifaces.lan.first() {
-                let _ = set_sysctl(&format!("net.ipv4.conf.{}.rp_filter", lan_ifname), "0");
+                let _ = sysctl::set_sysctl(&format!("net.ipv4.conf.{}.rp_filter", lan_ifname), "0");
             }
-            _dae0_guard = Some(create_dae0_link()?);
+            _dae0_guard = Some(daens::create_dae0_link()?);
             for wan_ifname in &configured_ifaces.wan {
-                enable_wan_accept_ra(wan_ifname);
+                sysctl::enable_wan_accept_ra(wan_ifname);
             }
             info!(
                 "dae0 link created before eBPF load (ifindex={})",
@@ -1063,7 +1267,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             // daens through scoped `with_daens_netns` switches; accepted
             // connections are then handled — and upstream dials made — from
             // ordinary host-netns worker threads.
-            setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
+            daens::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
             info!("dae0peer moved to daens netns");
 
             // Attach the sk_lookup program in daens (scoped switch inside
@@ -1109,8 +1313,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let traffic_geo = routing::GeoRequirements::for_traffic(&config.routing.rules);
     let dns_geo = dns::routing::DnsRouter::geo_requirements(&config.dns);
     let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
-    let router = routing::Router::from_config_with_geo_sources(&config.routing, &geo_sources)?;
+    let mut shared = routing::SharedMatchers::default();
+    let router = routing::Router::from_config_sharing(&config.routing, &geo_sources, &mut shared)?;
     info!("Router ready with {} compiled routes", router.route_count());
+    ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
 
     let proxy_registry = std::sync::Arc::new(proxy::ProxyRegistry::default_resolver()?);
     info!(
@@ -1121,11 +1327,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let dns_cache = std::sync::Arc::new(tokio::sync::Mutex::new(dns::cache::DnsCache::new(
         config.dns.cache.max_size,
     )));
-    let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new_with_geo_sources(
+    let dns_router = std::sync::Arc::new(dns::routing::DnsRouter::new_sharing(
         &config.dns,
         &geo_sources,
+        &mut shared,
     )?);
-    drop(geo_sources);
+    drop((geo_sources, shared));
     // Keep a concrete Arc so we can attach SharedGroupManager after the
     // control plane builds it (same cell traffic dials use).
     let dns_upstream_pool = std::sync::Arc::new(
@@ -1163,6 +1370,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             dns_cache,
             dns_router,
         )
+        .with_configured_upstreams(&config.dns)
         .with_timeouts(
             std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
             std::time::Duration::from_millis(config.global.connect_timeout_ms),
@@ -1176,6 +1384,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
     info!("DNS forwarder ready");
 
+    #[cfg(feature = "native-api")]
+    let native_enabled = config.experimental.native_api.enabled;
     let mut control_plane = control::ControlPlane::new_with_upstream_pool_and_budget(
         config,
         ebpf_backend,
@@ -1184,7 +1394,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         dns_forwarder,
         dns_upstream_pool.clone(),
         resource_budget,
+        Arc::clone(&degradations),
     )?;
+    #[cfg(feature = "native-api")]
+    let native_observation = if native_enabled {
+        Some(native_api::observation::NativeObservation::attach(&mut control_plane).await)
+    } else {
+        None
+    };
     control_plane
         .install_startup_diagnostics(startup_diagnostics)
         .await;
@@ -1196,6 +1413,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             control_plane.config_handle(),
             control_plane.command_sender(),
             attached_ifaces,
+            Arc::clone(&degradations),
         )
     } else {
         None
@@ -1207,11 +1425,16 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     dns_upstream_pool.set_group_manager(Some(control_plane.group_manager()));
     dns_upstream_pool.set_traffic_router(Some(control_plane.traffic_router()));
     info!("DNS upstream pool attached to SharedGroupManager + traffic Router");
+    // The initial runtime owns the pool now; keeping this handle would pin the
+    // startup traffic router snapshot after that runtime retires.
+    drop(dns_upstream_pool);
 
-    // Persistent cache (selector choices, clash mode): opens cache.db when
-    // `experimental.cache_file` is enabled, restores Selector choices, and
-    // wires change persistence into the group manager.
-    control_plane.init_cache_db(cli.config.parent()).await;
+    // Runtime state (selector choices, clash mode): with
+    // `experimental.cache_file` enabled, imports a legacy cache.db, restores
+    // Selector choices, and wires change persistence into the group manager.
+    control_plane
+        .init_cache_db(state_db.clone(), Some(legacy_cache))
+        .await;
 
     #[cfg(feature = "clash-api")]
     let clash_cfg = control_plane
@@ -1221,42 +1444,78 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .experimental
         .clash_api
         .clone();
-    let cache_db = control_plane.cache_db();
-    #[cfg(feature = "clash-api")]
-    let mode = cache_db
-        .as_ref()
-        .and_then(|db| db.load_clash_mode())
-        .and_then(|mode| mode::ModeState::normalize(&mode))
-        .or_else(|| mode::ModeState::normalize(&clash_cfg.default_mode))
-        .unwrap_or_else(|| "Rule".to_string());
-    #[cfg(not(feature = "clash-api"))]
-    let mode = "Rule".to_string();
-    let (default_selection, valid_global_selections) = {
-        let config = control_plane.config_handle();
-        let config = config.read().await;
-        let selections = config
-            .groups
-            .iter()
-            .map(|group| group.name.clone())
-            .chain(config.nodes.iter().map(|node| node.name.clone()))
-            .collect::<Vec<_>>();
-        let default = selections.first().cloned().unwrap_or_default();
-        (default, selections)
+    let native_mode = cfg!(feature = "native-api")
+        && control_plane
+            .config_handle()
+            .read()
+            .await
+            .experimental
+            .native_api
+            .enabled;
+    let mode_value = match native_mode {
+        #[cfg(feature = "native-api")]
+        true => mode::ModeState::native(),
+        #[cfg(not(feature = "native-api"))]
+        true => unreachable!("native mode needs the native-api feature"),
+        false => {
+            let mode_db = control_plane.mode_db();
+            #[cfg(feature = "clash-api")]
+            let mode = startup_clash_mode(mode_db.as_deref(), &clash_cfg.default_mode);
+            #[cfg(not(feature = "clash-api"))]
+            let mode = "Rule".to_owned();
+            let (default_selection, valid_global_selections) = {
+                let config = control_plane.config_handle();
+                let config = config.read().await;
+                let selections = config
+                    .groups
+                    .iter()
+                    .map(|group| group.name.clone())
+                    .chain(config.nodes.iter().map(|node| node.name.clone()))
+                    .collect::<Vec<_>>();
+                (selections.first().cloned().unwrap_or_default(), selections)
+            };
+            let global_selection = mode_db
+                .as_ref()
+                .and_then(|db| db.load_clash_global())
+                .filter(|selection| {
+                    valid_global_selections
+                        .iter()
+                        .any(|valid| valid == selection)
+                })
+                .unwrap_or(default_selection);
+            mode::ModeState::new(&mode, global_selection)
+        }
     };
-    let global_selection = cache_db
-        .as_ref()
-        .and_then(|db| db.load_selector_choice("GLOBAL"))
-        .filter(|selection| {
-            valid_global_selections
-                .iter()
-                .any(|valid| valid == selection)
-        })
-        .unwrap_or(default_selection);
-    let mode_state: mode::SharedModeState = std::sync::Arc::new(parking_lot::RwLock::new(
-        mode::ModeState::new(&mode, global_selection),
-    ));
+    let mode_state: mode::SharedModeState =
+        std::sync::Arc::new(parking_lot::RwLock::new(mode_value));
     control_plane.set_mode_state(mode_state.clone());
-    control_plane.start_datapath_flags_coordinator()?;
+    if let Err(error) = control_plane.start_datapath_flags_coordinator() {
+        return Err(abort_startup(&mut control_plane, subscription_supervisor, error).await);
+    }
+
+    #[cfg(feature = "native-api")]
+    let mut native = match native_observation {
+        Some(observation) => {
+            match native_api::NativeRuntime::start(
+                &mut control_plane,
+                observation,
+                started_at,
+                started,
+                engine_level,
+                &native_log_binding,
+            )
+            .await
+            {
+                Ok(native) => Some(native),
+                Err(error) => {
+                    return Err(
+                        abort_startup(&mut control_plane, subscription_supervisor, error).await,
+                    );
+                }
+            }
+        }
+        None => None,
+    };
 
     // Starts only when external_controller is configured; bind/parse
     // failures are logged and never abort startup.
@@ -1293,6 +1552,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                     datapath_flags: control_plane
                         .datapath_flags_handle()
                         .expect("datapath flags writer started above"),
+                    control: Some(control_plane.control_client()),
+                    ui_download: control_plane.ui_download_handle(),
                     secret: clash_cfg.secret.clone(),
                     connection_pool: control_plane.connection_pool(),
                     external_ui,
@@ -1316,13 +1577,40 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     let cmd_tx = control_plane.command_sender();
 
+    subscription_supervisor.route_through(download_route::SharedOutbounds {
+        router: control_plane.traffic_router(),
+        config: control_plane.config_handle(),
+        group_manager: control_plane.group_manager(),
+        proxy_registry: control_plane.proxy_registry(),
+        runtime_registry: control_plane.runtime_registry(),
+    });
     subscription_supervisor.start(cmd_tx.clone());
+    #[cfg(feature = "native-api")]
+    control_plane.attach_subscriptions(subscription_supervisor.handle());
     let reload_subscription_supervisor = subscription_supervisor.handle();
+    #[cfg(feature = "native-api")]
+    let native_configuration = match native.as_mut() {
+        Some(native) => Some(
+            native
+                .start_configuration(
+                    &mut control_plane,
+                    database.take(),
+                    native_sources,
+                    &cli.config,
+                    cmd_tx.clone(),
+                    reload_subscription_supervisor.clone(),
+                )
+                .await,
+        ),
+        None => None,
+    };
 
     // SIGHUP handler: reload configuration from disk and push it to the
     // control plane without interrupting established connections.
     let config_path = cli.config.clone();
     let reload_tx = cmd_tx.clone();
+    let mut activation =
+        configuration::Activation::new(reload_tx.clone(), reload_subscription_supervisor);
     let sighup_handle = tokio::spawn(async move {
         let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -1337,6 +1625,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             sighup.recv().await;
             request_id = request_id.wrapping_add(1).max(1);
             info!("SIGHUP reload request {request_id} received");
+            #[cfg(feature = "native-api")]
+            if let Some(service) = &native_configuration {
+                if service.request_sighup().is_err() {
+                    warn!("SIGHUP reload coordinator is unavailable or busy");
+                }
+                continue;
+            }
             let mut diagnostics = Vec::new();
             let result = load_operator_config(
                 config_path.to_str().unwrap_or("/etc/honk/config.dae"),
@@ -1346,18 +1641,32 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             match result {
                 Ok(mut new_config) => {
                     new_config.ensure_builtin_nodes();
-                    if let Err(error) = request_runtime_reload(
-                        &reload_tx,
-                        &reload_subscription_supervisor,
-                        request_id,
-                        new_config,
-                        diagnostics,
-                    )
-                    .await
+                    match activation
+                        .activate(configuration::ActivationRequest {
+                            candidate: new_config,
+                            diagnostics,
+                            #[cfg(feature = "native-api")]
+                            sources: None,
+                            #[cfg(feature = "native-api")]
+                            expected_group_revision: None,
+                            #[cfg(feature = "native-api")]
+                            deferred_provider: None,
+                        })
+                        .await
                     {
-                        warn!("SIGHUP reload request {request_id} failed: {error}");
-                        let _ = reload_tx.send(control::ControlCommand::Shutdown).await;
-                        break;
+                        Ok(_) | Err(configuration::ActivationFailure::Rejected) => {}
+                        Err(configuration::ActivationFailure::Degraded(generation)) => {
+                            warn!(generation, "SIGHUP reload committed with degraded datapath");
+                        }
+                        Err(configuration::ActivationFailure::Reconciliation(generation)) => {
+                            error!(generation, "SIGHUP reload worker reconciliation failed");
+                            break;
+                        }
+                        Err(failure) => {
+                            error!(?failure, "SIGHUP reload request {request_id} failed");
+                            let _ = reload_tx.send(control::ControlCommand::Shutdown).await;
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
@@ -1367,6 +1676,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     });
 
+    let shutdown_intent = control_plane.shutdown_intent();
     let sig_handle = tokio::spawn(async move {
         // The shell may start us with SIGINT/SIGTERM ignored (e.g. background
         // job). Reset them to the default disposition so tokio can install its
@@ -1389,11 +1699,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 info!("Received SIGTERM, shutting down...");
             }
         }
+        shutdown_intent.store(true, std::sync::atomic::Ordering::Release);
         let _ = cmd_tx.send(control::ControlCommand::Shutdown).await;
     });
 
-    info!("honk-core is running. Press Ctrl+C to stop.");
+    // Under a service manager nobody is at a terminal to press it.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        info!("honk-core is running. Press Ctrl+C to stop.");
+    } else {
+        info!("honk-core is running.");
+    }
     let control_result = control_plane.run().await;
+    #[cfg(feature = "native-api")]
+    native_api::NativeRuntime::shutdown(native, &control_plane, control_result.is_err()).await;
 
     // Signal systemd that we're stopping (Type=notify)
     #[cfg(target_os = "linux")]
@@ -1403,694 +1723,178 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     sighup_handle.abort();
     let _ = sig_handle.await;
     let _ = sighup_handle.await;
-    let remaining_subscription_tasks = subscription_supervisor.shutdown().await;
-    debug_assert_eq!(remaining_subscription_tasks, 0);
+    let subscription_result = subscription_supervisor.shutdown().await;
     info!("honk-core stopped");
 
-    control_result
-}
-
-#[cfg(feature = "ebpf")]
-#[derive(Debug, Clone)]
-pub struct Dae0Setup {
-    pub ifindex: u32,
-    pub peer_ifindex: u32,
-    pub peer_mac: [u8; 6],
-}
-
-/// Guard that removes the `dae0` link pair and policy routing when it goes out
-/// of scope. If setup fails mid-way, drop cleans up whatever was installed.
-///
-/// Link-local addressing (169.254.0.1/32 on dae0, 169.254.0.11/32 on dae0peer)
-/// eliminates the need for iptables MASQUERADE and TCP MSS clamping — the kernel
-/// already treats link-local traffic as local.
-#[cfg(feature = "ebpf")]
-struct Dae0Guard {
-    pub ifindex: u32,
-}
-
-#[cfg(feature = "ebpf")]
-impl Dae0Guard {
-    fn new() -> Self {
-        Self { ifindex: 0 }
-    }
-}
-
-#[cfg(feature = "ebpf")]
-impl Drop for Dae0Guard {
-    fn drop(&mut self) {
-        info!("Cleaning up dae0 side effects");
-        // The recorded ifindex keeps cleanup pointed at the device THIS
-        // instance created, never at a same-named replacement.
-        cleanup_dae0_interface((self.ifindex != 0).then_some(self.ifindex));
-    }
-}
-
-#[cfg(feature = "ebpf")]
-fn create_dae0_link() -> anyhow::Result<Dae0Guard> {
-    let mut guard = Dae0Guard::new();
-
-    // Stale-state cleanup (previous run): drop the compat bind-mount (the
-    // FD-held namespace dies with its owner process) and any leftover dae0.
-    // The singleton lock guarantees no live sibling owns these names.
-    if is_mountpoint("/run/netns/daens") {
-        let _ = nix::mount::umount2(DAENS_NS_PATH, nix::mount::MntFlags::MNT_DETACH);
-    }
-    if let Ok(idx) = netlink::ifindex_of("dae0")
-        && let Ok(mut nl) = netlink::NlSock::new()
-    {
-        let _ = nl.del_link(idx);
-    }
-
-    // FD-owned namespace (unshare + held FD, compat bind-mount inside).
-    create_daens_namespace()?;
-
-    let mut nl = netlink::NlSock::new().map_err(|e| anyhow::anyhow!("netlink: {e}"))?;
-    let link_kind = nl
-        .add_link_pair("dae0", "dae0peer")
-        .map_err(|e| anyhow::anyhow!("failed to add dae0 link pair: {e}"))?;
-    info!(kind = ?link_kind, "Created dae0/dae0peer link pair");
-
-    let dae0_idx = netlink::ifindex_of("dae0")?;
-    let peer_idx = netlink::ifindex_of("dae0peer")?;
-
-    // These are datapath-critical: a "successful" startup without them is
-    // worse than a loud failure.
-    nl.set_link_up(dae0_idx, true)
-        .map_err(|e| anyhow::anyhow!("bring dae0 up: {e}"))?;
-    nl.set_link_up(peer_idx, true)
-        .map_err(|e| anyhow::anyhow!("bring dae0peer up: {e}"))?;
-
-    for (key, val) in [
-        ("net.ipv4.conf.dae0.rp_filter", "0"),
-        ("net.ipv4.conf.dae0.accept_local", "1"),
-    ] {
-        match set_sysctl(key, val) {
-            Ok(()) => info!("{} = {}", key, val),
-            Err(e) => warn!("failed to set {}={}: {}", key, val, e),
-        }
-    }
-
-    // Enable IPv6 on dae0 for the daens IPv6 reply path.
-    let _ = set_sysctl("net.ipv6.conf.dae0.disable_ipv6", "0");
-    let _ = set_sysctl("net.ipv6.conf.dae0.forwarding", "1");
-
-    guard.ifindex = dae0_idx;
-
-    // Assign a link-local /32 address to the host-side dae0.  Link-local
-    // addressing eliminates the need for iptables MASQUERADE and TCP MSS
-    // clamping — the kernel already treats 169.254.0.0/16 traffic as local.
-    let host_v4: std::net::Ipv4Addr = DAENS_HOST_IP.parse().unwrap();
-    // Idempotent: delete any stale address left by a previous run first.
-    let _ = nl.addr_op(false, dae0_idx, netlink::FAM_V4, &host_v4.octets(), 32);
-    nl.addr_op(true, dae0_idx, netlink::FAM_V4, &host_v4.octets(), 32)
-        .map_err(|e| anyhow::anyhow!("dae0 IPv4 address {}: {e}", host_v4))?;
-
-    // Assign an IPv6 ULA address to the host-side dae0 so the daens
-    // namespace can route IPv6 replies back through this link.
-    let host_v6: std::net::Ipv6Addr = DAENS_HOST_IPV6.parse().unwrap();
-    let _ = nl.addr_op(false, dae0_idx, netlink::FAM_V6, &host_v6.octets(), 64);
-    let _ = nl.addr_op(true, dae0_idx, netlink::FAM_V6, &host_v6.octets(), 64);
-
-    // Enable IPv6 forwarding so daens-originated IPv6 packets reach the LAN.
-    let _ = set_sysctl("net.ipv6.conf.all.forwarding", "1");
-
-    Ok(guard)
-}
-
-#[cfg(feature = "ebpf")]
-fn setup_daens_namespace(tproxy_mark: u32, tproxy_port: u16) -> anyhow::Result<()> {
-    let _ = tproxy_port;
-    use netlink::{FAM_V4, FAM_V6, NlSock};
-
-    // Host-side dae0 MAC: the L2 next-hop for the daens default route.
-    let dae0_mac = netlink::mac_of("dae0").map_err(|e| anyhow::anyhow!("read dae0 MAC: {e}"))?;
-    let dae0_idx = netlink::ifindex_of("dae0")?;
-    let peer_idx = netlink::ifindex_of("dae0peer")?;
-
-    // Move dae0peer into daens (BPF programs are already attached).
-    let mut nl = NlSock::new().map_err(|e| anyhow::anyhow!("netlink: {e}"))?;
-    nl.set_link_netns_fd(peer_idx, daens_fd()?)
-        .map_err(|e| anyhow::anyhow!("move dae0peer to daens: {e}"))?;
-    info!("Moved dae0peer to daens");
-
-    let host_v4: std::net::Ipv4Addr = DAENS_HOST_IP.parse().unwrap();
-    let peer_v4: std::net::Ipv4Addr = DAENS_PEER_IP.parse().unwrap();
-    let host_v6: std::net::Ipv6Addr = DAENS_HOST_IPV6.parse().unwrap();
-    let peer_v6: std::net::Ipv6Addr = DAENS_PEER_IPV6.parse().unwrap();
-
-    // Configure daens in one scoped switch: a netlink socket opened inside
-    // operates on the daens namespace, and /proc/sys writes hit the
-    // namespace's sysctls.
-    let peer_mac = with_daens_netns("configure daens", || {
-        use anyhow::Context as _;
-        let mut n = NlSock::new().context("daens netlink socket")?;
-        // /sys inside a scoped setns still shows the HOST's devices (the
-        // view is per-mount, not per-reader) — look links up over netlink,
-        // whose socket is bound to the namespace it was created in.
-        let (lo, _) = n.get_link("lo").context("lo in daens")?;
-        let (peer, peer_mac) = n.get_link("dae0peer").context("dae0peer in daens")?;
-        n.set_link_up(lo, true).context("lo up")?;
-        n.set_link_up(peer, true).context("dae0peer up")?;
-
-        // fwmark → table 100 with a local default route (v4 + v6 mirror):
-        // marked packets are delivered to daens-local sockets.
-        n.add_rule_fwmark(
-            FAM_V4,
-            tproxy_mark,
-            !honk_ebpf_common::DNS_ROUTE_MARK_MASK,
-            100,
-        )?;
-        n.add_route(
-            FAM_V4,
-            100,
-            netlink::ROUTE_LOCAL,
-            netlink::SCOPE_HOST,
-            netlink::PROTO_STATIC,
-            None,
-            None,
-            Some(lo),
-        )?;
-        n.add_rule_fwmark(
-            FAM_V6,
-            tproxy_mark,
-            !honk_ebpf_common::DNS_ROUTE_MARK_MASK,
-            100,
-        )?;
-        n.add_route(
-            FAM_V6,
-            100,
-            netlink::ROUTE_LOCAL,
-            netlink::SCOPE_HOST,
-            netlink::PROTO_STATIC,
-            None,
-            None,
-            Some(lo),
-        )?;
-
-        // Link-local /32 on dae0peer. The link-scope route tells the kernel
-        // that 169.254.0.1 (dae0) is directly reachable at L2; without it,
-        // /32 prevents treating 169.254.0.1 as a valid nexthop.
-        n.addr_op(true, peer, FAM_V4, &peer_v4.octets(), 32)?;
-        n.add_route(
-            FAM_V4,
-            254,
-            netlink::ROUTE_UNICAST,
-            netlink::SCOPE_LINK,
-            netlink::PROTO_STATIC,
-            Some((&host_v4.octets(), 32)),
-            None,
-            Some(peer),
-        )?;
-        n.add_route(
-            FAM_V4,
-            254,
-            netlink::ROUTE_UNICAST,
-            netlink::SCOPE_UNIVERSE,
-            netlink::PROTO_STATIC,
-            None,
-            Some(&host_v4.octets()),
-            Some(peer),
-        )?;
-
-        // IPv6 ULA on dae0peer + IPv6 default (non-fatal: v6 path degrades
-        // to v4-only rather than aborting startup).
-        let _ = n.addr_op(true, peer, FAM_V6, &peer_v6.octets(), 64);
-        let _ = n.add_route(
-            FAM_V6,
-            254,
-            netlink::ROUTE_UNICAST,
-            netlink::SCOPE_UNIVERSE,
-            netlink::PROTO_STATIC,
-            None,
-            Some(&host_v6.octets()),
-            Some(peer),
-        );
-
-        // Static neighbours for the host side of the link (v4 + v6).
-        n.neigh_replace(peer, FAM_V4, &host_v4.octets(), &dae0_mac)?;
-        let _ = n.neigh_replace(peer, FAM_V6, &host_v6.octets(), &dae0_mac);
-
-        // Disable rp_filter, enable accept_local/route_localnet in daens so
-        // packets with foreign source/dest addresses can be delivered locally.
-        for (key, val) in [
-            ("net.ipv4.conf.all.rp_filter", "0"),
-            ("net.ipv4.conf.all.accept_local", "1"),
-            ("net.ipv4.conf.all.route_localnet", "1"),
-            ("net.ipv4.conf.dae0peer.rp_filter", "0"),
-            ("net.ipv4.conf.dae0peer.accept_local", "1"),
-            ("net.ipv4.conf.dae0peer.route_localnet", "1"),
-            ("net.ipv4.conf.lo.accept_local", "1"),
-            ("net.ipv4.conf.lo.route_localnet", "1"),
-            ("net.ipv6.conf.all.forwarding", "1"),
-            ("net.ipv6.conf.dae0peer.forwarding", "1"),
-            ("net.ipv6.conf.dae0peer.accept_ra", "0"),
-        ] {
-            let _ = set_sysctl(key, val);
-        }
-        Ok(peer_mac)
-    })?;
-
-    // Install static neighbour entries on the host so replies to
-    // daens-bound connections are forwarded to the correct dae0peer MAC.
-    nl.neigh_replace(dae0_idx, FAM_V4, &peer_v4.octets(), &peer_mac)
-        .map_err(|e| anyhow::anyhow!("host neighbour for daens peer: {e}"))?;
-    let _ = nl.neigh_replace(dae0_idx, FAM_V6, &peer_v6.octets(), &peer_mac);
-
-    // Make sure the host forwards traffic between dae0 and the LAN/WAN
-    // interfaces; this is required for the SYN-ACK path back to the client.
-    set_sysctl("net.ipv4.ip_forward", "1")
-        .map_err(|e| anyhow::anyhow!("enable net.ipv4.ip_forward: {e}"))?;
-
-    info!("Configured daens namespace (mark={:#x})", tproxy_mark);
-    DAENS_READY.store(true, std::sync::atomic::Ordering::Release);
-    Ok(())
-}
-
-/// Path of the daens network-namespace bind-mount, kept for external
-/// tooling compatibility (`ip netns exec`, debug shells). The engine
-/// itself never depends on it — the namespace is FD-owned (below).
-#[cfg(target_os = "linux")]
-pub(crate) const DAENS_NS_PATH: &str = "/var/run/netns/daens";
-
-/// Runtime truth for "daens is set up", set by [`setup_daens_namespace`]
-/// on success. Socket creation must key on this, never on
-/// `DAENS_NS_PATH` existing — a leftover or failed compat mount says
-/// nothing about the datapath (a first clean deploy once bound every
-/// TPROXY listener into the host namespace because of that confusion).
-#[cfg(target_os = "linux")]
-pub(crate) static DAENS_READY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Whether THIS instance created the compat bind-mount at
-/// [`DAENS_NS_PATH`]. Cleanup only ever unmounts what it mounted —
-/// never a same-named mount belonging to another tool.
-#[cfg(feature = "ebpf")]
-static COMPAT_MOUNTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Whether THIS instance created the regular file used as the compat
-/// bind-mount target. If `/run/netns` belongs to iproute2, unmounting the
-/// child does not remove that file, so cleanup must remove its own target.
-#[cfg(feature = "ebpf")]
-static COMPAT_FILE_CREATED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// The engine-owned daens namespace FD, created by
-/// [`create_daens_namespace`] at startup. An open namespace FD pins the
-/// namespace for the process lifetime — no `ip netns` registry involved.
-#[cfg(feature = "ebpf")]
-static DAENS_FD: std::sync::OnceLock<std::os::unix::io::OwnedFd> = std::sync::OnceLock::new();
-
-/// Whether THIS instance mounted the tmpfs at /run/netns (the compat
-/// bind-mount's parent). Tracked separately from [`COMPAT_MOUNTED`]:
-/// cleanup unmounts the parent only when it is ours.
-#[cfg(feature = "ebpf")]
-static PARENT_TMPFS_MOUNTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Create the daens network namespace without iproute2: a throwaway thread
-/// `unshare(CLONE_NEWNET)`s, hands its `/proc/thread-self/ns/net` FD back
-/// (the FD pins the namespace after the thread exits), and the FD is stored
-/// process-wide. For external tooling compatibility the namespace is also
-/// bind-mounted to [`DAENS_NS_PATH`] (best-effort — the engine works fine
-/// without the mount).
-#[cfg(feature = "ebpf")]
-fn create_daens_namespace() -> anyhow::Result<&'static std::os::unix::io::OwnedFd> {
-    use std::os::unix::io::OwnedFd;
-
-    if let Some(fd) = DAENS_FD.get() {
-        return Ok(fd);
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        if let Err(error) = nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET) {
-            let _ = tx.send(Err(std::io::Error::from(error)));
-            return;
-        }
-        // /proc/self/ns/net always shows the main thread's namespace. This
-        // thread-local path is the namespace created by unshare above.
-        let task_ns = "/proc/thread-self/ns/net";
-        // Best-effort compat mount: /var/run/netns/daens (iproute2 shape).
-        // The target must be a FILE — namespace handles are files, and a
-        // file bind-mount onto a directory fails with ENOTDIR. The parent
-        // is made a mountpoint (tmpfs) only if it isn't one already —
-        // crucially NOT via a self-MS_BIND, which would stack-duplicate
-        // every nsfs mount beneath it (lab ns pins included) on every
-        // engine restart.
-        let _ = std::fs::create_dir_all("/var/run/netns");
-        // /proc/mounts lists the real path (/var/run is a symlink to
-        // /run) — check the canonical path or every engine start
-        // mounts a fresh tmpfs over the registry, hiding iproute2's
-        // namespace files (the lab netns "disappears"). The tmpfs must
-        // be mounted BEFORE the target file is created, or the mount
-        // hides it and the bind below fails on a first clean deploy.
-        if !is_mountpoint("/run/netns") {
-            match nix::mount::mount(
-                Some("tmpfs"),
-                "/var/run/netns",
-                Some("tmpfs"),
-                nix::mount::MsFlags::empty(),
-                None::<&str>,
-            ) {
-                Ok(()) => {
-                    PARENT_TMPFS_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                Err(error) => warn!("tmpfs mount on /run/netns failed: {error}"),
-            }
-        }
-        let compat_target_ready = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(DAENS_NS_PATH)
-        {
-            Ok(_) => {
-                COMPAT_FILE_CREATED.store(true, std::sync::atomic::Ordering::Relaxed);
-                true
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
-            Err(error) => {
-                warn!("create compat daens target failed: {error}");
-                false
-            }
-        };
-        if compat_target_ready {
-            // The bind result is reported, never silently ignored — a failed
-            // compat mount leaves debug tooling unable to find daens.
-            match nix::mount::mount(
-                Some(task_ns),
-                DAENS_NS_PATH,
-                None::<&str>,
-                nix::mount::MsFlags::MS_BIND,
-                None::<&str>,
-            ) {
-                Ok(()) => COMPAT_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed),
-                Err(error) => {
-                    warn!("compat bind-mount of daens failed (debug tooling degraded): {error}");
-                }
-            }
-        }
-        let result = std::fs::File::open(task_ns).map(OwnedFd::from);
-        if result.is_ok() {
-            let link = std::fs::read_link(task_ns)
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|e| format!("<readlink failed: {e}>"));
-            info!("daens FD source: {} -> {}", task_ns, link);
-        }
-        let _ = tx.send(result);
-    });
-    let fd = rx
-        .recv()
-        .map_err(|_| anyhow::anyhow!("daens creator thread died"))?
-        .map_err(|e| anyhow::anyhow!("create daens namespace: {e}"))?;
-    info!("Created daens network namespace (FD-owned)");
-    Ok(DAENS_FD.get_or_init(|| fd))
-}
-
-/// The process-wide daens FD (created on demand).
-#[cfg(feature = "ebpf")]
-pub(crate) fn daens_fd() -> anyhow::Result<&'static std::os::unix::io::OwnedFd> {
-    create_daens_namespace()
-}
-
-/// Run `f` with the calling thread temporarily switched into the `daens`
-/// network namespace, restoring the original namespace on every exit path —
-/// including when `f` returns an error or panics (via the drop guard below).
-///
-/// This mirrors Go dae's `DaeNetns.WithRequired`: the process (all threads)
-/// always stays in the host netns; only operations that need the
-/// daens-internal view enter it for a scoped, synchronous call:
-/// dae0peer TC filter attach, sk_lookup attach, and DNS/UDP reply socket
-/// creation (Go "anyfrom" semantics — reply sockets must live in daens so
-/// their packets egress dae0peer and take the host dae0_ingress rewrite path
-/// back to the LAN).
-///
-/// `f` must be fully synchronous and must not `.await`: setns(2) is
-/// per-thread, so a future parked while inside daens could resume on a
-/// different worker thread that never switched, and this thread could
-/// restore its namespace while the parked future still assumes daens.  A
-/// process-wide mutex serializes the switches; it is not strictly required
-/// for correctness (each switch is per-thread) but keeps enter/leave pairs
-/// easy to reason about and the logs ordered.
-#[cfg(target_os = "linux")]
-pub(crate) fn with_daens_netns<R>(
-    op: &str,
-    f: impl FnOnce() -> anyhow::Result<R>,
-) -> anyhow::Result<R> {
-    static DAENS_SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Restores the saved network namespace on drop, so the original
-    /// namespace is regained even when `f` panics. A failed restore
-    /// aborts the process — a worker left in the wrong namespace would
-    /// silently originate dials from daens forever after.
-    struct RestoreNs<'a> {
-        fd: std::fs::File,
-        op: &'a str,
-    }
-    impl Drop for RestoreNs<'_> {
-        fn drop(&mut self) {
-            if let Err(error) = nix::sched::setns(&self.fd, nix::sched::CloneFlags::CLONE_NEWNET) {
-                tracing::error!(
-                    "failed to restore original netns after '{}': {} — aborting",
-                    self.op,
-                    error
-                );
-                std::process::abort();
-            }
-        }
-    }
-
-    // Lock FIRST: the save-and-switch is serialized before any namespace
-    // reads, so no other scoped switch can interleave.
-    let _switch_guard = DAENS_SWITCH
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    // /proc/thread-self/ns/net is this thread's real namespace;
-    // /proc/self/ns/net always resolves to the main thread.
-    let orig_ns = std::fs::File::open("/proc/thread-self/ns/net")
-        .map_err(|e| anyhow::anyhow!("{}: open /proc/thread-self/ns/net: {}", op, e))?;
-
-    // The FD-owned namespace is the primary handle; the compat bind-mount
-    // path is the fallback for tests, mock mode, and non-ebpf builds.
-    #[cfg(feature = "ebpf")]
-    {
-        let daens = daens_fd()
-            .map_err(|error| anyhow::anyhow!("{op}: daens namespace unavailable: {error:#}"))?;
-        nix::sched::setns(daens, nix::sched::CloneFlags::CLONE_NEWNET)
-            .map_err(|error| anyhow::anyhow!("{op}: setns(daens): {error}"))?;
-    }
-    #[cfg(not(feature = "ebpf"))]
-    {
-        let daens = std::fs::File::open(DAENS_NS_PATH)
-            .map_err(|error| anyhow::anyhow!("{op}: open {DAENS_NS_PATH}: {error}"))?;
-        nix::sched::setns(&daens, nix::sched::CloneFlags::CLONE_NEWNET)
-            .map_err(|error| anyhow::anyhow!("{op}: setns(daens): {error}"))?;
-    }
-    let _restore_guard = RestoreNs { fd: orig_ns, op };
-    f()
-}
-
-#[cfg(feature = "ebpf")]
-fn cleanup_dae0_interface(recorded_ifindex: Option<u32>) {
-    // Unmount the compat bind-mount only when THIS instance mounted it —
-    // a same-named mount from another tool is never ours to tear down.
-    if COMPAT_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        let _ = nix::mount::umount2(DAENS_NS_PATH, nix::mount::MntFlags::MNT_DETACH);
-    }
-    if COMPAT_FILE_CREATED.swap(false, std::sync::atomic::Ordering::Relaxed)
-        && let Err(error) = std::fs::remove_file(DAENS_NS_PATH)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!("remove compat daens target failed: {error}");
-    }
-    // Same ownership rule for the parent tmpfs (child must go first).
-    if PARENT_TMPFS_MOUNTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
-        let _ = nix::mount::umount2("/run/netns", nix::mount::MntFlags::MNT_DETACH);
-    }
-    DAENS_READY.store(false, std::sync::atomic::Ordering::Release);
-    // The FD-owned namespace dies with the process (dae0peer goes with it).
-
-    let Ok(mut nl) = netlink::NlSock::new() else {
-        return;
-    };
-    // Delete dae0 only when it is still the device this instance created:
-    // the recorded ifindex must still match the name — an outsider's
-    // same-named recreation is left alone.
-    let victim = match recorded_ifindex {
-        Some(idx) if netlink::ifindex_of("dae0").ok() == Some(idx) => Some(idx),
-        Some(_) => None,
-        None => netlink::ifindex_of("dae0").ok(),
-    };
-    if let Some(idx) = victim {
-        let _ = nl.del_link(idx);
-    }
-    // Policy-routing rules for daens live inside the daens namespace and
-    // disappear with it; these are only a safety net for stale
-    // host-namespace rules.
-    let _ = nl.del_rule_fwmark(
-        netlink::FAM_V4,
-        honk_ebpf_common::TPROXY_MARK,
-        u32::MAX,
-        100,
+    control_result?;
+    anyhow::ensure!(
+        subscription_result? == 0,
+        "subscription tasks remained after shutdown"
     );
-    let _ = nl.del_rule_fwmark(
-        netlink::FAM_V6,
-        honk_ebpf_common::TPROXY_MARK,
-        u32::MAX,
-        100,
-    );
-}
-
-/// Addressing for the dae0/dae0peer link pair between the host namespace and
-/// the isolated `daens` namespace.  These strings are the canonical values:
-/// the netns setup consumes them (ebpf feature only), while the control
-/// plane's internal-traffic filter (`control::is_honk_internal_addr`) uses
-/// the numeric forms `DAE0_IPV6_PREFIX_HI` / `DAE0_IPV4_NET` below in every
-/// build.  `control` tests assert both forms agree.
-///
-/// Link-local addresses (169.254.0.0/16) are used instead of a private
-/// subnet so that the kernel treats daens-originated traffic as local — no
-/// iptables MASQUERADE or TCP MSS clamping is needed.
-#[cfg(any(feature = "ebpf", test))]
-pub(crate) const DAENS_HOST_IP: &str = "169.254.0.1";
-#[cfg(any(feature = "ebpf", test))]
-pub(crate) const DAENS_PEER_IP: &str = "169.254.0.11";
-/// IPv6 ULA addresses of the dae0/dae0peer link pair (fd00:686f:6e6b::/64).
-/// The middle hextets are ASCII "honk" (`68 6f 6e 6b`) so the mnemonic
-/// stays readable while remaining a valid IPv6 ULA prefix.
-#[cfg(any(feature = "ebpf", test))]
-pub(crate) const DAENS_HOST_IPV6: &str = "fd00:686f:6e6b::1";
-#[cfg(any(feature = "ebpf", test))]
-pub(crate) const DAENS_PEER_IPV6: &str = "fd00:686f:6e6b::2";
-
-/// First 64 bits of `DAENS_HOST_IPV6`/`DAENS_PEER_IPV6` — the
-/// fd00:686f:6e6b::/64 ULA prefix — as a big-endian u64.
-pub(crate) const DAE0_IPV6_PREFIX_HI: u64 = 0xfd00_686f_6e6b_0000;
-/// `DAENS_HOST_IP`/`DAENS_PEER_IP` with the host bits masked off
-/// (169.254.0.0/16), as a big-endian u32.
-pub(crate) const DAE0_IPV4_NET: u32 = 0xA9FE_0000;
-
-pub(crate) fn set_sysctl(key: &str, value: &str) -> anyhow::Result<()> {
-    // Prefer /proc/sys because the standalone `sysctl` binary may not be on
-    // PATH in minimal environments (e.g. NixOS containers).
-    let path = format!("/proc/sys/{}", key.replace('.', "/"));
-    if let Err(e) = std::fs::write(&path, format!("{}\n", value)) {
-        // Fallback to the sysctl command if /proc/sys write fails.
-        let output = std::process::Command::new("sysctl")
-            .args(["-w", &format!("{}={}", key, value)])
-            .output()?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "sysctl -w {}={} failed: {} (proc write also failed: {})",
-                key,
-                value,
-                String::from_utf8_lossy(&output.stderr),
-                e
-            );
-        }
-    }
     Ok(())
-}
-
-/// Keep RA reception alive on a WAN interface across the datapath's
-/// all.forwarding=1 pin: with the stock accept_ra=1 the kernel drops RAs
-/// once forwarding is on, and networkd's userspace RA disables itself the
-/// same way — either path lets the SLAAC default route expire (#46).
-#[cfg(feature = "ebpf")]
-pub(crate) fn enable_wan_accept_ra(ifname: &str) {
-    if let Err(e) = set_sysctl(&format!("net.ipv6.conf.{ifname}.accept_ra"), "2") {
-        warn!("failed to set accept_ra for {ifname}: {e}");
-    }
-}
-
-/// Whether `path` is a mountpoint (appears in /proc/mounts).
-#[cfg(feature = "ebpf")]
-fn is_mountpoint(path: &str) -> bool {
-    std::fs::read_to_string("/proc/mounts")
-        .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(path)))
-        .unwrap_or(false)
-}
-
-#[cfg(test)]
-mod local_time_tests {
-    use tracing_subscriber::fmt::time::FormatTime;
-
-    #[test]
-    fn test_log_timestamp_carries_the_local_utc_offset() {
-        let mut out = String::new();
-        super::LocalTime
-            .format_time(&mut tracing_subscriber::fmt::format::Writer::new(&mut out))
-            .unwrap();
-        // 2026-09-12T02:30:15.123456+10:00 — date, time with microseconds, signed offset.
-        let (stamp, offset) = out.split_at(out.len() - 6);
-        assert_eq!(stamp.len(), 26, "{out}");
-        assert_eq!(&stamp[10..11], "T", "{out}");
-        assert!(offset.starts_with('+') || offset.starts_with('-'), "{out}");
-        assert_eq!(&offset[3..4], ":", "{out}");
-        let expected = chrono::Local::now().format("%:z").to_string();
-        assert_eq!(offset, expected, "{out}");
-    }
-
-    /// `--disable-timestamp` drops the stamp from the console line only.
-    #[test]
-    fn test_disable_timestamp_omits_the_console_stamp() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::prelude::*;
-
-        #[derive(Clone, Default)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let render = |disable_timestamp: bool| {
-            let sink = Sink::default();
-            let writer = sink.clone();
-            let layer = super::console_log_layer(
-                disable_timestamp,
-                move || writer.clone(),
-                tracing_subscriber::EnvFilter::new("info"),
-            );
-            let subscriber = tracing_subscriber::registry().with(layer);
-            tracing::subscriber::with_default(subscriber, || {
-                tracing::info!("stamp probe");
-            });
-            let bytes = sink.0.lock().unwrap().clone();
-            let text = String::from_utf8(bytes).unwrap();
-            // The console layer keeps its colours; strip the SGR sequences.
-            let mut plain = String::new();
-            let mut rest = text.as_str();
-            while let Some(start) = rest.find("\u{1b}[") {
-                plain.push_str(&rest[..start]);
-                let after = &rest[start + 2..];
-                rest = after.find('m').map_or("", |end| &after[end + 1..]);
-            }
-            plain.push_str(rest);
-            plain
-        };
-
-        let stamped = render(false);
-        assert!(stamped.starts_with("20"), "{stamped:?}");
-        assert!(stamped.contains(" INFO "), "{stamped:?}");
-        let bare = render(true);
-        assert!(bare.trim_start().starts_with("INFO "), "{bare:?}");
-        assert!(bare.contains("stamp probe"), "{bare:?}");
-    }
 }
 
 #[cfg(test)]
 mod startup_lifecycle_tests {
     use super::{
-        ClashCommand, Cli, load_operator_config, open_log_file, prepare_nfqueue_startup,
-        prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback, publish_instance_pid,
-        running_instance_pid,
+        ClashCommand, Cli, RotatingLogFile, acquire_instance_lock, load_operator_config,
+        prepare_nfqueue_startup, prepare_runtime_data_dir, prepare_runtime_data_dir_with_fallback,
+        publish_instance_pid, running_instance_pid,
     };
+    use crate::logging::open_log_file;
     use clap::Parser;
+
+    #[test]
+    fn a_reset_that_cannot_run_leaves_honk_running_without_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(directory.path()).unwrap());
+        let held = crate::state::StateDb::open(directory.path()).unwrap();
+        let degradations = crate::degradations::Degradations::default();
+        assert!(crate::state::startup::reset_non_strict(directory.path(), &degradations).is_none());
+        let issue = degradations
+            .get(crate::degradations::Component::Persistence)
+            .expect("the failed reset is reported");
+        // The reset's own failure is the cause, not the corruption.
+        assert_eq!(issue.reason, "in_use");
+        drop(held);
+    }
+
+    #[test]
+    fn a_failed_reopen_bounds_the_log_to_twice_the_limit() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let mut log = RotatingLogFile::open(&path, 100).unwrap();
+        log.fail_reopen = true;
+        for _ in 0..20 {
+            log.write_all(format!("{}\n", "x".repeat(59)).as_bytes())
+                .unwrap();
+        }
+        let rotated = std::fs::metadata(directory.path().join("honk.log.1")).unwrap();
+        assert!(
+            rotated.len() <= 200,
+            "{} bytes after a failed reopen",
+            rotated.len()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn two_writers_sharing_the_log_rotate_it_once() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let mut first = RotatingLogFile::open(&path, 100).unwrap();
+        let mut second = RotatingLogFile::open(&path, 100).unwrap();
+        let line = |text: &str| format!("{}\n", text.repeat(59));
+        first.write_all(line("a").as_bytes()).unwrap();
+        second.write_all(line("b").as_bytes()).unwrap();
+        first.write_all(line("c").as_bytes()).unwrap();
+        second.write_all(line("d").as_bytes()).unwrap();
+        let rotated = std::fs::read_to_string(directory.path().join("honk.log.1")).unwrap();
+        assert_eq!(rotated, format!("{}\n{}\n", "a".repeat(59), "b".repeat(59)));
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(current, format!("{}\n{}\n", "c".repeat(59), "d".repeat(59)));
+    }
+
+    #[test]
+    fn the_log_file_rotates_into_one_private_copy() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("honk.log");
+        let rotated = directory.path().join("honk.log.1");
+        let mut log = RotatingLogFile::open(&path, 100).unwrap();
+        for line in ["a", "b", "c", "d"] {
+            log.write_all(line.repeat(59).as_bytes()).unwrap();
+            log.write_all(b"\n").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "d".repeat(59) + "\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rotated).unwrap(),
+            "c".repeat(59) + "\n"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+        for file in [&path, &rotated] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_strict_state_db_that_cannot_be_used_leaves_honk_running() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cli = Cli::parse_from(["honk-core"]);
+        let mut config = honk_config::Config::default();
+        config.experimental.cache_file.enabled = Some(true);
+
+        let unsafe_dir = tempfile::tempdir().unwrap();
+        let state = unsafe_dir.path().join(crate::state::STATE_DIR);
+        std::fs::create_dir(&state).unwrap();
+        // Only a writable directory is still refused; readable ones are tightened.
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let reason = |degradations: &crate::degradations::Degradations| {
+            degradations
+                .get(crate::degradations::Component::Persistence)
+                .map(|issue| issue.reason)
+        };
+        let degradations = crate::degradations::Degradations::default();
+        let (db, reset) =
+            super::open_state_db(&cli, &config, unsafe_dir.path(), &degradations).unwrap();
+        assert!(db.is_none() && !reset);
+        assert_eq!(reason(&degradations), Some("unsafe"));
+        let entry = degradations.snapshot().pop().unwrap();
+        assert_eq!(entry.rule, Some("group_or_other_bits"));
+
+        let locked_dir = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(locked_dir.path()).unwrap());
+        let held = nix::fcntl::Flock::lock(
+            std::fs::File::open(locked_dir.path().join(crate::state::STATE_DIR)).unwrap(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap();
+        let degradations = crate::degradations::Degradations::default();
+        let (db, reset) =
+            super::open_state_db(&cli, &config, locked_dir.path(), &degradations).unwrap();
+        assert!(db.is_none() && !reset);
+        assert_eq!(reason(&degradations), Some("locked"));
+        drop(held);
+
+        // Password mode makes the db strict: the same unsafe directory refuses startup.
+        config.experimental.native_api.password_auth = true;
+        assert!(
+            super::open_state_db(&cli, &config, unsafe_dir.path(), &Default::default()).is_err()
+        );
+
+        // A newer schema refuses startup either way.
+        config.experimental.native_api.password_auth = false;
+        let newer_dir = tempfile::tempdir().unwrap();
+        drop(crate::state::StateDb::open(newer_dir.path()).unwrap());
+        rusqlite::Connection::open(
+            newer_dir
+                .path()
+                .join(crate::state::STATE_DIR)
+                .join(crate::state::DB_FILE),
+        )
+        .unwrap()
+        .execute_batch(&format!(
+            "PRAGMA user_version = {}",
+            crate::state::SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+        assert!(
+            super::open_state_db(&cli, &config, newer_dir.path(), &Default::default()).is_err()
+        );
+    }
 
     #[test]
     fn nfqueue_requested_with_mock_backend_falls_back_to_disabled() {
@@ -2255,6 +2059,21 @@ mod startup_lifecycle_tests {
         drop(lock);
         assert!(running_instance_pid(&path).is_err());
     }
+
+    #[test]
+    fn a_refused_instance_lock_names_the_holder_and_the_wait() {
+        let directory = tempfile::tempdir().expect("create temporary directory");
+        let path = directory.path().join("honk-core.lock");
+        let wait = std::time::Duration::ZERO;
+        let _held = acquire_instance_lock(&path, wait).expect("take instance lock");
+        let error = acquire_instance_lock(&path, wait).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("PID {}", std::process::id())),
+            "{error}"
+        );
+        assert!(error.contains("within 0s"), "{error}");
+    }
+
     #[test]
     fn startup_load_reports_duplicate_node_identity() {
         let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();

@@ -1,6 +1,3 @@
-use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
-
 use super::*;
 use base64::Engine as _;
 use honk_config::types::NodeProtocol;
@@ -21,15 +18,44 @@ fn parse_clash_subscription(
     parse_clash_proxies(proxies, subscription_id)
 }
 
-#[tokio::test]
-async fn body_reader_refuses_one_byte_past_the_cap() {
-    let at_cap = http::Response::new(vec![b'a'; MAX_SUBSCRIPTION_BYTES]);
-    assert_eq!(
-        read_capped_body(at_cap.into()).await.unwrap().len(),
-        MAX_SUBSCRIPTION_BYTES
-    );
-    let over_cap = http::Response::new(vec![b'a'; MAX_SUBSCRIPTION_BYTES + 1]);
-    assert!(read_capped_body(over_cap.into()).await.is_err());
+#[test]
+fn subscription_userinfo_parses_known_unsigned_fields() {
+    let cases = [
+        ("", [None, None, None, None]),
+        (
+            "upload=422986054; download=5198408536; total=214748364800; expire=1796712849",
+            [
+                Some(422986054),
+                Some(5198408536),
+                Some(214748364800),
+                Some(1796712849),
+            ],
+        ),
+        (
+            " upload = 0 ; download = 0 ; total = 0 ; expire = 0 ",
+            [Some(0), Some(0), None, None],
+        ),
+        (
+            "download=12; ignored=34; upload=7",
+            [Some(7), Some(12), None, None],
+        ),
+        (
+            "upload=-1; download=no; total=18446744073709551616; expire=1=2; broken",
+            [None, None, None, None],
+        ),
+        (
+            "upload=18446744073709551615; total=1; expire=2",
+            [Some(u64::MAX), None, Some(1), Some(2)],
+        ),
+    ];
+    for (header, expected) in cases {
+        let parsed = parse_subscription_userinfo(header);
+        assert_eq!(
+            [parsed.upload, parsed.download, parsed.total, parsed.expire],
+            expected,
+            "{header}"
+        );
+    }
 }
 
 #[test]
@@ -404,6 +430,7 @@ async fn subscription_redirects_retain_same_origin_auth_and_strip_it_permanently
     });
     let sub = Subscription {
         url: format!("http://us%40er:p%3Ass@{address}/start"),
+        download_detour: "direct".into(),
         ..Default::default()
     };
     let nodes = tokio::time::timeout(
@@ -450,7 +477,7 @@ async fn configured_subscription_user_agent_reaches_fetch_request() {
             .unwrap();
     });
     let config = honk_config::parser::parse_dae_config(&format!(
-            "subscription {{\nprovider: {{\nurl: 'http://{address}/sub'\nua: 'provider/2.0'\ninterval: 0\n}}\n}}"
+            "subscription {{\nprovider: {{\nurl: 'http://{address}/sub'\nua: 'provider/2.0'\ninterval: 0\ndownload_detour: direct\n}}\n}}"
         ))
         .unwrap();
 
@@ -486,17 +513,14 @@ async fn subscription_store_loads_pre_default_user_agent_key() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let store = SubscriptionStore::open(temp.path().join(SUBSCRIPTION_STORE_DIR)).unwrap();
+    let store = SubscriptionStore::in_dir(temp.path());
     let sub = Subscription {
         name: "provider".into(),
         url: "https://example.test/subscription".into(),
         ..Subscription::default()
     };
     let content = "socks5://127.0.0.1:1080#stored";
-    assert_eq!(
-        store.path_for(&sub).file_name().unwrap().to_str().unwrap(),
-        pre_default_filename(&sub)
-    );
+    assert_eq!(SubscriptionStore::key(&sub), pre_default_filename(&sub));
     store.store_content(&sub, content.into()).await.unwrap();
 
     let restored = store.load_nodes(&sub).await.unwrap().unwrap();
@@ -510,7 +534,7 @@ async fn subscription_store_loads_pre_default_user_agent_key() {
 #[tokio::test]
 async fn subscription_cache_identity_isolates_explicit_default_user_agent() {
     let temp = tempfile::tempdir().unwrap();
-    let store = SubscriptionStore::open(temp.path().join(SUBSCRIPTION_STORE_DIR)).unwrap();
+    let store = SubscriptionStore::in_dir(temp.path());
     let default_sub = Subscription {
         name: "provider".into(),
         url: "https://example.test/subscription".into(),
@@ -581,6 +605,7 @@ async fn fetch_error_chain_redacts_subscription_url() {
     let subscription = Subscription {
         name: "provider".into(),
         url: format!("http://{address}/{SENTINEL}?token={SENTINEL}"),
+        download_detour: "direct".into(),
         ..Subscription::default()
     };
 
@@ -604,7 +629,7 @@ async fn subscription_store_recovers_last_valid_fetch() {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let temp = tempfile::tempdir().unwrap();
-    let store = SubscriptionStore::open(temp.path().join(SUBSCRIPTION_STORE_DIR)).unwrap();
+    let store = SubscriptionStore::in_dir(temp.path());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let valid = "socks5://127.0.0.1:1080#stored";
@@ -624,9 +649,10 @@ async fn subscription_store_recovers_last_valid_fetch() {
     let mut sub = Subscription {
         name: "provider".into(),
         url: format!("http://{address}/subscription"),
+        download_detour: "direct".into(),
         ..Subscription::default()
     };
-    let path = store.path_for(&sub);
+    let key = SubscriptionStore::key(&sub);
     let original_id = sub.id;
     let manager = SubscriptionManager::new().unwrap();
     let fetched = manager.fetch_and_store(&sub, Some(&store)).await.unwrap();
@@ -637,50 +663,11 @@ async fn subscription_store_recovers_last_valid_fetch() {
 
     sub.id = uuid::Uuid::new_v4();
     sub.name = "renamed-provider".into();
-    assert_eq!(store.path_for(&sub), path);
+    assert_eq!(SubscriptionStore::key(&sub), key);
     let restored = store.load_nodes(&sub).await.unwrap().unwrap();
     assert_eq!(restored.len(), 1);
     assert_eq!(restored[0].name, "stored");
     assert_eq!(restored[0].subscription_id, Some(sub.id));
-
-    let directory_mode = fs::metadata(store.root()).unwrap().permissions().mode() & 0o777;
-    let file_mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(directory_mode, 0o700);
-    assert_eq!(file_mode, 0o600);
-    assert_eq!(fs::read_dir(store.root()).unwrap().count(), 1);
-}
-
-#[tokio::test]
-async fn subscription_store_skips_rejected_legacy_candidates() {
-    let temp = tempfile::tempdir().unwrap();
-    let preferred = temp.path().join("preferred");
-    let old = temp.path().join("old");
-    let cwd = temp.path().join("cwd");
-    let sub = Subscription {
-        url: "https://example.invalid/subscription".into(),
-        ..Subscription::default()
-    };
-    let retained = SubscriptionStore::open(cwd.clone()).unwrap();
-    retained
-        .store_content(&sub, "socks5://127.0.0.1:1080#retained".into())
-        .await
-        .unwrap();
-    fs::write(&old, "not a directory").unwrap();
-
-    for symlink in [false, true] {
-        if symlink {
-            fs::remove_file(&old).unwrap();
-            let target = temp.path().join("symlink-target");
-            fs::create_dir(&target).unwrap();
-            std::os::unix::fs::symlink(target, &old).unwrap();
-        }
-        let store =
-            SubscriptionStore::open_with_legacy(preferred.clone(), [old.clone(), cwd.clone()])
-                .unwrap();
-        let nodes = store.load_nodes(&sub).await.unwrap().unwrap();
-        assert_eq!(nodes[0].name, "retained");
-        assert!(!preferred.exists());
-    }
 }
 
 const C19_PARTIAL: &str = include_str!("../../tests/fixtures/c19-partial-body.txt");
@@ -692,6 +679,7 @@ async fn c19_store_acceptance_is_independent_of_runtime_publication() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let sub = Subscription {
         url: format!("http://{}/sub", listener.local_addr().unwrap()),
+        download_detour: "direct".into(),
         ..Subscription::default()
     };
     let server = tokio::spawn(async move {
@@ -721,11 +709,10 @@ async fn c19_store_acceptance_is_independent_of_runtime_publication() {
         }
     });
     let temp = tempfile::tempdir().unwrap();
-    let store = SubscriptionStore::open(temp.path().join("store")).unwrap();
+    let store = SubscriptionStore::in_dir(temp.path());
     let manager = SubscriptionManager::new().unwrap();
     let nodes = manager.fetch_and_store(&sub, Some(&store)).await.unwrap();
-    let saved = store.path_for(&sub);
-    assert_eq!(fs::read_to_string(&saved).unwrap(), C19_PARTIAL);
+    assert_eq!(store.body(&sub).as_deref(), Some(C19_PARTIAL));
     assert!(
         honk_outbound::runtime::OutboundRuntimeRegistry::build(&[
             nodes[0].clone(),
@@ -738,12 +725,10 @@ async fn c19_store_acceptance_is_independent_of_runtime_publication() {
         nodes[0].id
     );
     assert!(manager.fetch_and_store(&sub, Some(&store)).await.is_err());
-    assert_eq!(fs::read_to_string(&saved).unwrap(), C19_PARTIAL);
-    fs::write(&saved, C19_INVALID).unwrap();
+    assert_eq!(store.body(&sub).as_deref(), Some(C19_PARTIAL));
+    store.store_content(&sub, C19_INVALID.into()).await.unwrap();
     assert!(store.load_nodes(&sub).await.is_err());
-    fs::remove_file(&saved).unwrap();
-    fs::remove_dir(store.root()).unwrap();
-    fs::write(store.root(), "not a directory").unwrap();
+    store.refuse_writes();
     let mut diagnostics = Vec::new();
     assert_eq!(
         manager
@@ -769,6 +754,7 @@ async fn c19_invalid_http_encoding_preserves_saved_body() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let sub = Subscription {
         url: format!("http://{}/sub", listener.local_addr().unwrap()),
+        download_detour: "direct".into(),
         ..Subscription::default()
     };
     let server = tokio::spawn(async move {
@@ -794,7 +780,7 @@ async fn c19_invalid_http_encoding_preserves_saved_body() {
         stream.write_all(body).await.unwrap();
     });
     let temp = tempfile::tempdir().unwrap();
-    let store = SubscriptionStore::open(temp.path().join("store")).unwrap();
+    let store = SubscriptionStore::in_dir(temp.path());
     store.store_content(&sub, C19_PARTIAL.into()).await.unwrap();
     let manager = SubscriptionManager::new().unwrap();
     let mut diagnostics = Vec::new();
@@ -806,10 +792,7 @@ async fn c19_invalid_http_encoding_preserves_saved_body() {
         result.is_err(),
         "invalid HTTP encoding must reject the body"
     );
-    assert_eq!(
-        fs::read(store.path_for(&sub)).unwrap(),
-        C19_PARTIAL.as_bytes()
-    );
+    assert_eq!(store.body(&sub).as_deref(), Some(C19_PARTIAL));
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].code, "invalid-subscription-encoding");
     assert!(diagnostics[0].terminal);

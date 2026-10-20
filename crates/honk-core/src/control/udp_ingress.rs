@@ -2,6 +2,11 @@
 
 use super::udp_endpoint::{DatagramPayload, RawDnsRoute};
 use super::*;
+use crate::ebpf::UdpFlowOwner;
+
+#[cfg(feature = "native-api")]
+pub(in crate::control) type PacketRoute =
+    Result<crate::observe::flows::kernel::CapturedKernelRoute, &'static str>;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UdpOriginalDst {
@@ -44,18 +49,44 @@ pub(super) enum UdpSlowPathWork {
         expected_epoch: u64,
         enqueued_at: u32,
         permit: tokio::sync::OwnedSemaphorePermit,
+        #[cfg(feature = "native-api")]
+        packet_route: Option<PacketRoute>,
     },
     Dns {
         admission: crate::control::dns_control::AdmittedDnsQuery,
         data: Bytes,
         validated: ValidatedDnsQuery,
+        #[cfg(feature = "native-api")]
+        packet_route: Option<PacketRoute>,
     },
     DnsRefused {
         runtime: crate::dns::runtime::RuntimeLease,
         udp_permit: tokio::sync::OwnedSemaphorePermit,
         response: Vec<u8>,
+        #[cfg(feature = "native-api")]
+        query: Bytes,
+        #[cfg(feature = "native-api")]
+        ingress: crate::dns::query::IngressProfile,
+        #[cfg(feature = "native-api")]
+        packet_route: Option<PacketRoute>,
     },
     Done,
+}
+
+#[cfg(feature = "native-api")]
+impl UdpSlowPathWork {
+    fn with_packet_route(mut self, capture: Option<PacketRoute>) -> Self {
+        match &mut self {
+            Self::Initialize(lease) => lease.set_packet_route(capture),
+            #[cfg(feature = "ebpf")]
+            Self::QueuedDatagram { packet_route, .. } => *packet_route = capture,
+            Self::Dns { packet_route, .. } | Self::DnsRefused { packet_route, .. } => {
+                *packet_route = capture
+            }
+            Self::Done => {}
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +111,7 @@ pub(super) fn begin_udp_slow_path(
         original_dst,
         data,
         None,
+        UdpFlowOwner::new(0, None).expect("model UDP owner"),
         pool.initialization_epoch(),
         udp_endpoint::queue_now(),
     )
@@ -99,6 +131,7 @@ pub(super) fn begin_udp_slow_path_at(
     original_dst: SocketAddr,
     data: &[u8],
     raw_dns_route: Option<RawDnsRoute<&str>>,
+    owner: UdpFlowOwner,
     expected_epoch: u64,
     enqueued_at: u32,
 ) -> UdpSlowPathWork {
@@ -120,6 +153,7 @@ pub(super) fn begin_udp_slow_path_at(
         original_dst,
         data,
         raw_dns_route,
+        owner,
         expected_epoch,
         permit,
         enqueued_at,
@@ -152,6 +186,12 @@ fn begin_udp_dns_query(
                     runtime,
                     udp_permit,
                     response: crate::dns::response::build_dns_refused(data.as_slice()),
+                    #[cfg(feature = "native-api")]
+                    query: data.into_bytes(),
+                    #[cfg(feature = "native-api")]
+                    ingress: validated.ingress(),
+                    #[cfg(feature = "native-api")]
+                    packet_route: None,
                 };
             }
             stats.record_udp_slow_permit_rejected();
@@ -162,6 +202,8 @@ fn begin_udp_dns_query(
         admission,
         data: data.into_bytes(),
         validated,
+        #[cfg(feature = "native-api")]
+        packet_route: None,
     }
 }
 
@@ -223,6 +265,8 @@ impl UdpLoopState {
                 original_dst,
                 route,
                 enqueued_at,
+                #[cfg(feature = "native-api")]
+                recv_meta.packet_priority,
             )
             .await
         } else {
@@ -242,6 +286,19 @@ impl UdpLoopState {
                 None,
                 enqueued_at,
             )
+            .await
+        };
+        #[cfg(feature = "native-api")]
+        let work = {
+            let mut work = work;
+            if let UdpSlowPathWork::Initialize(lease) = &mut work {
+                lease.set_packet_trace_id(
+                    (recv_meta.packet_mark == Some(honk_ebpf_common::TPROXY_MARK))
+                        .then_some(recv_meta.packet_priority)
+                        .flatten(),
+                );
+            }
+            work
         };
         self.spawn_work(src_addr, original_dst, work);
     }
@@ -253,6 +310,7 @@ impl UdpLoopState {
         original_dst: SocketAddr,
         route: UdpDnsRoute,
         enqueued_at: u32,
+        #[cfg(feature = "native-api")] packet_priority: Option<u32>,
     ) -> UdpSlowPathWork {
         let expected_epoch = self.udp_pool.initialization_epoch();
         // Match reload's router -> config -> backend publication order.
@@ -288,7 +346,6 @@ impl UdpLoopState {
             };
             Some(RawDnsRoute::Group(group.name.as_str()))
         };
-        drop(backend);
         if self.drain.should_reject() || !self.udp_pool.initialization_epoch_is(expected_epoch) {
             self.stats.record_udp_slow_permit_closed();
             return UdpSlowPathWork::Done;
@@ -296,24 +353,57 @@ impl UdpLoopState {
         if udp_ingress_excluded(src_addr, original_dst) {
             return UdpSlowPathWork::Done;
         }
+        #[cfg(feature = "native-api")]
+        let packet_route = self
+            .handle
+            .native
+            .as_ref()
+            .filter(|_| config.experimental.native_api.record_flows)
+            .map(|_| match packet_priority {
+                Some(trace_id) => backend.capture_kernel_route(
+                    &crate::control::connection::build_tuples_key(
+                        original_dst.ip(),
+                        original_dst.port(),
+                        src_addr.ip(),
+                        src_addr.port(),
+                        17,
+                    ),
+                    crate::observe::flows::kernel::KernelRouteReference {
+                        trace_id,
+                        decision_token: 0,
+                        routing_generation: u64::from(route.generation()),
+                        effective_outbound: route.outbound(),
+                        mark: None,
+                        must: None,
+                    },
+                ),
+                None => Err("receive_metadata_unavailable"),
+            });
+        drop(backend);
         let validated_dns = raw_dns_route
             .is_none()
             .then(|| validate_exact_dns_query(data.as_slice()))
             .flatten();
         // Config remains guarded through synchronous admission, not through spawned I/O.
         if let Some(validated) = validated_dns {
-            return begin_udp_dns_query(&self.dns_controller, &self.stats, data, validated);
+            let work = begin_udp_dns_query(&self.dns_controller, &self.stats, data, validated);
+            #[cfg(feature = "native-api")]
+            let work = work.with_packet_route(packet_route);
+            return work;
         }
-        match data {
-            DatagramPayload::Borrowed(data) => self.admit_datagram_at(
-                data,
-                src_addr,
-                original_dst,
-                None,
-                raw_dns_route,
-                Some(expected_epoch),
-                enqueued_at,
-            ),
+        let work = match data {
+            DatagramPayload::Borrowed(data) => {
+                self.admit_datagram_at(
+                    data,
+                    src_addr,
+                    original_dst,
+                    None,
+                    raw_dns_route,
+                    Some(expected_epoch),
+                    enqueued_at,
+                )
+                .await
+            }
             #[cfg(feature = "ebpf")]
             DatagramPayload::Owned(data) => {
                 let Some(permit) =
@@ -328,15 +418,20 @@ impl UdpLoopState {
                     expected_epoch,
                     enqueued_at,
                     permit,
+                    #[cfg(feature = "native-api")]
+                    packet_route: None,
                 }
             }
             #[cfg(all(test, not(feature = "ebpf")))]
             DatagramPayload::Owned(_) => unreachable!("queued DNS requires NFQUEUE"),
-        }
+        };
+        #[cfg(feature = "native-api")]
+        let work = work.with_packet_route(packet_route);
+        work
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn admit_datagram_at(
+    async fn admit_datagram_at(
         &self,
         data: &[u8],
         src_addr: SocketAddr,
@@ -364,6 +459,35 @@ impl UdpLoopState {
         ) {
             return UdpSlowPathWork::Done;
         }
+        let expected_epoch = expected_epoch.unwrap_or_else(|| self.udp_pool.initialization_epoch());
+        let backend =
+            if honk_ebpf_common::conn::is_stateless_udp_ports(src_addr.port(), original_dst.port())
+            {
+                None
+            } else {
+                Some(self.handle.ebpf.read().await)
+            };
+        let owner = if let Some(backend) = backend.as_ref() {
+            let key = crate::control::connection::build_tuples_key(
+                original_dst.ip(),
+                original_dst.port(),
+                src_addr.ip(),
+                src_addr.port(),
+                17,
+            );
+            match backend
+                .conn_state_lookup(&key)
+                .and_then(|state| backend.udp_flow_owner(0, state))
+            {
+                Ok(owner) => owner,
+                Err(error) => {
+                    debug!(%src_addr, %original_dst, %error, "Dropping UDP without kernel flow ownership");
+                    return UdpSlowPathWork::Done;
+                }
+            }
+        } else {
+            UdpFlowOwner::new(0, None).expect("stateless UDP owner")
+        };
         begin_udp_slow_path_at(
             &self.udp_pool,
             &self.stats,
@@ -373,7 +497,8 @@ impl UdpLoopState {
             original_dst,
             data,
             raw_dns_route,
-            expected_epoch.unwrap_or_else(|| self.udp_pool.initialization_epoch()),
+            owner,
+            expected_epoch,
             enqueued_at,
         )
     }
@@ -393,6 +518,8 @@ impl UdpLoopState {
                 expected_epoch,
                 enqueued_at,
                 permit,
+                #[cfg(feature = "native-api")]
+                packet_route,
             } => {
                 if self.drain.should_reject()
                     || !self.udp_pool.initialization_epoch_is(expected_epoch)
@@ -406,12 +533,17 @@ impl UdpLoopState {
                         original_dst,
                         DatagramPayload::Owned(data),
                         raw_dns_route.as_ref().map(RawDnsRoute::as_ref),
+                        UdpFlowOwner::new(0, None).expect("stateless UDP owner"),
                         expected_epoch,
                         permit,
                         enqueued_at,
                         &self.stats,
                     )
                 {
+                    #[cfg(feature = "native-api")]
+                    let mut lease = lease;
+                    #[cfg(feature = "native-api")]
+                    lease.set_packet_route(packet_route);
                     self.spawn_work(src_addr, original_dst, UdpSlowPathWork::Initialize(lease));
                 }
             }
@@ -421,7 +553,7 @@ impl UdpLoopState {
                 self.udp_pool.spawn_slow_path(async move {
                     let _guard = guard;
                     if let Err(error) = handle.serve_udp_connection(lease).await {
-                        warn!(%src_addr, %original_dst, %error, "Error handling UDP");
+                        debug!(%src_addr, %original_dst, %error, "Error handling UDP");
                     }
                 });
             }
@@ -429,38 +561,134 @@ impl UdpLoopState {
                 admission,
                 data,
                 validated,
+                #[cfg(feature = "native-api")]
+                packet_route,
             } => {
                 let guard = ConnectionGuard::new(Arc::clone(&self.drain));
                 let dns_controller = Arc::clone(&self.dns_controller);
+                #[cfg(feature = "native-api")]
+                let mut observation =
+                    crate::control::connection::observation::ConnectionObservation::begin(
+                        self.handle.native.as_deref(),
+                        crate::observe::vocab::Network::Udp,
+                        src_addr,
+                        original_dst,
+                    );
+                #[cfg(feature = "native-api")]
+                if let Some(capture) = packet_route {
+                    observation.packet_route(capture);
+                }
+                #[cfg(feature = "native-api")]
+                let observer = observation
+                    .observer(|| self.handle.diagnostics.read().generation, "client_dns");
                 self.udp_pool.spawn_slow_path(async move {
                     let _guard = guard;
-                    dns_controller
-                        .handle_udp_dns_admitted(
-                            &admission,
-                            &data,
-                            src_addr,
-                            original_dst,
-                            validated,
-                        )
-                        .await;
+                    let operation = async {
+                        dns_controller
+                            .handle_udp_dns_admitted(
+                                &admission,
+                                &data,
+                                src_addr,
+                                original_dst,
+                                validated,
+                            )
+                            .await;
+                    };
+                    #[cfg(feature = "native-api")]
+                    {
+                        match observer {
+                            Some(observer) => observer.scope(operation).await,
+                            None => operation.await,
+                        }
+                        observation.finish(
+                            crate::observe::vocab::ConnectionState::Closed,
+                            "dns_query_completed",
+                        );
+                    }
+                    #[cfg(not(feature = "native-api"))]
+                    operation.await;
                 });
             }
             UdpSlowPathWork::DnsRefused {
                 runtime,
                 udp_permit,
                 response,
+                #[cfg(feature = "native-api")]
+                query,
+                #[cfg(feature = "native-api")]
+                ingress,
+                #[cfg(feature = "native-api")]
+                packet_route,
             } => {
                 let guard = ConnectionGuard::new(Arc::clone(&self.drain));
+                #[cfg(feature = "native-api")]
+                let dns_controller = Arc::clone(&self.dns_controller);
+                #[cfg(feature = "native-api")]
+                let mut observation =
+                    crate::control::connection::observation::ConnectionObservation::begin(
+                        self.handle.native.as_deref(),
+                        crate::observe::vocab::Network::Udp,
+                        src_addr,
+                        original_dst,
+                    );
+                #[cfg(feature = "native-api")]
+                if let Some(capture) = packet_route {
+                    observation.packet_route(capture);
+                }
+                #[cfg(feature = "native-api")]
+                let observer = observation
+                    .observer(|| self.handle.diagnostics.read().generation, "client_dns");
                 self.udp_pool.spawn_slow_path(async move {
                     let _guard = guard;
                     let _permit = udp_permit;
-                    let _ = runtime
-                        .run_reply(send_udp_reply_from_orig_dst(
+                    #[cfg(feature = "native-api")]
+                    let started = std::time::Instant::now();
+                    let operation = async {
+                        crate::observe::flows::dns::decision("rejected", Some("admission_refused"));
+                        let result = runtime
+                            .run_reply(send_udp_reply_from_orig_dst(
+                                &response,
+                                src_addr,
+                                original_dst,
+                            ))
+                            .await;
+                        crate::observe::flows::dns::reply_delivery(
+                            &result,
+                            |length| *length == response.len(),
+                            "client_send_failed",
+                        );
+                    };
+                    #[cfg(feature = "native-api")]
+                    {
+                        let operation = std::pin::pin!(operation);
+                        let operation = crate::observe::flows::dns::client_scope(
+                            &query,
+                            ingress,
+                            crate::dns::query::DnsRequestMeta::new(
+                                Some(src_addr.ip()),
+                                Some(original_dst),
+                            ),
+                            operation,
+                        );
+                        match observer {
+                            Some(observer) => observer.scope(operation).await,
+                            None => operation.await,
+                        }
+                        observation.finish(
+                            crate::observe::vocab::ConnectionState::Closed,
+                            "dns_refusal_completed",
+                        );
+                        dns_controller.dns_service().observer.observe_client(
+                            &query,
+                            ingress,
+                            Some(src_addr),
+                            None,
                             &response,
-                            src_addr,
-                            original_dst,
-                        ))
-                        .await;
+                            started.elapsed(),
+                        );
+                    }
+                    #[cfg(not(feature = "native-api"))]
+                    operation.await;
                 });
             }
         }
@@ -471,14 +699,8 @@ pub(super) async fn udp_listener_loop(
     state: UdpLoopState,
     socket: Arc<UdpSocket>,
     family: &'static str,
+    mut batch: UdpRecvBatch,
 ) {
-    let mut batch = match UdpRecvBatch::new() {
-        Ok(batch) => batch,
-        Err(error) => {
-            error!(family, %error, "UDP receive setup failed");
-            return;
-        }
-    };
     let local_addr = match socket.local_addr() {
         Ok(address) => address,
         Err(error) => {
@@ -486,17 +708,27 @@ pub(super) async fn udp_listener_loop(
             return;
         }
     };
+    // A persistent receive error repeats every iteration; warn once per episode.
+    let mut receive_failing = false;
     loop {
         if let Err(error) = recv_batch_from_with_orig_dst(&socket, local_addr, &mut batch).await {
-            error!(family, %error, "UDP receive failed");
+            crate::logging::warn_on_entry!(
+                !std::mem::replace(&mut receive_failing, true),
+                family,
+                %error,
+                "UDP receive failed"
+            );
             continue;
+        }
+        if std::mem::replace(&mut receive_failing, false) {
+            info!(family, "UDP receive recovered");
         }
         let enqueued_at = udp_endpoint::queue_now();
         for index in 0..batch.len() {
             let (data, src_addr, metadata) = match batch.packet(index) {
                 Ok(packet) => packet,
                 Err(error) => {
-                    error!(family, %error, "Invalid UDP receive metadata");
+                    debug!(family, %error, "Invalid UDP receive metadata");
                     continue;
                 }
             };

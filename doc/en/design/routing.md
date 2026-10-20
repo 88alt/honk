@@ -40,8 +40,8 @@ directly; use a group (including a one-node filter group).
 Kernel routing preserves the userspace matching contract:
 
 - Ordinary domain pattern/suffix/keyword/regex and geosite alternatives form one
-  condition. Existing suffix, regex, keyword, case, and geosite attribute behavior
-  is retained.
+  condition. Negation applies once to their union. Existing suffix, regex,
+  keyword, case, and geosite attribute behavior is retained.
 - Destination/source IP predicates preserve IPv4/IPv6 identity, including `/0`,
   host addresses and overlapping prefixes.
 - Port ranges are inclusive. TCP/UDP and IPv4/IPv6 masks retain both alternatives.
@@ -76,8 +76,9 @@ predicate ID within one policy.
 ### Source organization
 
 - [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
-  userspace `Router`, priority-ordered compiled routes, `route_action`,
-  `GeositeMatcher`, and the `BinaryLpmTrie`/geo-asset helpers. `geo.rs` parses
+  userspace `Router`, priority-ordered compiled routes, `route_action`, and the
+  `BinaryLpmTrie`/geo-asset helpers. `domain.rs` owns the domain matchers,
+  `GeositeMatcher`, and the build-local interner. `geo.rs` parses
   `geoip.dat`/`geosite.dat` once per `Router` build and decodes only referenced
   codes; `category@attr` splits at the first `@` and filters attribute keys
   case-insensitively.
@@ -122,10 +123,21 @@ and family masks, DSCP, and provenance/presence information. `RoutingDecision`
 contains outbound, mark, must, domain-finality, and rule ID. A scalar return code
 separates a successful decision from an unavailable or failed evaluator.
 
+`RoutingInput.flags` keeps MAC presence separate from direct-finality permission.
+The static caller rebuilds that permission from the same captured Rule-mode
+flags used for enforcement, not a second map read. The input remains 128 bytes;
+the loader rejects older external eBPF objects whose last member is still
+`mac_present`. Rebuild those objects before using this userspace compiler.
+
 `domain_final` means that a later domain routing observation cannot change this
 phase's route under its dial mode: the policy has no domain predicates, domain
-rerouting is disabled, or a complete learned-domain bitmap was available. It is
-policy-generation data, not a separately published global routing flag.
+rerouting is disabled, or a complete learned-domain bitmap was available. In
+Rule mode, an ordinary direct action is also final when every live rule through
+and including its matching rule is domain-independent. Later domain rules cannot
+preempt that first match; folded-false rules do not count, while positive and
+negated domain predicates both do. The same prefix proof applies to fallback.
+Without the captured Rule-mode permission, this additional proof is not applied,
+preserving the existing Global-mode handoff and hostname-sniffing authority.
 
 For non-DNS traffic, a non-`must` direct result with unresolved domain finality is
 encoded as `ControlPlaneRouting` when handed to userspace. Passing it as final
@@ -243,6 +255,8 @@ one GeoIP predicate can contain hundreds of thousands of prefixes. The emitter
 checks its 1,000,000-instruction budget before each instruction insertion and stops
 immediately on exhaustion, before further instruction or fixup expansion.
 
+Fact bits are a per-generation resource: 256 IDs per category (destination IP, source IP, MAC), counted per distinct list rather than per rule. Rules that name the same IP list (identified by its interned matcher) or the same MAC list (by value, order-sensitive) share one ID; negation stays on the rule condition. Domain predicates have a separate 256-ID limit and share IDs for equal normalized matcher keys. Branch distances must fit signed 16-bit instruction offsets; otherwise publication fails with `routing jump out of range`.
+
 Capacity and verifier limits are explicit errors. No rule chain is truncated and
 no missing outbound silently becomes direct. Generated source attribution records
 rule IDs and normalized rule descriptions. A raw loader uses the existing syscall
@@ -329,10 +343,12 @@ Implementation is accepted only with all existing matchers supported and with:
 The current CI real-kernel baseline is the pinned Ubuntu Linux
 `6.12.0-061200-generic` VM. CI builds the test executables on the hosted runner
 and runs those exact artifacts in the VM; it does not compile again in the guest.
-The VM runs the root-only routing and integration gates, while `just test-routing`
-also exercises the generated policy through the root/slot path, including
-precedence, complete decision metadata, capacity failures, and failed-publication
-preservation. `just test-netns` includes that routing gate.
+`just test-routing` and dependent `just test-netns` share that complete
+pre-provisioned disposable-VM gate. It exercises the real root/slot path,
+including precedence, complete decision metadata, capacity failures and
+failed-publication preservation, followed by the ownership/netns suites.
+Toolchain, both objects and VM environment prerequisites are documented in
+the `honk-real-ebpf-tests` skill; protected fixtures never run on a shared host.
 
 Performance measurements and historical prototype/lab records are intentionally
 not kept on this design page. The reload benchmark definition lives in

@@ -20,6 +20,7 @@ async fn different_sources_share_only_aggregated_carriers() {
                 8,
                 8,
                 8,
+                false,
                 None,
             )
             .unwrap()
@@ -50,11 +51,12 @@ async fn different_sources_share_only_aggregated_carriers() {
             let client = client.local_addr().unwrap();
             let lease = reserve_source(&pool, &stats, client, target, node.id);
             let attachment = pool
-                .prepare_vless_source(
+                .prepare_source(
+                    &honk_outbound::proxy::ProxyRegistry::new(),
                     Arc::clone(&generation),
                     Arc::clone(&runtime),
                     client,
-                    path,
+                    SourcePath::Vless(path),
                     None,
                     target,
                     None,
@@ -62,6 +64,7 @@ async fn different_sources_share_only_aggregated_carriers() {
                     Arc::clone(&alive),
                     Arc::clone(&stats),
                     honk_outbound::alive::IpVersion::V4,
+                    false,
                 )
                 .await
                 .unwrap()
@@ -98,7 +101,7 @@ async fn different_sources_share_only_aggregated_carriers() {
         assert_eq!(keep.status, STATUS_KEEP);
         assert_eq!(keep.payload.as_deref(), Some(b"survivor".as_slice()));
         endpoints.clear();
-        assert!(pool.shutdown().await);
+        assert!(pool.shutdown().await.joined);
         generation.shutdown().await;
         wire_task.abort();
         let _ = wire_task.await;
@@ -133,11 +136,12 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
     for original in originals {
         let mut lease = reserve_source(&pool, &stats, client_addr, original, node.id);
         let attachment = pool
-            .prepare_vless_source(
+            .prepare_source(
+                &honk_outbound::proxy::ProxyRegistry::new(),
                 Arc::clone(&generation),
                 Arc::clone(&runtime),
                 client_addr,
-                VlessUdpPath::Xudp,
+                SourcePath::Vless(VlessUdpPath::Xudp),
                 Some(original),
                 remote,
                 None,
@@ -145,6 +149,7 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
                 Arc::clone(&alive),
                 Arc::clone(&stats),
                 honk_outbound::alive::IpVersion::V4,
+                false,
             )
             .await
             .unwrap()
@@ -156,7 +161,7 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
             remote,
             None,
             Arc::new(pool.create_reply_socket(original).unwrap()),
-            stats.outbound_tracker("core-source-vless"),
+            stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
             node.id,
             honk_outbound::alive::IpVersion::V4,
             None,
@@ -177,7 +182,7 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
         assert_eq!(receive_reply(&client).await, (b"reply".to_vec(), original));
     }
     endpoints.clear();
-    assert!(pool.shutdown().await);
+    assert!(pool.shutdown().await.joined);
     generation.shutdown().await;
     wire_task.abort();
     let _ = wire_task.await;

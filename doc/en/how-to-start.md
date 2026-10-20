@@ -40,11 +40,13 @@ CONFIG_BPF=y
 CONFIG_BPF_SYSCALL=y
 CONFIG_BPF_JIT=y
 CONFIG_CGROUP_BPF=y
-CONFIG_NET_CLS_BPF=y|m
-CONFIG_NET_SCH_INGRESS=y|m
+CONFIG_NET_SCHED=y
 CONFIG_NET_CLS_ACT=y
+CONFIG_NET_XGRESS=y
 CONFIG_NET_NS=y
 ```
+
+The TCX backend needs `CONFIG_NET_XGRESS`, a hidden option selected by `CONFIG_NET_CLS_ACT`, not legacy `CONFIG_NET_CLS_BPF` or `CONFIG_NET_SCH_INGRESS`. See [hook and qdisc ownership](./design/datapath.md#interface-hook-sets).
 
 Held-first-packet UDP, which is enabled by default, additionally requires:
 
@@ -56,7 +58,15 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
-`pname(...)` routing requires cgroup v2. Without cgroup v2, the remaining features can still start, but process-name routing is disabled.
+cgroup v2 with `CONFIG_CGROUP_BPF` is required. The real datapath attaches socket-identity hooks and the TCP `sock_ops` program `honk_tcp_passive` to the root cgroup and refuses to start without them. A legacy (flags=0) program already holding the root cgroup's `sock_ops` slot, for example one attached with `bpftool cgroup attach`, also makes startup fail. `honk_tcp_passive` is entered for every TCP `sock_ops` callback on the host, a few per connection, and returns at once unless the socket belongs to honk's namespace. TCP ownership proof needs no in-kernel BTF, no ftrace and no built-in IPv6, so a kernel that only has an external raw BTF file can run it. Startup always loads raw BTF (the eBPF loader's target BTF, plus the process-name and receive-trace offsets), from `/sys/kernel/btf/vmlinux` or the file named by `HONK_VMLINUX_BTF`.
+
+Only the optional `native-api` UDP receive-trace fallback, used when UDP receive-priority ancillary metadata is unavailable, attaches fentry/fexit programs. It needs the in-kernel BTF (`HONK_VMLINUX_BTF` does not substitute) and ftrace, and degrades without them:
+
+```text
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_FUNCTION_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y
+```
 
 ### bpffs
 

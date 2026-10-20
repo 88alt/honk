@@ -29,11 +29,16 @@ pub(in crate::control) fn report_dial_failure_if_current(
     alive_set.notify_check_tcp(node_id);
 }
 
-mod handoff;
+pub(in crate::control) mod handoff;
+#[cfg(test)]
+pub(super) use handoff::TcpFlowKey;
+pub(super) use handoff::TcpFlowPins;
 pub(crate) use handoff::build_tuples_key;
-pub(super) use handoff::{TcpFlowKey, TcpFlowPins};
 
 mod context;
+
+#[cfg_attr(not(feature = "native-api"), path = "observation/inert.rs")]
+pub(in crate::control) mod observation;
 
 pub(super) use context::{ConnectionGuard, ControlPlaneHandle};
 

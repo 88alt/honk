@@ -5,7 +5,6 @@ use super::diagnostics::ParserDiagnostics;
 use super::read::{self, Text};
 use crate::config::GlobalConfig;
 use crate::diagnostic::{SettingPath, SettingSegment, Severity};
-use crate::experimental::ExperimentalConfig;
 
 const LEGACY_LIST_MESSAGE: &str =
     "list quoting is deprecated; quote list items individually or use bare items";
@@ -15,7 +14,7 @@ fn scalar_path(setting: &'static str) -> SettingPath {
     SettingPath(setting.split('.').map(SettingSegment::Field).collect())
 }
 
-fn strict_bool(value: &str) -> Option<bool> {
+pub(super) fn strict_bool(value: &str) -> Option<bool> {
     if ["true", "yes", "1", "on"]
         .iter()
         .any(|spelling| value.eq_ignore_ascii_case(spelling))
@@ -31,7 +30,7 @@ fn strict_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn scalar_warning(
+pub(super) fn scalar_warning(
     text: Text<'_, '_>,
     diagnostics: &mut ParserDiagnostics<'_>,
     setting: &'static str,
@@ -47,7 +46,7 @@ fn scalar_warning(
     diagnostics.emit(diagnostic);
 }
 
-fn scalar_error(
+pub(super) fn scalar_error(
     text: Text<'_, '_>,
     code: &'static str,
     setting: &'static str,
@@ -67,7 +66,7 @@ fn scalar_error(
     error
 }
 
-const GLOBAL_KEYS: &[&str] = &[
+pub(super) const GLOBAL_KEYS: &[&str] = &[
     "tproxy_port",
     "tproxy_port_protect",
     "pprof_port",
@@ -174,13 +173,48 @@ pub(super) fn bool_value(
     parsed
 }
 
-fn list_value(
-    value: Text<'_, '_>,
+#[derive(Clone, Copy)]
+pub(super) struct ListOptions {
     aggregate_compat: bool,
     legacy_unquote_items: bool,
     filter_empty: bool,
+    legacy_notice: bool,
+}
+
+impl ListOptions {
+    const INTERFACES: Self = Self {
+        aggregate_compat: false,
+        legacy_unquote_items: false,
+        filter_empty: true,
+        legacy_notice: true,
+    };
+    const CHECK_TARGETS: Self = Self {
+        aggregate_compat: true,
+        legacy_unquote_items: true,
+        filter_empty: false,
+        legacy_notice: true,
+    };
+    /// A setting that never existed before the item-wise parser: there is no legacy
+    /// reading to compare against, so quoting differences are not migration notices.
+    pub(super) const NEW: Self = Self {
+        aggregate_compat: false,
+        legacy_unquote_items: false,
+        filter_empty: false,
+        legacy_notice: false,
+    };
+}
+
+pub(super) fn list_value(
+    value: Text<'_, '_>,
+    options: ListOptions,
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Vec<String> {
+    let ListOptions {
+        aggregate_compat,
+        legacy_unquote_items,
+        filter_empty,
+        legacy_notice,
+    } = options;
     let trimmed = value.trim();
     let whole_quoted = trimmed
         .quoted_prefix()
@@ -209,7 +243,7 @@ fn list_value(
             }
         })
         .filter(|item| !filter_empty || !item.is_empty());
-    if aggregate || !parsed.iter().map(String::as_str).eq(legacy) {
+    if aggregate || (legacy_notice && !parsed.iter().map(String::as_str).eq(legacy)) {
         trimmed.notice(
             diagnostics,
             Severity::Warning,
@@ -299,10 +333,10 @@ pub(super) fn parse_global_section(
         );
     }
     if let Some(value) = settings.get("lan_interface") {
-        cfg.lan_interface = list_value(*value, false, false, true, diagnostics);
+        cfg.lan_interface = list_value(*value, ListOptions::INTERFACES, diagnostics);
     }
     if let Some(value) = settings.get("wan_interface") {
-        cfg.wan_interface = list_value(*value, false, false, true, diagnostics);
+        cfg.wan_interface = list_value(*value, ListOptions::INTERFACES, diagnostics);
     }
     if settings.contains_key("auto_config_kernel_parameter") {
         cfg.auto_config_kernel_parameter = bool_value(
@@ -324,7 +358,7 @@ pub(super) fn parse_global_section(
         );
     }
     if let Some(value) = settings.get("tcp_check_url") {
-        cfg.tcp_check_url = list_value(*value, true, true, false, diagnostics);
+        cfg.tcp_check_url = list_value(*value, ListOptions::CHECK_TARGETS, diagnostics);
     }
     if let Some(value) = settings
         .get("tcp_check_http_method")
@@ -333,7 +367,7 @@ pub(super) fn parse_global_section(
         cfg.tcp_check_http_method = value.to_owned();
     }
     if let Some(value) = settings.get("udp_check_dns") {
-        cfg.udp_check_dns = list_value(*value, true, true, false, diagnostics);
+        cfg.udp_check_dns = list_value(*value, ListOptions::CHECK_TARGETS, diagnostics);
     }
     if let Some(text) = settings.get("check_interval") {
         let value = text.unquote().raw();
@@ -529,221 +563,4 @@ pub(super) fn nfqueue_present(section: &[Segment<'_, '_>]) -> bool {
         }
         false
     })
-}
-
-pub(super) fn parse_experimental_section(
-    section: &[Segment<'_, '_>],
-    diagnostics: &mut ParserDiagnostics<'_>,
-) -> Result<ExperimentalConfig, super::ParseFailure> {
-    let mut config = ExperimentalConfig::default();
-    let mut api_location = None;
-    for root in section {
-        let Some(body) = root.body() else {
-            continue;
-        };
-        for segment in body {
-            diagnostics.at_text(Text::segment(&segment));
-            let Some(header) = read::block_header(&segment) else {
-                return Err(scalar_error(
-                    Text::segment(&segment),
-                    "unknown-experimental-setting",
-                    "experimental",
-                    "unknown experimental setting",
-                )
-                .into());
-            };
-            let name = header.raw();
-            let mut values = HashMap::new();
-            let known_keys = match name {
-                "clash_api" => &[
-                    "external_controller",
-                    "external_ui",
-                    "external_ui_download_url",
-                    "external_ui_download_detour",
-                    "secret",
-                    "default_mode",
-                ][..],
-                "cache_file" => &["enabled", "path", "cache_id", "store_fakeip", "store_dns"][..],
-                "udp_nfqueue" => &["enabled"][..],
-                _ => {
-                    return Err(scalar_error(
-                        header,
-                        "unknown-experimental-setting",
-                        "experimental",
-                        "unknown experimental setting",
-                    )
-                    .into());
-                }
-            };
-            let lines = if name == "udp_nfqueue" {
-                let mut lines = Vec::new();
-                if let Some(body) = segment.body() {
-                    for child in body {
-                        let text = Text::segment(&child);
-                        diagnostics.at_text(text);
-                        if read::block_header(&child).is_some() {
-                            return Err(scalar_error(
-                                text,
-                                "unknown-nfqueue-setting",
-                                "experimental.udp_nfqueue",
-                                "unknown NFQUEUE setting; only enabled is supported",
-                            )
-                            .into());
-                        }
-                        lines.push(text);
-                    }
-                }
-                lines
-            } else {
-                read::child_statements(&segment, diagnostics, super::cursor::BodySyntax::Statements)
-            };
-            for line in lines {
-                diagnostics.at_text(line);
-                let Some((key, value)) = line.kv() else {
-                    if name == "udp_nfqueue" {
-                        return Err(scalar_error(
-                            line,
-                            "unknown-nfqueue-setting",
-                            "experimental.udp_nfqueue",
-                            "unknown NFQUEUE setting; only enabled is supported",
-                        )
-                        .into());
-                    }
-                    line.notice(
-                        diagnostics,
-                        Severity::Warning,
-                        "unknown-statement",
-                        "unknown scalar statement ignored",
-                    );
-                    continue;
-                };
-                if !known_keys.contains(&key.raw()) {
-                    if name == "udp_nfqueue" {
-                        return Err(scalar_error(
-                            line,
-                            "unknown-nfqueue-setting",
-                            "experimental.udp_nfqueue",
-                            "unknown NFQUEUE setting; only enabled is supported",
-                        )
-                        .into());
-                    }
-                    key.notice(
-                        diagnostics,
-                        Severity::Warning,
-                        "unknown-key",
-                        "unknown scalar key ignored",
-                    );
-                    continue;
-                }
-                diagnostics.register_field(key.raw(), value);
-                if name == "clash_api" && key.raw() == "external_controller" {
-                    api_location = Some(diagnostics.field_location("external_controller"));
-                }
-                value.warn_glued_hash(diagnostics);
-                values.insert(key.raw(), value);
-            }
-            match name {
-                "clash_api" => {
-                    if let Some(value) = values
-                        .get("external_controller")
-                        .map(|text| text.unquote().raw())
-                    {
-                        config.clash_api.external_controller = value.to_owned();
-                    }
-                    if let Some(value) = values.get("external_ui").map(|text| text.unquote().raw())
-                    {
-                        config.clash_api.external_ui = value.to_owned();
-                    }
-                    if let Some(value) = values
-                        .get("external_ui_download_url")
-                        .map(|text| text.unquote().raw())
-                    {
-                        config.clash_api.external_ui_download_url = value.to_owned();
-                    }
-                    if let Some(value) = values
-                        .get("external_ui_download_detour")
-                        .map(|text| text.unquote().raw())
-                    {
-                        config.clash_api.external_ui_download_detour = value.to_owned();
-                    }
-                    if let Some(value) = values.get("secret").map(|text| text.unquote().raw()) {
-                        config.clash_api.secret = value.to_owned();
-                    }
-                    if let Some(value) = values.get("default_mode").map(|text| text.unquote().raw())
-                    {
-                        config.clash_api.default_mode = value.to_owned();
-                    }
-                }
-                "cache_file" => {
-                    if values.contains_key("enabled") {
-                        config.cache_file.enabled = bool_value(
-                            &values,
-                            "enabled",
-                            "experimental.cache_file.enabled",
-                            diagnostics,
-                        );
-                    }
-                    if let Some(value) = values.get("path").map(|text| text.unquote().raw()) {
-                        config.cache_file.path = value.to_owned();
-                    }
-                    if let Some(value) = values.get("cache_id").map(|text| text.unquote().raw()) {
-                        config.cache_file.cache_id = value.to_owned();
-                    }
-                    if values.contains_key("store_fakeip") {
-                        config.cache_file.store_fakeip = bool_value(
-                            &values,
-                            "store_fakeip",
-                            "experimental.cache_file.store_fakeip",
-                            diagnostics,
-                        );
-                    }
-                    if values.contains_key("store_dns") {
-                        config.cache_file.store_dns = bool_value(
-                            &values,
-                            "store_dns",
-                            "experimental.cache_file.store_dns",
-                            diagnostics,
-                        );
-                    }
-                }
-                "udp_nfqueue" => {
-                    let enabled = values
-                        .get("enabled")
-                        .map(|text| {
-                            strict_bool(text.unquote().raw()).ok_or_else(|| {
-                                scalar_error(
-                                    *text,
-                                    "invalid-config-value",
-                                    "experimental.udp_nfqueue",
-                                    "expected true/false, yes/no, 1/0 or on/off",
-                                )
-                            })
-                        })
-                        .transpose()?;
-                    config.legacy_udp_nfqueue = Some(crate::experimental::LegacyUdpNfqueueConfig {
-                        enabled: enabled.unwrap_or(false),
-                    });
-                    diagnostics.emit(crate::diagnostic::legacy_nfqueue_warning(
-                        diagnostics.source(),
-                    ));
-                }
-                _ => {
-                    return Err(scalar_error(
-                        header,
-                        "unknown-experimental-setting",
-                        "experimental",
-                        "unknown experimental setting",
-                    )
-                    .into());
-                }
-            }
-        }
-    }
-    if let Some((source, line)) = api_location
-        && let Some(mut diagnostic) = config.clash_api.exposure_diagnostic(source)
-    {
-        diagnostic.line = line;
-        diagnostics.output.push(diagnostic);
-    }
-    Ok(config)
 }

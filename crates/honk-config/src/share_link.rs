@@ -81,7 +81,16 @@ impl Node {
         source: &crate::diagnostic::SourceRef,
         emit: &mut impl FnMut(crate::diagnostic::DetailedDiagnostic),
     ) -> Result<Node, crate::error::DetailedConfigError> {
-        let mut node = Self::decode_share_link(link, source, emit)?;
+        // A node entry that parses only ever warns with `legacy-*` codes, so native
+        // clients read any other warning on the entry as the entry being dropped.
+        let mut node = Self::decode_share_link(link, source, &mut |diagnostic| {
+            debug_assert!(
+                diagnostic.code.starts_with("legacy-"),
+                "share-link warning {} must use a legacy-* code",
+                diagnostic.code
+            );
+            emit(diagnostic);
+        })?;
         node.normalize_stream_transport().map_err(|message| {
             DetailedConfigError::new(
                 ErrorCategory::Validation,
@@ -187,8 +196,8 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
                 ErrorCategory::UnknownProtocol,
                 "unknown-protocol",
                 source.clone(),
-                SettingPath::new("config"),
-                "unknown node protocol",
+                SettingPath::new("config").field("protocol"),
+                "unknown node protocol; expected socks5, socks4, socks4a, ss, trojan, anytls, vmess, vless, hysteria2, hysteria, hy2, tuic or juicity",
             ));
         }
     };

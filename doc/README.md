@@ -42,6 +42,7 @@ Field-by-field configuration and API reference. / 逐字段的配置与 API 参�
 | `routing { }` | [en/reference/routing.md](./en/reference/routing.md) | [zh/reference/routing.md](./zh/reference/routing.md) |
 | `dns { }` | [en/reference/dns.md](./en/reference/dns.md) | [zh/reference/dns.md](./zh/reference/dns.md) |
 | `subscription { }` | [en/reference/subscription.md](./en/reference/subscription.md) | [zh/reference/subscription.md](./zh/reference/subscription.md) |
+| `assets { }` | [en/reference/assets.md](./en/reference/assets.md) | [zh/reference/assets.md](./zh/reference/assets.md) |
 | `experimental { }` | [en/reference/experimental.md](./en/reference/experimental.md) | [zh/reference/experimental.md](./zh/reference/experimental.md) |
 | Clash API + `/stats` | [en/reference/api.md](./en/reference/api.md) | [zh/reference/api.md](./zh/reference/api.md) |
 | CLI (`honk-core` + `honk-tool`) | [en/reference/cli.md](./en/reference/cli.md) | [zh/reference/cli.md](./zh/reference/cli.md) |
@@ -51,6 +52,7 @@ Field-by-field configuration and API reference. / 逐字段的配置与 API 参�
 | Document | English | 中文 |
 | ---------- | --------- | ------ |
 | DNS canary and rollback runbook | [en/operations/dns-rollout.md](./en/operations/dns-rollout.md) | [zh/operations/dns-rollout.md](./zh/operations/dns-rollout.md) |
+| Long connections and keepalive / 长连接与保活 | [en/operations/long-connections.md](./en/operations/long-connections.md) | [zh/operations/long-connections.md](./zh/operations/long-connections.md) |
 
 ---
 

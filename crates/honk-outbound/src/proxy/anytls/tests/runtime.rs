@@ -70,6 +70,141 @@ async fn ephemeral_guard_releases_session_when_probe_is_aborted() {
     .expect("the connection must close on abort");
 }
 
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_ephemeral_close_joins_drivers_after_closed_session_was_pruned() {
+    use futures_util::FutureExt as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let mut guard =
+        crate::runtime::NodeRuntime::try_ephemeral_guarded(&anytls_node("native-joined")).unwrap();
+    let runtime = guard.runtime();
+    let (session, mut server) = runtime
+        .scope_tasks(async { Ok(establish_test_session("native-joined").await) })
+        .await
+        .unwrap();
+    expect_handshake(&mut server).await;
+    let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
+        panic!("expected AnyTLS runtime")
+    };
+    anytls.pool.insert(&session);
+    session.close();
+    assert_eq!(anytls.pool.live_session_count(), 0);
+    guard.close().await.unwrap();
+    assert!(matches!(
+        server.read(&mut [0; 1]).now_or_never(),
+        Some(Ok(0))
+    ));
+}
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_ephemeral_close_joins_cancelled_pool_factory_before_releasing_capacity() {
+    use futures_util::FutureExt as _;
+
+    let mut guard =
+        crate::runtime::NodeRuntime::try_ephemeral_guarded(&anytls_node("native-factory")).unwrap();
+    let runtime = guard.runtime();
+    let crate::runtime::ProtocolRuntime::AnyTls(anytls) = &runtime.runtime else {
+        panic!("expected AnyTLS runtime")
+    };
+    let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = Arc::clone(&capacity).acquire_owned().await.unwrap();
+    let mut offer = Box::pin(runtime.scope_tasks(anytls.pool.offer(move || async move {
+        let _permit = permit;
+        std::future::pending::<anyhow::Result<Arc<AnyTlsSession>>>().await
+    })));
+    assert!(offer.as_mut().now_or_never().is_none());
+    drop(offer);
+    guard.close().await.unwrap();
+    assert_eq!(capacity.available_permits(), 1);
+    assert!(!anytls.pool.has_usable_session());
+}
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_production_factory_and_drivers_travel_with_reused_runtime() {
+    use futures_util::FutureExt as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let node = zero_idle_anytls_node("owned-production");
+    let first = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )
+    .unwrap()
+    .0;
+    let runtime = first.get(&node.id).unwrap();
+    let pool = runtime.anytls_pool().unwrap();
+    AnyTlsHandler::ensure_janitor(&node, &pool, Some(Arc::clone(&runtime)));
+    let (wire_tx, wire_rx) = tokio::sync::oneshot::channel();
+    let session = pool
+        .offer(move || async move {
+            let (session, server) = establish_test_session("owned-production").await;
+            wire_tx.send(server).unwrap();
+            Ok(session)
+        })
+        .await
+        .unwrap();
+    let mut server = wire_rx.await.unwrap();
+    expect_handshake(&mut server).await;
+    let (successor, reused) = crate::runtime::OutboundRuntimeRegistry::build_reusing(
+        std::slice::from_ref(&node),
+        1,
+        Some(&first),
+    )
+    .unwrap();
+    first.mark_moved_out(reused);
+    first.shutdown().await;
+    assert!(!session.is_closed());
+    assert!(session.try_reserve().is_some());
+    successor.shutdown().await;
+    assert!(session.is_closed());
+    assert!(matches!(
+        server.read(&mut [0; 1]).now_or_never(),
+        Some(Ok(0))
+    ));
+}
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn native_production_close_joins_factory_cancelled_before_first_poll() {
+    use futures_util::FutureExt as _;
+
+    let node = zero_idle_anytls_node("unpolled-production");
+    let generation = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+        std::slice::from_ref(&node),
+        1,
+        1,
+        1,
+        true,
+        None,
+    )
+    .unwrap()
+    .0;
+    let runtime = generation.get(&node.id).unwrap();
+    let pool = runtime.anytls_pool().unwrap();
+    let capacity = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = Arc::clone(&capacity).acquire_owned().await.unwrap();
+    let mut offer = Box::pin(pool.offer(move || async move {
+        let _permit = permit;
+        std::future::pending::<anyhow::Result<Arc<AnyTlsSession>>>().await
+    }));
+    assert!(offer.as_mut().now_or_never().is_none());
+    drop(offer);
+    generation.shutdown().await;
+    assert_eq!(capacity.available_permits(), 1);
+    assert!(
+        pool.offer(|| async { panic!("closed pool must not invoke factory") })
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn ephemeral_runtime_close_releases_session_and_connection() {
     let node = anytls_node("ephemeral-probe");
@@ -558,4 +693,176 @@ async fn speculative_udp_generation_shutdown_cancels_injected_dial() {
     assert!(result.is_err());
     assert!(cancelled.load(Ordering::Acquire));
     assert_eq!(pool.metrics().sessions, 0);
+}
+
+/// The shared-source entry joins the node's own pool: ordinary and
+/// speculative preparations both commit into one UoT stream that carries
+/// several destinations, and Drop unregisters the stream.
+#[tokio::test]
+async fn shared_source_preparation_uses_pool_session_and_carries_many_destinations() {
+    let registry = crate::proxy::ProxyRegistry::default_resolver().unwrap();
+    let node = anytls_node("shared-source");
+    let generation = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+    );
+    let runtime = generation.get(&node.id).unwrap();
+    let pool = runtime.anytls_pool().unwrap();
+    let (session, mut server) = establish_test_session("shared-source").await;
+    expect_handshake(&mut server).await;
+    pool.insert(&session);
+    let a: SocketAddr = "198.51.100.10:5301".parse().unwrap();
+    let b: SocketAddr = "203.0.113.20:5302".parse().unwrap();
+
+    for speculative in [false, true] {
+        let prepared = registry
+            .prepare_shared_source(
+                Arc::clone(&runtime),
+                a,
+                None,
+                Duration::from_secs(1),
+                speculative,
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.streams.lock().unwrap().len(), 1);
+        let transport = prepared.commit().await.unwrap();
+        assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+        let (cmd, sid, _) = read_frame(&mut server).await.unwrap();
+        assert_eq!(cmd, CMD_PSH);
+
+        transport
+            .send_to(a, None, b"to-a", true, None)
+            .await
+            .unwrap();
+        let (_, first_sid, first) = read_frame(&mut server).await.unwrap();
+        transport
+            .send_to(b, None, b"to-b", false, None)
+            .await
+            .unwrap();
+        let (_, second_sid, second) = read_frame(&mut server).await.unwrap();
+        assert_eq!((first_sid, second_sid), (sid, sid));
+        assert_eq!(
+            first,
+            [
+                &[0x00, 0x01, 198, 51, 100, 10, 0x14, 0xb5][..],
+                &[0x00, 198, 51, 100, 10, 0x14, 0xb5, 0x00, 0x04],
+                b"to-a",
+            ]
+            .concat()
+        );
+        assert_eq!(
+            second,
+            [
+                &[0x00, 203, 0, 113, 20, 0x14, 0xb6, 0x00, 0x04][..],
+                b"to-b"
+            ]
+            .concat()
+        );
+
+        drop(transport);
+        assert!(session.streams.lock().unwrap().is_empty());
+        assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_FIN);
+        assert!(!session.is_closed());
+    }
+    generation.shutdown().await;
+}
+
+/// A losing speculative source preparation releases its stream
+/// synchronously, like the ordinary UDP preparation.
+#[tokio::test]
+async fn shared_source_speculative_loser_unregisters_sid_synchronously() {
+    let node = anytls_node("shared-source-loser");
+    let generation = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+    );
+    let runtime = generation.get(&node.id).unwrap();
+    let (session, _server) = establish_test_session("shared-source-loser").await;
+    runtime.anytls_pool().unwrap().insert(&session);
+
+    let prepared = AnyTlsHandler::prepare_udp_source(
+        runtime,
+        "8.8.8.8:53".parse().unwrap(),
+        None,
+        Duration::from_secs(1),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(session.streams.lock().unwrap().len(), 1);
+    drop(prepared);
+    assert!(session.streams.lock().unwrap().is_empty());
+    assert!(!session.is_closed());
+    generation.shutdown().await;
+}
+
+/// The opener's flow must not be credited with other flows' first flush:
+/// each confirmed source send reports in its own context.
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn shared_source_confirmed_send_reports_in_caller_context_only() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let observe = || {
+        let events = Arc::clone(&events);
+        FlowObserver::new(
+            FlowContext {
+                flow_id: uuid::Uuid::new_v4(),
+                generation: 1,
+                attempt_id: None,
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            Arc::new(move |context, event| {
+                if let FlowEvent::Milestone { milestone } = event {
+                    events.lock().push((context.flow_id, milestone.as_str()));
+                }
+            }),
+        )
+    };
+    let (opener, sender) = (observe(), observe());
+    let node = anytls_node("shared-source-evidence");
+    let generation = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap(),
+    );
+    let runtime = generation.get(&node.id).unwrap();
+    let (session, mut server) = establish_test_session("shared-source-evidence").await;
+    expect_handshake(&mut server).await;
+    runtime.anytls_pool().unwrap().insert(&session);
+
+    let transport = opener
+        .scope(AnyTlsHandler::prepare_udp_source(
+            runtime,
+            "8.8.8.8:53".parse().unwrap(),
+            None,
+            Duration::from_secs(1),
+            false,
+        ))
+        .await
+        .unwrap()
+        .commit()
+        .await
+        .unwrap();
+    let (sent, _) = tokio::join!(
+        sender.scope(transport.send_to("8.8.8.8:53".parse().unwrap(), None, b"q", true, None)),
+        async {
+            for _ in 0..3 {
+                read_frame(&mut server).await.unwrap();
+            }
+        },
+    );
+    sent.unwrap();
+
+    {
+        let events = events.lock();
+        let of = |flow: &crate::runtime::flow_observation::FlowObserver| {
+            events
+                .iter()
+                .filter_map(|(id, event)| (*id == flow.context().flow_id).then_some(*event))
+                .collect::<Vec<_>>()
+        };
+        assert!(of(&opener).is_empty());
+        assert_eq!(of(&sender), ["target_request_sent"]);
+    }
+    drop(transport);
+    generation.shutdown().await;
 }

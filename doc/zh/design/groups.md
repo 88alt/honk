@@ -12,7 +12,9 @@ honk 将组解析为叶子出站，跟踪其健康状态，并限制预热资源
 
 `SharedGroupManager = Arc<parking_lot::RwLock<Arc<GroupManager>>>`
 
-重载会构建完整的替代 `GroupManager`，通过 `migrate_selector_choices_from` 迁移组和成员 tag 仍然存在的 Selector 选择，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。因此读取方只会看到旧管理器或新管理器，不会看到尚未构建完成的组图。
+普通重载构建完整的替代 `GroupManager`，通过 `migrate_selector_choices_from` 分别迁移 TCP/UDP Selector 中仍存在的成员身份，在发布前安装连接中断、预热和持久化回调，再切换内部 `Arc`。已删除节点的选择不会转向同名替代节点。原生与 Clash API 的选择写入和管理器替换由同一 control/reload 所有者串行处理，不能确认对已被替换的管理器的写入。因此读取方只会看到完整的旧管理器或新管理器。
+
+共用重载规范化由 `control/reload/fingerprint.rs` 按同名保留配置组 UUID 与 `created_at`，不受插入、删除或重排影响。改名视为新组，不继承旧身份；程序化改名若仍携带旧 UUID，也会重新生成 UUID。SIGHUP、显式激活及 provider/runtime reload（含 no-op 比较）都遵循此规则，不依赖原生观测是否启用。
 
 `src/group/` 对外接口与内部实现按职责拆分：
 
@@ -36,11 +38,17 @@ UDP 选择首先排除规范协议／配置不支持 UDP 的转发叶节点，�
 
 | 策略 | 运行时行为 |
 | --- | --- |
-| Selector | TCP 与 UDP 都不依赖健康状态，依次解析运行时选择、`group.default` 和声明顺序中的第一个成员；只有缺失或不再属于该组的 tag 才继续向后查找。该成员没有合格候选时，仅执行该组显式 `final` 或上述同一叶节点的 TCP 最后尝试；两者都不可用时计划为空。GroupManager 在每级嵌套中解析 final。Clash API 修改运行时选择。`PersistCallback` 把有效写入经 honk-core 的 `cachedb` 持久化到 `cache.db`；启用 `interrupt_connections` 时，`InterruptCallback` 只移除跟踪记录，不会取消正在运行的转发任务。配置诊断会对此限制发出警告。 |
+| Selector | TCP/UDP 各自维护选择，都在健康过滤前依次解析对应网络运行时选择、`group.default` 和第一个成员；仅缺失或非成员 tag 才向后查找。无合格叶时仅执行显式 `final` 或同叶 TCP 最后尝试。原生 API 可写 tcp/udp/both，Clash 写 both、读 TCP 投影；both 一次校验并原子发布。有效选择按网络持久化；启用 `interrupt_connections` 时关闭捕获了该组路径的旧 transport owner，而非只删除 tracker。 |
 | URLTest | 选择最小减半递推移动平均，分别保存 TCP 与 UDP 选择，应用 tolerance 滞后，并在拨号和选择查询时惰性重算。真实选择变化可以调用 `InterruptCallback`。 |
 | LoadBalance | 按声明顺序轮询合格成员。每个组分别为 TCP 和 UDP 持有独立 `AtomicUsize` 游标。轮转从不调用 `InterruptCallback`。 |
 | Fallback | 分别为 TCP 和 UDP 固定声明顺序中的第一个合格成员。该成员死亡前保持固定；更靠前的成员恢复不会触发 failback。 |
 | Score | 以 `policy: score` 显式选择后，根据实际可靠性、新鲜目标质量和有界验证选择一个健康合格叶节点；历史样本数量不是性能加分。省略策略仍默认 Selector。 |
+
+组中断根据连接建立时捕获的已选组身份/路径和网络选择精确 TCP/UDP owner，不按当前组成员或叶名称重建匹配，也不依赖 flow recorder 是否启用。显式选择在发布前捕获旧集合，回调在同步 guard 外运行，再等待选择发生变化的网络确认关闭；相同选择不重拨。TCP 绑定 UUID/cancel/completion，UDP 绑定 token/generation/source view 并确认 backend 与 driver 退役。共享 XUDP 不关闭其他 view 的 carrier，也不重放数据。选择已发布但关闭确认失败时可返回错误，不表示回滚。
+
+同一已捕获 owner 的并发 close 共用实际完成结果，退役失败也由所有等待者继承；不会仅因已处于 Closing 或 Failed 而报告 `Gone`。不存在或已被替换的 owner 仍是 `Gone`。自动中断回调只发起退役，需要确认的调用者等待该 owner 的 completion。
+
+组配置与运行时选择分离。受限原生 JSON Patch 通过解析器记录的来源位置和既有协调器写入 `.dae`，完整校验后执行实际重载。已接受的配置 revision 与磁盘文件 SHA-256 分别校验，激活前还会再次检查 revision。配置的 `icon` 展示为通过校验的 HTTP(S) URL 或 data URI，其中至少 8 字节长的监听凭据值会被遮蔽；不推测或下载图标。自动策略的固定成员只存在于当前 GroupManager，配置激活后即失效。节点和 provider 的创建、删除另经主文件源事务，修改已有条目仍用源 PUT，见[API 参考](../reference/api.md#主文件条目与-geodata-管理)。
 
 ### Score 评分与生命周期
 
@@ -70,7 +78,7 @@ Carrier 来源由实际拥有代理连接的边界标记，不能从通用 QUIC 
 
 Score 权限切换前捕获的普通待开始尝试，只有不持有可选 token 时，才可继续转发但不评分。Guard 保留原始业务身份，不发布当前证据或额度。失效的可选工作仍被拒绝，不能降级为免费的挑战者拨号。物理 runtime 准入、路由和类型化拒绝语义保持不变。
 
-TCP relay 在 copy 和 splice 路径中区分客户端断开与上游失败。客户端侧的 reset、abort、broken pipe、未连接 socket、异常 EOF 或 socket 超时，对 Score 按中性取消结算，不撤回已接受的 RX，也不清除既有失败／退避；relay 仍返回原始 I/O 错误，连接错误统计保持不变。同类上游错误、协议错误及未明确归因的本地失败保留既有失败处理。日志级别较低本身不代表错误中性。
+TCP relay 在 copy 和 splice 路径中区分客户端断开与上游失败。客户端侧的 reset、abort、broken pipe、未连接 socket、异常 EOF、socket 超时或主机／网络不可达错误，对 Score 按中性取消结算，不撤回已接受的 RX，也不清除既有失败／退避；relay 仍返回原始 I/O 错误，连接错误统计保持不变。同类上游错误、协议错误及未明确归因的本地失败保留既有失败处理。日志级别较低本身不代表错误中性。
 
 业务 RX 上报独立于吞吐窗口：首次合格非零 RX 立即发布，随后每个 reporter 每秒至多一次。普通单向 TX 回调不补发被限频的接收事件，也没有定时器把静默变成进展。共享源首次确认成功的非零发送可补认其串行发送开始后已交付的回包，使用实际 RX 时间而非确认时间；排队、失败或已退役的发送不能授予证据。限频中的失败后 RX 仍可能等待下一次可发布 RX 或终态，不保证一个自然秒内恢复。活跃发布更新可用性及作用域内恢复门槛，不增加 Beta 终态。
 
@@ -90,7 +98,7 @@ Traffic reporter 覆盖透明 TCP/UDP、受支持的 DNS exchange 和 UI 下载�
 
 Reload 后，已开始的试用仍结算历史结果与成本计数。只有 `(group, node)` 仍是当前配置成员时，其结果才影响当前试用收益；已移除成员不能暂停或加速替补成员的额度赚取。保留成员仍可跨 authority 变化贡献结果。
 
-预留只在节点专属工作开始时支出；释放最后一个未开始引用或使未开始预留失效会退款，开始后取消不退款。Reload 保留已开始工作的在途记录，直到结算或既有到期边界。UI 重定向、DNS 重试和 TCP 替代尝试保留原始业务身份，不能产生试用额度或把已有试用重标为免费恢复。可选工作只有一条路径：已授权的定向 rank 按派发顺序遍历已评估挑战者，为账本首个接受的成员预留一份额度；预算拒绝结束遍历，在途拒绝则尝试下一个成员。每个成员针对其未决问题在同一目标上至多有一个尚未得到回答的试用，资格问题跨目标计算。缺少流量时仍无结论。真实失败保留 5 分钟至 6 小时退避，除非真正的作用域内 RX 打开恢复；试用不取得已提交现任保护。
+预留只在节点专属工作开始时支出；释放最后一个未开始引用或使未开始预留失效会退款，开始后取消不退款。Reload 保留已开始工作的在途记录，直到结算或既有到期边界。UI 与订阅重定向、DNS 重试和 TCP 替代尝试保留原始业务身份，不能产生试用额度或把已有试用重标为免费恢复。可选工作只有一条路径：已授权的定向 rank 按派发顺序遍历已评估挑战者，为账本首个接受的成员预留一份额度；预算拒绝结束遍历，在途拒绝则尝试下一个成员。每个成员针对其未决问题在同一目标上至多有一个尚未得到回答的试用，资格问题跨目标计算。缺少流量时仍无结论。真实失败保留 5 分钟至 6 小时退避，除非真正的作用域内 RX 打开恢复；试用不取得已提交现任保护。
 
 成员的未决问题依次为：连败后的恢复；缺少近期可用性时的可用性；普通选择能比较该成员、但所选成员与它的原始比较对缺少本作用域（精确目标，聚合读取时为共同目标）新鲜、非部分且晚于所选成员最近退化的业务响应时的成对问题；否则为资格。配置探测不能解决成对问题。派发顺序先放未训练成员，再按未决问题的进展（成对问题为已与参考成员共享有效时间块的挑战者 reporter 数）从多到少，然后按最久未被选中；从未被选中的成员以配置探测提示打破平局。近期顺序只在归属工作于 begin 时获准后推进，未开始、被拒绝或未计分的预案不改变顺序。除恢复外，只有完成数加上未完成工作仍少于所选成员完成数的成员才会被派发：首次选择跟随证据，先训练挑战者会挤掉探测优先的所选成员，因此冷启动探索在所选成员取得一次完成后开始。只读 question、action 与 wait 取自同一顺序的首个成员；wait 只附加账本当前的预算或在途拒绝。节点来源明确区分失败时间与失效边界，借用的 cell stamp 统一当前父节点及有效 fence 检查，不增加缓存。
 
@@ -127,6 +135,8 @@ Score 状态随 manager 初始化，证据条目按需填充，由 mutex 保护�
 完整解析子组后仍无候选时，可以撤回该子组保留的名额，包括健康／能力过滤及 Selector 固定选择不可用的情况；仅重试排除造成的缺席不能撤回。选择 IPv6 `final` 前，内部 IPv4 预检通过同一选择路径推导可能的候选池，但不提交池、不预留工作或更新计数。预检必须具有当前 authority，不改变公开 Peek 的语义。
 
 每份尚未开始的策略选路尝试，都会在 begin 时、证据锁内、节点专属 I/O 之前重新检查其捕获的普通服务池义务。成员离池或池尚未初始化时，以类型化取消拒绝，并退还未开始的预留；过期普通计划和重试都不能把这种拒绝降级成免费工作。已开始的尝试与 relay 保留原有生命期及结算规则。新重试虽然沿用原始业务身份，仍须重新准入。因此，活跃连接可能跨越已退出候选池的成员，k 不是所有存量连接所用节点的历史并集上限。
+
+原生 pin 使自动策略组按 Selector 行事时，不为该 owner 附加普通 Score 池义务；原有 attribution 和嵌套普通 Score owner 的池义务仍须保留。即使多个子组别名共用叶节点，候选观测仍保留各成员的健康排除事实；Score utility 与资格原因只更新通过筛选的行。
 
 显式 `final` 只豁免其所属组的普通候选池，普通选择该路径的 Score 祖先仍须约束叶节点。唯一 TCP 叶节点恢复路径也进入同一个池，不能借此改选未选中的 Selector 兄弟。独立健康探测和预热观测不属于策略选中的业务，保留原有作用域。探测基线仍可用；比较单元接纳跟随服务池成员，并保留四个近期 Apply 胜者及初始收集的既有例外。原有信用、身份和 TTL 规则不变。成员检查受 k 限制；池重新排名对候选排序，轮转则遍历一次。
 
@@ -178,7 +188,7 @@ Score 归属。普通成员/展示列表不包含 final 边；健康注册、预
 可用的普通 IPv4 代理路径，再执行 final，业务目标地址族不变。缺失或成环的
 final 仍然拒绝；这里不重试传输错误或终态 packet rejection。
 
-Selector 在候选展开和健康过滤前绑定具体节点或子组成员；节点 tag 重复时，按声明顺序绑定第一个匹配的 `NodeId`。父组保留现有的子组 Peek、父组健康检查和服务提交顺序，不推进未选中 Score 子组的状态。TCP 与 UDP 的服务提交失败时都不能恢复之前 peek 的叶节点；只有显式配置的 final 可以继续选择。候选保留来源子组的引用，不再根据显示 tag 反查身份。选中的自动策略子组仍可在自己的成员范围内选择其他叶节点。唯一 TCP 叶节点的最后尝试遍历也遵守每一级 Selector 选择，而显式延迟测试仍可检查全部成员以发现恢复。
+Selector 在候选展开和健康过滤前绑定具体节点或子组成员；按名称配置的默认选择和 Clash 写入在节点 tag 重复时，按声明顺序绑定第一个匹配的 `NodeId`；原生成员 ID 可选择特定直接成员。服务选择只对已选子组执行 Apply，再检查父组健康条件；不预览未选兄弟，也不要求子组已提交的 Peek 必须先成功。TCP 与 UDP 的已选路径不可用时，都只能通过其显式配置的 final 继续选择。候选保留来源子组的引用，不再根据显示 tag 反查身份。选中的自动策略子组仍可在自己的成员范围内选择其他叶节点。唯一 TCP 叶节点的最后尝试遍历也遵守每一级 Selector 选择，而显式延迟测试仍可检查全部成员以发现恢复。
 
 展示和 API 输出仍使用成员 tag；即使物理拨号落到更深的叶节点，实际选择也会单独保留具体节点或子组身份：
 
@@ -221,13 +231,13 @@ Go dae 的 TCP=1 会使短暂的探测丢包在 URLTest 选择前将当前节点
 | Score QUIC 质量 | 每次周期性 UDP 探测都通过每个 Score 叶节点独立执行 ALPN 为 `h3` 的真实 TLS-in-QUIC 握手，目标为第一个配置的 `global.tcp_check_url`，且必须是有效的 HTTPS URL。测得时长提供独立 `DataUdp` 探测质量，不增加业务成功或虚构吞吐；DNS 探测失败而握手成功时仍可恢复 `DataUdp` 活性。缺少 URL 或 URL 不是 HTTPS 时禁用此探测；非 Score 叶节点既不创建此握手，也不创建 Score cell。 |
 | 按组 URL | 用与全局 TCP 探测相同的临时暖路径计时，探测动态解析出的 `(member tag, current leaf)` 对。状态为 TCP-only，连续三次失败即死亡，并使用相同冷却与连续两次成功恢复。重载时 `sync_group_check_urls` 替换有效的组/URL 注册表。 |
 
-`has_udp_state(node)` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。对于普通 endpoint，终止性 send/receive error 与从未收到 reply 时的 idle expiry，会在 driver 捕获 terminal per-flow Score outcome 后上报 `DataUdp` failure。对于来源共享 VLESS，source owner 负责报告 transport health，而每个绑定 endpoint 保留并结算自己的 Score reporter；匹配 reply 属于对应 endpoint，foreign reply 没有 flow Score owner。source terminal event 会退役其 endpoints，并把 terminal outcome 分发给这些 flow。
+`has_udp_state(node)` 区分从未观察过 UDP 的节点与已明确观察为死亡的节点。对于普通 endpoint，终止性 send/receive error 与从未收到 reply 时的 idle expiry，会在 driver 捕获 terminal per-flow Score outcome 后上报 `DataUdp` failure。对于来源共享协议，source owner 负责报告 transport health，而每个绑定 endpoint 保留并结算自己的 Score reporter；匹配 reply 属于对应 endpoint，foreign reply 没有 flow Score owner。source terminal event 会退役其 endpoints，并把 terminal outcome 分发给这些 flow。
 
 类型化 policy、size 与 `PacketRejection::Capacity` refusal 对候选是 terminal，但不影响 health 或 Score；CLI 调用方收到 capacity error，而不是 `NotApplicable`。单包拥塞、已有 reply 后的 idle expiry、主动退役、节点死亡取消和进程关闭也不影响健康。alive→dead 转换调用带 `(NodeId, name)` 的控制面回调，清除 pool connection 与 UDP endpoint。若 sibling UDP domain 明确存活，则跳过该 UDP domain 的死亡清理，避免被阻断的 `:53` 探测清除正常 flow。
 
-每个节点最近一次真实 TCP 延迟样本每 60 秒写入 `cache.db`；启动时只恢复不超过 24 小时的样本。存活性从不由缓存恢复。合成 10 秒占位样本带有标记，不显示在历史中，不进入移动平均，也不会作为最近真实样本持久化；选择降级由失败 strike 计数承担，与占位样本无关。
+每个节点最近一次真实 TCP 延迟样本每 60 秒写入状态数据库；启动时只恢复不超过 24 小时的样本。存活性从不由缓存恢复。合成 10 秒占位样本带有标记，不显示在历史中，不进入移动平均，也不会作为最近真实样本持久化；选择降级由失败 strike 计数承担，与占位样本无关。
 
-- `src/alive/` API 包括 `register_node`、`notify_check_*`、`report_*_traffic` 与 `record_dial_failure`。组表及 `(member tag, check_url)` 状态仍以名称为键：组没有 NodeId，成员可能是子组（sing-box RealTag）。`mod.rs` 负责状态、阈值、registry、eBPF 连通性推送回调；`probe.rs` 负责 HTTP/raw-connect `probe_node`、经 `dial_udp_transport` 的 DNS `probe_node_udp` 与并发探测周期；`collection.rs` 负责 `DialerCollection` 延迟、移动平均与拨号失败跟踪；`latencies.rs` 使用操作复杂度为 O(1)、容量为 10 的环形缓冲区，测量的 `SystemTime` 给出真实的 Clash 历史记录时间。`last_real_sample()` 排除合成条目，避免仪表盘显示虚构的 10000 ms。
+- `src/alive/` API 包括 `register_node`、`notify_check_*`、`report_*_traffic` 与 `record_dial_failure`。组表及 `(member tag, check_url)` 状态仍以名称为键：组没有 NodeId，成员可能是子组（sing-box RealTag）。`mod.rs` 负责状态、阈值、registry、eBPF 连通性推送回调；`probe.rs` 负责 HTTP/raw-connect `probe_node` 与经 `dial_udp_transport` 的 DNS `probe_node_udp` 测量；`runner.rs` 负责健康检查的准入/取消/排空、并发探测周期以及周期/恢复/紧急探测循环；`collection.rs` 负责 `DialerCollection` 延迟、移动平均与拨号失败跟踪；`latencies.rs` 使用操作复杂度为 O(1)、容量为 10 的环形缓冲区，测量的 `SystemTime` 给出真实的 Clash 历史记录时间。`last_real_sample()` 排除合成条目，避免仪表盘显示虚构的 10000 ms。
 
 `honk-outbound/src/urltest.rs` 统一负责 HTTP 请求构造和测量，URL 解释委托给 `honk-config::check` 的规范解码器。core 与 generation URLTest 还共享显式冷 session 预热，并在创建资源或反馈之前保留可失败的节点准入；独立工具调用保留 handler 内部的 setup 和 CLI 外层 deadline。请求使用不含凭据的 authority，仅保留非默认端口，移除 fragment，并保留原始路径、查询串及点段；仅有查询串的 URL 使用 `/?query`。HTTPS 验证证书并协商 `h2,http/1.1`，禁用 server push。第一轮使用 HEAD，第二轮使用配置方法（delay 测试为 HEAD）；两轮最终响应的解码状态都必须为有效的 200–499。HTTP/1 会在同一轮内消费临时响应头后再读取最终响应，但不支持协议切换；每轮响应头累计上限为 16 KiB。HTTP/2 响应头列表使用相同大小上限。
 HTTP/2 探测连接在首个本地检测到的协议错误时终止，避免后续远端 reset 覆盖已经拒绝的响应头错误并触发首轮样本回退。
@@ -261,7 +271,7 @@ eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族�
 | 机制 | 候选与生命周期 | 保留资源 | 边界 |
 | --- | --- | --- | --- |
 | 启动预连接 | 仅在启动时运行一轮；先取各组当前选择，再按配置顺序。只有可池化裸 TCP 的代理节点合格。 | 向池中存入一条服务端裸 TCP 连接 | `'auto'` 最多选择 8 个节点；`0` 关闭。它不持有策略 retention bit。 |
-| Selector 固定 | 始终跟踪每个 Selector 的配置叶节点，包括不健康的显式选择；多个组共享的叶节点按 UUID 去重。 | TCP path 选择的可复用 session（AnyTLS 或 VLESS H2/shared Mux.Cool）、一个 QUIC client/connection，否则一条服务端裸 TCP | 有效选择变化会立即唤醒；10 秒周期修复丢失、已消费或已过期状态。 |
+| Selector 固定 | 跟踪每个 Selector 的 TCP 配置选择叶，包括不健康的显式选择；共享叶按 UUID 去重。UDP 预热另按 UDP 选择。 | TCP path 选择的可复用 session（AnyTLS 或 VLESS H2/shared Mux.Cool）、一个 QUIC client/connection，否则一条服务端裸 TCP | 有效选择变化会立即唤醒；10 秒周期修复丢失、已消费或已过期状态。 |
 | UDP 预热集 | 需显式启用；每轮对每个地址族重新选择各组 top `min(N, 3)` 的可复用 UDP 叶节点，再按 UUID 全局去重。 | UDP path 选择的可复用状态，包括 VLESS H2/shared/separate Mux.Cool pool，或一个 QUIC client | 最多并发 4 个预热尝试；进程保留集会重新排名并封顶 `4 × N`。 |
 
 Selector 与 UDP ownership 是 reusable node runtime 上相互独立的 bit。
@@ -274,6 +284,8 @@ reuse。active flow 不会被切断，startup preconnect 仍只是一颗 pool se
 VLESS pool/source key 与 QUIC 状态；配置变化时得到 fresh runtime。现有 outbound
 maintenance pass 与其他 idle resource 一起回收未受 retention 的 idle VLESS
 carrier，不创建新的 protocol timer。
+
+原生探测固定成员到叶节点的关联和代次所有者，不推进策略状态。实际 TCP-connect、HTTP 和 TCP/UDP DNS 测量保留传输协议、用途、地址族及冷热状态；过期或取消的结果不发布新的健康状态。探测、geodata 和共享下载使用配置的目标，不设地址或端口白名单。能够写入配置或控制订阅内容的人决定这些目标；provider 内容属于受信任的配置。探测仍固定解析出的 IP。参见[有界探测](../reference/api.md#有界探测)。
 
 ## 拨号准入预算
 

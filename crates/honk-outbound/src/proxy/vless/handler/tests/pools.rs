@@ -82,6 +82,7 @@ async fn cancelled_encrypted_ws_handshake_retains_credit_until_bridge_teardown()
         1,
         1,
         1,
+        false,
         None,
     )
     .unwrap()
@@ -176,24 +177,18 @@ async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
                         send.send_data(bytes::Bytes::from_static(b"pong"), true)
                             .unwrap();
                     }
-                    1 => {
+                    3 => {
                         assert_eq!(&body[2..9], &[1, 8, 8, 8, 8, 0, 53]);
-                        while body.len() < 14 {
+                        while body.len() < 21 {
                             let data = recv.data().await.unwrap().unwrap();
                             let size = data.len();
                             body.extend_from_slice(&data);
                             recv.flow_control().release_capacity(size).unwrap();
                         }
-                        assert_eq!(&body[9..14], b"\0\x03dns");
-                        let packet = super::super::uot::encode_packet(
-                            b"answer",
-                            super::super::uot::MAX_PACKET_SIZE,
-                        )
-                        .unwrap();
-                        let mut response = bytes::BytesMut::with_capacity(1 + packet.len());
-                        response.extend_from_slice(&[0]);
-                        response.extend_from_slice(&packet);
-                        send.send_data(response.freeze(), true).unwrap();
+                        assert_eq!(&body[9..21], b"\x01\x08\x08\x08\x08\0\x35\0\x03dns");
+                        let mut response = vec![0, 1, 8, 8, 8, 8, 0, 53, 0, 6];
+                        response.extend_from_slice(b"answer");
+                        send.send_data(bytes::Bytes::from(response), true).unwrap();
                     }
                     flags => panic!("unexpected mux flags {flags}"),
                 }
@@ -228,6 +223,7 @@ async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
             8,
             8,
             1,
+            cfg!(feature = "flow-observation"),
             None,
         )
         .unwrap()
@@ -272,6 +268,7 @@ async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
             8,
             8,
             1,
+            cfg!(feature = "flow-observation"),
             Some(&generation),
         )
         .unwrap();
@@ -329,6 +326,12 @@ async fn h2mux_tcp_and_udp_share_one_vless_carrier() {
     assert!(!pool.is_warm_retained());
     assert_eq!(pool.live_session_count(), 0);
     replacement.shutdown().await;
+    #[cfg(feature = "flow-observation")]
+    drop(
+        runtime
+            .acquire_vless_carrier()
+            .expect("joined H2 driver must already release its carrier"),
+    );
     let released = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             if let Ok(permit) = runtime.acquire_vless_carrier() {
@@ -353,6 +356,7 @@ async fn cool_c8_opens_seventeen_tcp_children_on_three_global_carriers() {
             8,
             8,
             3,
+            false,
             None,
         )
         .unwrap()
@@ -429,7 +433,7 @@ async fn idle_reap_returns_carrier_credit_without_cutting_retained_or_active_ses
         node.id = node.derive_id();
     }
     let registry = crate::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
-        &nodes, 8, 8, 3, None,
+        &nodes, 8, 8, 3, false, None,
     )
     .unwrap()
     .0;
@@ -460,7 +464,7 @@ async fn idle_reap_returns_carrier_credit_without_cutting_retained_or_active_ses
     pools[1].set_warm_retained(true);
     let active_child = sessions[2].try_reserve().unwrap();
 
-    assert_eq!(registry.reap_idle_resources(std::time::Instant::now()), 1);
+    assert_eq!(registry.reap_idle_resources(), 1);
     assert!(sessions[0].is_closed());
     assert!(!sessions[1].is_closed());
     assert!(!sessions[2].is_closed());

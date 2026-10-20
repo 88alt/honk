@@ -9,11 +9,13 @@
 
 #[cfg(test)]
 use self::driver::TRANSPORT_SEND_TIMEOUT;
+use crate::ebpf::UdpFlowOwner;
 use crate::stats::{ActiveConnectionGuard, OutboundTracker, StatsManager};
 use bytes::Bytes;
 use dashmap::DashMap;
 use honk_outbound::group::{ScoreOutcome, ScoreReporter};
 use parking_lot::Mutex;
+pub(in crate::control) use source::UplinkStall;
 use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
@@ -24,16 +26,107 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tracing::debug;
 
+/// How an observed UDP connection ended.
+#[cfg_attr(
+    not(all(feature = "native-api", feature = "ebpf")),
+    allow(
+        dead_code,
+        reason = "builds name only the outcomes their engine paths report"
+    )
+)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(in crate::control) enum UdpTerminal {
+    PolicyBlock,
+    IntentionalRetirement,
+    ReplyIdle,
+    Shutdown,
+    CleanupFailed,
+    ClientDeliveryFailed,
+    Congestion,
+    DriverCancelled,
+    InitializerCancelled,
+    InitializerFirstPacketMissing,
+    InitializerQueueMissing,
+    InternalAddressSkipped,
+    LocalRefusal,
+    NoAvailableCandidate,
+    PacketRejected,
+    QuicSniffIncomplete,
+    ReplyFamilyMismatch,
+    ReplySocketCapacity,
+    ReplySocketFailed,
+    SetupFailed,
+    SpecialAddressSkipped,
+    TimeoutAfterReply,
+    TimeoutBeforeReply,
+    TransportError,
+    TransportTimeout,
+    UdpCommitFailed,
+    UdpCommitTimeout,
+    UdpPrepareFailed,
+    UdpPrepareTimeout,
+    WinnerBindCancelled,
+    WinnerIneligible,
+    DriverCompleted,
+    KernelHandoff,
+}
+
+#[cfg(feature = "native-api")]
+impl UdpTerminal {
+    fn outcome(self) -> (crate::observe::vocab::ConnectionState, &'static str) {
+        use crate::observe::vocab::ConnectionState::{Blocked, Closed, Failed, Unknown};
+        match self {
+            Self::PolicyBlock => (Blocked, "policy_block"),
+            Self::IntentionalRetirement => (Closed, "intentional_retirement"),
+            Self::ReplyIdle => (Closed, "reply_idle"),
+            Self::Shutdown => (Closed, "shutdown"),
+            Self::CleanupFailed => (Failed, "cleanup_failed"),
+            Self::ClientDeliveryFailed => (Failed, "client_delivery_failed"),
+            Self::Congestion => (Failed, "congestion"),
+            Self::DriverCancelled => (Failed, "driver_cancelled"),
+            Self::InitializerCancelled => (Failed, "initializer_cancelled"),
+            Self::InitializerFirstPacketMissing => (Failed, "initializer_first_packet_missing"),
+            Self::InitializerQueueMissing => (Failed, "initializer_queue_missing"),
+            Self::InternalAddressSkipped => (Failed, "internal_address_skipped"),
+            Self::LocalRefusal => (Failed, "local_refusal"),
+            Self::NoAvailableCandidate => (Failed, "no_available_candidate"),
+            Self::PacketRejected => (Failed, "packet_rejected"),
+            Self::QuicSniffIncomplete => (Failed, "quic_sniff_incomplete"),
+            Self::ReplyFamilyMismatch => (Failed, "reply_family_mismatch"),
+            Self::ReplySocketCapacity => (Failed, "reply_socket_capacity"),
+            Self::ReplySocketFailed => (Failed, "reply_socket_failed"),
+            Self::SetupFailed => (Failed, "setup_failed"),
+            Self::SpecialAddressSkipped => (Failed, "special_address_skipped"),
+            Self::TimeoutAfterReply => (Failed, "timeout_after_reply"),
+            Self::TimeoutBeforeReply => (Failed, "timeout_before_reply"),
+            Self::TransportError => (Failed, "transport_error"),
+            Self::TransportTimeout => (Failed, "transport_timeout"),
+            Self::UdpCommitFailed => (Failed, "udp_commit_failed"),
+            Self::UdpCommitTimeout => (Failed, "udp_commit_timeout"),
+            Self::UdpPrepareFailed => (Failed, "udp_prepare_failed"),
+            Self::UdpPrepareTimeout => (Failed, "udp_prepare_timeout"),
+            Self::WinnerBindCancelled => (Failed, "winner_bind_cancelled"),
+            Self::WinnerIneligible => (Failed, "winner_ineligible"),
+            Self::DriverCompleted => (Unknown, "driver_completed"),
+            Self::KernelHandoff => (Unknown, "kernel_handoff"),
+        }
+    }
+}
+
 mod admission;
+#[cfg_attr(not(feature = "native-api"), path = "observation/inert.rs")]
+mod observation;
 mod retirement;
-#[cfg(feature = "rprx")]
 mod source;
+#[cfg(test)]
+mod source_quic_tests;
+#[cfg(test)]
+mod source_shared_tests;
 #[cfg(all(test, feature = "rprx"))]
 mod source_tests;
+use retirement::{EndpointIoGuard, RetirementIo};
 pub(crate) use retirement::{EndpointRemoval, RemovalReason};
-#[cfg(feature = "rprx")]
-pub(in crate::control) use source::{SourceAttachment, VlessSourcePreparation};
-#[cfg(feature = "rprx")]
+pub(in crate::control) use source::{SourceAttachment, SourcePath, SourcePreparation};
 use source::{SourceEndpoint, SourceOwner, SourceRetirement, SourceScope};
 #[doc(hidden)]
 pub mod bench_support;
@@ -56,7 +149,6 @@ pub(crate) const MAX_ENDPOINTS: usize = 8192;
 pub(in crate::control) const MAX_REPLY_SOCKETS_PER_ENDPOINT: usize = 8;
 enum EndpointTransport {
     Flow(Arc<dyn honk_outbound::proxy::PacketTransport>),
-    #[cfg(feature = "rprx")]
     Source(SourceEndpoint),
 }
 
@@ -95,7 +187,11 @@ pub struct UdpEndpoint {
     download: Arc<AtomicU64>,
     score_reporter: Option<ScoreReporter>,
     health_family: honk_outbound::alive::IpVersion,
+    #[cfg(test)]
+    source_reply_hook: Mutex<Option<Arc<source::ReplyAdmissionHook>>>,
     tracker_id: Mutex<Option<String>>,
+    pub(in crate::control) native: observation::EndpointObservation,
+    retirement: EndpointIoGuard,
 }
 
 impl UdpEndpoint {
@@ -132,7 +228,6 @@ impl UdpEndpoint {
         )
     }
 
-    #[cfg(feature = "rprx")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) fn new_source_scored(
         attachment: SourceAttachment,
@@ -193,10 +288,33 @@ impl UdpEndpoint {
             pending_reply_next: AtomicU64::new(0),
             upload: Arc::new(AtomicU64::new(0)),
             download: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            source_reply_hook: Mutex::new(None),
             tracker_id: Mutex::new(None),
             score_reporter,
             health_family,
+            native: Default::default(),
+            retirement: EndpointIoGuard(RetirementIo::new()),
         }
+    }
+
+    #[cfg(feature = "native-api")]
+    fn finish_native_source(&self, retirement: SourceRetirement) {
+        let outcome = match retirement {
+            SourceRetirement::Neutral(ScoreOutcome::Timeout) if self.has_reply() => {
+                UdpTerminal::ReplyIdle
+            }
+            SourceRetirement::Neutral(ScoreOutcome::Timeout) if self.native.received_reply() => {
+                UdpTerminal::TimeoutAfterReply
+            }
+            SourceRetirement::Neutral(ScoreOutcome::Timeout) => UdpTerminal::TimeoutBeforeReply,
+            SourceRetirement::Neutral(_) => UdpTerminal::IntentionalRetirement,
+            SourceRetirement::Failure(
+                ScoreOutcome::Timeout | ScoreOutcome::Io(io::ErrorKind::TimedOut),
+            ) => UdpTerminal::TransportTimeout,
+            SourceRetirement::Failure(_) => UdpTerminal::TransportError,
+        };
+        self.native.finish(outcome);
     }
 
     /// Bind the clash-API tracker entry to this endpoint: the entry shares
@@ -231,7 +349,6 @@ impl UdpEndpoint {
         let Some(reporter) = &self.score_reporter else {
             return;
         };
-        #[cfg(feature = "rprx")]
         let outcome = match &self.transport {
             EndpointTransport::Source(source) if outcome != ScoreOutcome::Shutdown => {
                 match source.score_retirement() {
@@ -264,7 +381,15 @@ impl UdpEndpoint {
     }
 
     pub fn mark_reply(&self) {
-        self.has_reply.store(true, Ordering::Relaxed);
+        let first = !self.has_reply.swap(true, Ordering::Relaxed);
+        if first && let Some(flow) = self.native.flow() {
+            flow.transition(
+                crate::observe::vocab::ConnectionState::Active,
+                "client_delivery_succeeded",
+                crate::observe::vocab::ConnectionMilestone::Unknown,
+                Some(true),
+            );
+        }
         self.refresh();
         self.reply_epoch.fetch_add(1, Ordering::Release);
         self.reply_notify.notify_waiters();
@@ -306,7 +431,6 @@ impl UdpEndpoint {
         }
         match &self.transport {
             EndpointTransport::Flow(_) => self.dead.store(true, Ordering::Release),
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(source) => source.retire(&self.dead),
         }
     }
@@ -325,7 +449,6 @@ impl UdpEndpoint {
     fn flow_transport(&self) -> Option<&dyn honk_outbound::proxy::PacketTransport> {
         match &self.transport {
             EndpointTransport::Flow(transport) => Some(transport.as_ref()),
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(_) => None,
         }
     }
@@ -333,7 +456,6 @@ impl UdpEndpoint {
     fn is_source(&self) -> bool {
         match &self.transport {
             EndpointTransport::Flow(_) => false,
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(_) => true,
         }
     }
@@ -341,71 +463,85 @@ impl UdpEndpoint {
     fn send_timeout(&self) -> Duration {
         match &self.transport {
             EndpointTransport::Flow(transport) => transport.send_timeout(),
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(source) => source.send_timeout(),
         }
     }
 
     fn send_timeout_is_congestion(&self) -> bool {
-        self.flow_transport()
-            .is_some_and(|transport| transport.send_timeout_is_congestion())
+        self.packet_transport().send_timeout_is_congestion()
     }
 
     fn quic_path_stalled(&self) -> bool {
-        self.flow_transport()
-            .is_some_and(|transport| transport.quic_path_stalled())
+        self.packet_transport().quic_path_stalled()
     }
 
-    #[cfg(all(test, feature = "rprx"))]
+    fn packet_transport(&self) -> &dyn honk_outbound::proxy::PacketTransport {
+        match &self.transport {
+            EndpointTransport::Flow(transport) => transport.as_ref(),
+            EndpointTransport::Source(source) => source.packet_transport(),
+        }
+    }
+
+    #[cfg(test)]
     async fn send_packet(&self, data: &[u8], confirmed: bool) -> io::Result<()> {
-        self.send_packet_with_admission(data, confirmed, None)
+        self.send_packet_with_admission(data, confirmed, None, &mut None)
             .await
             .map(|_| ())
     }
 
-    async fn send_packet_with_admission(
-        &self,
+    async fn send_packet_with_admission<'a>(
+        &'a self,
         data: &[u8],
         confirmed: bool,
         admitted: Option<&AtomicBool>,
+        attempt: &mut Option<honk_outbound::proxy::QuicSendAttempt<'a>>,
     ) -> io::Result<Option<Instant>> {
-        #[cfg(not(feature = "rprx"))]
-        let _ = admitted;
-        match &self.transport {
-            EndpointTransport::Flow(transport) if confirmed => {
-                transport.send_packet_confirmed(data).await.map(|()| None)
+        let operation = async {
+            match &self.transport {
+                EndpointTransport::Flow(transport) if confirmed => {
+                    transport.send_packet_confirmed(data).await.map(|()| None)
+                }
+                EndpointTransport::Flow(transport) => {
+                    transport.send_packet(data).await.map(|()| None)
+                }
+                EndpointTransport::Source(source) => {
+                    let record_start = self.score_reporter.is_some()
+                        && !data.is_empty()
+                        && self.upload.load(Ordering::Relaxed) == 0;
+                    source
+                        .send(data, confirmed, admitted, record_start, attempt)
+                        .await
+                }
             }
-            EndpointTransport::Flow(transport) => transport.send_packet(data).await.map(|()| None),
-            #[cfg(feature = "rprx")]
-            EndpointTransport::Source(source) => {
-                let record_start = self.score_reporter.is_some()
-                    && !data.is_empty()
-                    && self.upload.load(Ordering::Relaxed) == 0;
-                source.send(data, admitted, record_start).await
-            }
+        };
+        if let Some(observer) = self.native.observer() {
+            return observer.scope(operation).await;
         }
+        operation.await
     }
 
     fn fail_source(&self, outcome: ScoreOutcome) {
-        #[cfg(feature = "rprx")]
         if let EndpointTransport::Source(source) = &self.transport {
             source.fail(outcome);
         }
-        #[cfg(not(feature = "rprx"))]
-        let _ = outcome;
+    }
+
+    fn source_uplink_stall(&self) -> Option<&UplinkStall> {
+        match &self.transport {
+            EndpointTransport::Flow(_) => None,
+            EndpointTransport::Source(source) => Some(source.uplink_stall()),
+        }
     }
 
     fn source_flow_idle_expired(&self) {
-        #[cfg(feature = "rprx")]
         if let EndpointTransport::Source(source) = &self.transport {
             source.flow_idle_expired();
         }
     }
 
-    #[cfg(feature = "rprx")]
+    #[cfg(all(test, feature = "native-api"))]
     fn source_owner_id(&self) -> Option<u64> {
         match &self.transport {
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(source) => Some(source.owner_id()),
             EndpointTransport::Flow(_) => None,
         }
@@ -413,7 +549,6 @@ impl UdpEndpoint {
 
     fn commit_source_binding(&self, endpoint_permit: OwnedSemaphorePermit) -> bool {
         match &self.transport {
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(source) => source.commit_binding(endpoint_permit),
             EndpointTransport::Flow(_) => {
                 drop(endpoint_permit);
@@ -422,26 +557,23 @@ impl UdpEndpoint {
         }
     }
 
-    #[cfg(feature = "rprx")]
     fn begin_source_reply(&self, owner_id: u64) -> bool {
-        let _send_gate = self.send_gate.lock();
-        !self.dead.load(Ordering::Acquire) && self.source_owner_id() == Some(owner_id)
+        match &self.transport {
+            EndpointTransport::Source(source) => source.reply_admitted(owner_id),
+            EndpointTransport::Flow(_) => false,
+        }
     }
 
-    #[cfg(feature = "rprx")]
     fn source_reply_socket(&self) -> &Arc<ReplySocket> {
         match &self.transport {
-            #[cfg(feature = "rprx")]
             EndpointTransport::Source(source) => source.reply_socket(),
             EndpointTransport::Flow(_) => panic!("ordinary UDP endpoint has no source reply lease"),
         }
     }
 
-    #[cfg(feature = "rprx")]
     fn record_source_reply(&self, len: u64) {
         self.tracker_download(len);
         self.score_reply(len);
-        #[cfg(feature = "rprx")]
         if let EndpointTransport::Source(source) = &self.transport {
             source.record_reply(len);
         }
@@ -552,6 +684,11 @@ impl UdpReplySocketFactory for SystemUdpReplySocketFactory {
     }
 }
 
+pub(in crate::control) struct UdpShutdown {
+    pub joined: bool,
+    pub graceful: bool,
+}
+
 /// Pool state is a single map entry per tuple: Initializing, Ready, or the
 /// exact Retiring identity that fences reuse until cleanup is acknowledged.
 pub struct UdpEndpointPool {
@@ -561,15 +698,10 @@ pub struct UdpEndpointPool {
     /// Lifetime-held across active and retiring ordinary/source reply sockets.
     /// The fixed 8× endpoint budget prevents teardown overlap from doubling FDs.
     reply_socket_slots: Arc<Semaphore>,
-    #[cfg(feature = "rprx")]
     sources: DashMap<SourceScope, Arc<SourceOwner>>,
-    #[cfg(feature = "rprx")]
     source_slots: Arc<Semaphore>,
-    #[cfg(feature = "rprx")]
     next_source_owner: AtomicU64,
-    #[cfg(feature = "rprx")]
     source_tasks: Mutex<TaskRegistry>,
-    #[cfg(feature = "rprx")]
     source_changed: Notify,
     /// Linearizes finalized-node binding against node-death scans. Without
     /// this gate a scan can observe an unbound initializer, then binding can
@@ -633,15 +765,10 @@ impl UdpEndpointPool {
             reply_socket_slots: Arc::new(Semaphore::new(
                 capacity_limit.saturating_mul(MAX_REPLY_SOCKETS_PER_ENDPOINT),
             )),
-            #[cfg(feature = "rprx")]
             sources: DashMap::new(),
-            #[cfg(feature = "rprx")]
             source_slots: Arc::new(Semaphore::new(capacity_limit)),
-            #[cfg(feature = "rprx")]
             next_source_owner: AtomicU64::new(1),
-            #[cfg(feature = "rprx")]
             source_tasks: Mutex::new(TaskRegistry::default()),
-            #[cfg(feature = "rprx")]
             source_changed: Notify::new(),
             node_binding_gate: Mutex::new(()),
             next_generation: AtomicU64::new(1),
@@ -680,6 +807,11 @@ impl UdpEndpointPool {
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.endpoints.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(&self, client: SocketAddr, dst: SocketAddr) -> bool {
+        self.endpoints.contains_key(&EndpointKey::new(client, dst))
     }
 
     #[cfg(test)]

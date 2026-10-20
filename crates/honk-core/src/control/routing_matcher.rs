@@ -7,11 +7,13 @@ use crate::ebpf::maps;
 use crate::routing::{CompiledPredicate, CompiledRoute, RouteAction, Router};
 use honk_config::types::DialMode;
 use honk_ebpf_common::{
-    DomainRouting, LpmKey, OutboundIndex, ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN,
-    ROUTING_FEATURE_DOMAIN_REROUTE, ROUTING_FEATURE_PROCESS, ROUTING_PROCESS_MAX_LEN,
+    DomainRouting, LpmKey, OutboundIndex, ROUTE_TRACE_VALUES, ROUTING_FACT_CAPACITY,
+    ROUTING_FEATURE_DOMAIN, ROUTING_FEATURE_DOMAIN_REROUTE, ROUTING_FEATURE_PROCESS,
+    ROUTING_PROCESS_MAX_LEN,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[cfg(feature = "ebpf")]
 pub mod codegen;
@@ -41,6 +43,22 @@ pub enum KernelPredicate {
     Dscp(Vec<u8>),
     /// Canonical process-name bytes, without a trailing NUL.
     ProcessName(Vec<Vec<u8>>),
+}
+
+impl KernelPredicate {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::DestinationPort(ranges) | Self::SourcePort(ranges) => ranges.is_empty(),
+            Self::Protocol(mask) | Self::IpVersion(mask) => *mask == 0,
+            Self::Dscp(values) => values.is_empty(),
+            Self::ProcessName(names) => names.is_empty(),
+            Self::Domain(_) | Self::DestinationIp(_) | Self::SourceIp(_) | Self::Mac(_) => false,
+        }
+    }
+
+    fn is_port(&self) -> bool {
+        matches!(self, Self::DestinationPort(_) | Self::SourcePort(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +105,67 @@ pub struct KernelRule {
     pub action: KernelAction,
 }
 
+impl KernelRule {
+    fn folded_false(&self) -> bool {
+        self.conditions.is_empty()
+            || self
+                .conditions
+                .iter()
+                .any(|condition| !condition.not && condition.predicate.is_empty())
+    }
+
+    fn runtime_conditions(&self) -> impl Iterator<Item = (usize, &KernelCondition)> + Clone {
+        let live = self
+            .conditions
+            .iter()
+            .enumerate()
+            .filter(|(_, condition)| !condition.predicate.is_empty());
+        live.clone()
+            .filter(|(_, condition)| condition.predicate.is_port())
+            .chain(live.filter(|(_, condition)| !condition.predicate.is_port()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KernelTraceDisposition {
+    Runtime,
+    FoldedTrue,
+    FoldedFalse,
+    Unreachable,
+}
+
+/// Slot index is its position in `KernelTraceLayout::slots`. A condition
+/// ordinal addresses the original compiled vector, never the port-first order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelTraceSlot {
+    /// None identifies fallback.
+    pub rule_id: Option<u32>,
+    /// None identifies a rule outcome (or fallback), not a predicate.
+    pub condition_ordinal: Option<usize>,
+    pub evaluation_rank: Option<usize>,
+    pub disposition: KernelTraceDisposition,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KernelTraceLayout {
+    pub slots: Vec<KernelTraceSlot>,
+    /// Includes omitted slots, so a bounded dictionary never calls them skipped.
+    pub total_values: usize,
+}
+
+impl KernelTraceLayout {
+    fn push(&mut self, slot: KernelTraceSlot) {
+        self.total_values += 1;
+        if self.slots.len() < ROUTE_TRACE_VALUES {
+            self.slots.push(slot);
+        }
+    }
+
+    pub fn truncated(&self) -> bool {
+        self.total_values > self.slots.len()
+    }
+}
+
 /// Generation-owned LPM fact maps.  Domain facts are staged by the backend
 /// from the projection writer and intentionally do not live in this plan.
 #[derive(Debug, Clone, Default)]
@@ -108,17 +187,94 @@ pub struct RoutingPushPlan {
     pub(crate) fingerprint: [u8; 32],
     pub has_domain_rules: bool,
     pub(crate) domain_predicate_count: usize,
+    pub(crate) trace_enabled: bool,
 }
 
 impl RoutingPushPlan {
     pub fn semantically_eq(&self, other: &Self) -> bool {
         self.fallback == other.fallback
             && self.features == other.features
+            && self.trace_enabled == other.trace_enabled
             && self.fingerprint == other.fingerprint
             && self.has_domain_rules == other.has_domain_rules
             && self.domain_predicate_count == other.domain_predicate_count
             && self.rules == other.rules
             && fact_maps_equal(&self.facts, &other.facts)
+    }
+
+    /// Native recording is restart-configured; disabled plans emit no tracing
+    /// instructions, while admitted invocations of enabled plans retain R9.
+    pub fn enable_trace(&mut self, enabled: bool) {
+        self.trace_enabled = enabled;
+    }
+
+    pub fn trace_enabled(&self) -> bool {
+        self.trace_enabled
+    }
+
+    pub fn trace_layout(&self) -> Option<KernelTraceLayout> {
+        if !self.trace_enabled {
+            return None;
+        }
+        use KernelTraceDisposition::{FoldedFalse, FoldedTrue, Runtime, Unreachable};
+        let mut layout = KernelTraceLayout::default();
+        let mut unreachable = false;
+        for rule in &self.rules {
+            let folded_false = rule.folded_false();
+            let count = rule.runtime_conditions().count();
+            let disposition = if unreachable {
+                Unreachable
+            } else if folded_false {
+                FoldedFalse
+            } else {
+                Runtime
+            };
+            layout.push(KernelTraceSlot {
+                rule_id: Some(rule.id),
+                condition_ordinal: None,
+                evaluation_rank: (disposition == Runtime).then_some(count),
+                disposition,
+            });
+            for (rank, (ordinal, _)) in rule.runtime_conditions().enumerate() {
+                layout.push(KernelTraceSlot {
+                    rule_id: Some(rule.id),
+                    condition_ordinal: Some(ordinal),
+                    evaluation_rank: (disposition == Runtime).then_some(rank),
+                    disposition: if disposition == Runtime {
+                        Runtime
+                    } else {
+                        Unreachable
+                    },
+                });
+            }
+            for (ordinal, condition) in rule
+                .conditions
+                .iter()
+                .enumerate()
+                .filter(|(_, condition)| condition.predicate.is_empty())
+            {
+                layout.push(KernelTraceSlot {
+                    rule_id: Some(rule.id),
+                    condition_ordinal: Some(ordinal),
+                    evaluation_rank: None,
+                    disposition: if unreachable {
+                        Unreachable
+                    } else if condition.not {
+                        FoldedTrue
+                    } else {
+                        FoldedFalse
+                    },
+                });
+            }
+            unreachable |= !folded_false && count == 0;
+        }
+        layout.push(KernelTraceSlot {
+            rule_id: None,
+            condition_ordinal: None,
+            evaluation_rank: (!unreachable).then_some(0),
+            disposition: if unreachable { Unreachable } else { Runtime },
+        });
+        Some(layout)
     }
 
     /// Compile a Router into native rules and generation-owned fact indexes.
@@ -157,29 +313,35 @@ impl RoutingPushPlan {
                         KernelPredicate::Domain(*id)
                     }
                     CompiledPredicate::DestinationIp(matcher) => {
-                        let id = dest_fact.alloc("destination IP")?;
-                        add_ip_facts(
-                            &mut facts.destination_v4,
-                            &mut facts.destination_v6,
-                            matcher.nets(),
-                            id,
-                        );
+                        let (id, new) = dest_fact.alloc(Arc::as_ptr(matcher), "destination IP")?;
+                        if new {
+                            add_ip_facts(
+                                &mut facts.destination_v4,
+                                &mut facts.destination_v6,
+                                matcher.nets(),
+                                id,
+                            );
+                        }
                         KernelPredicate::DestinationIp(id)
                     }
                     CompiledPredicate::SourceIp(matcher) => {
-                        let id = source_fact.alloc("source IP")?;
-                        add_ip_facts(
-                            &mut facts.source_v4,
-                            &mut facts.source_v6,
-                            matcher.nets(),
-                            id,
-                        );
+                        let (id, new) = source_fact.alloc(Arc::as_ptr(matcher), "source IP")?;
+                        if new {
+                            add_ip_facts(
+                                &mut facts.source_v4,
+                                &mut facts.source_v6,
+                                matcher.nets(),
+                                id,
+                            );
+                        }
                         KernelPredicate::SourceIp(id)
                     }
                     CompiledPredicate::Mac(macs) => {
-                        let id = mac_fact.alloc("MAC")?;
-                        for mac in macs {
-                            add_mac_fact(&mut facts.mac, mac, id);
+                        let (id, new) = mac_fact.alloc(macs.as_slice(), "MAC")?;
+                        if new {
+                            for mac in macs {
+                                add_mac_fact(&mut facts.mac, mac, id);
+                            }
                         }
                         KernelPredicate::Mac(id)
                     }
@@ -228,10 +390,6 @@ impl RoutingPushPlan {
                             route.name
                         )
                     })?;
-            // Empty authored rules never match in userspace and need no code.
-            if conditions.is_empty() {
-                continue;
-            }
             rules.push(KernelRule {
                 id: route.id,
                 source: rule_source(route),
@@ -277,6 +435,7 @@ impl RoutingPushPlan {
             fingerprint: hash.finalize().into(),
             has_domain_rules: has_domain,
             domain_predicate_count,
+            trace_enabled: false,
         })
     }
 }
@@ -295,20 +454,36 @@ fn fact_maps_equal(a: &RoutingFactMaps, b: &RoutingFactMaps) -> bool {
         && eq(&a.mac, &b.mac)
 }
 
-#[derive(Default)]
-struct FactAllocator {
-    next: usize,
+/// One bit per distinct matcher: rules naming the same list share the bit, so
+/// capacity counts distinct lists, not rules. Negation lives on the rule
+/// condition, never in the bitmap, so sharing cannot change a decision. IP
+/// keys are matcher pointers (SharedMatchers interns equal lists; an
+/// uninterned duplicate only costs an extra bit); MAC keys are list values.
+struct FactAllocator<K> {
+    ids: HashMap<K, u32>,
 }
 
-impl FactAllocator {
-    fn alloc(&mut self, kind: &str) -> anyhow::Result<u32> {
-        let id = self.next;
-        self.next += 1;
+impl<K> Default for FactAllocator<K> {
+    fn default() -> Self {
+        Self {
+            ids: HashMap::new(),
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq> FactAllocator<K> {
+    /// Returns the list's bit and whether this call assigned it.
+    fn alloc(&mut self, key: K, kind: &str) -> anyhow::Result<(u32, bool)> {
+        if let Some(id) = self.ids.get(&key) {
+            return Ok((*id, false));
+        }
+        let id = self.ids.len();
         anyhow::ensure!(
             id < ROUTING_FACT_CAPACITY,
             "{kind} fact capacity exceeded ({ROUTING_FACT_CAPACITY})"
         );
-        Ok(id as u32)
+        self.ids.insert(key, id as u32);
+        Ok((id as u32, true))
     }
 }
 
@@ -516,5 +691,102 @@ mod tests {
                 [0, 1 << 31, 0, 0, 0, 0, 0, 1 << 31],
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod fact_sharing_tests {
+    use super::*;
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+    use serde_json::json;
+
+    fn compile(rules: Vec<serde_json::Value>) -> RoutingPushPlan {
+        let rules: Vec<_> = rules
+            .into_iter()
+            .map(|condition| RoutingRule {
+                name: String::new(),
+                condition: serde_json::from_value::<RoutingCondition>(condition).unwrap(),
+                outbound: RoutingOutbound::Simple("direct".into()),
+                priority: 0,
+                must: false,
+                mark: 0,
+            })
+            .collect();
+        let router = Router::new(&rules, "direct").unwrap();
+        let ids = HashMap::from([("direct".to_string(), 0u8)]);
+        RoutingPushPlan::compile(&router, &ids, DialMode::Ip).unwrap()
+    }
+
+    fn fact_ids(plan: &RoutingPushPlan, pick: fn(&KernelPredicate) -> Option<u32>) -> Vec<u32> {
+        plan.rules
+            .iter()
+            .flat_map(|rule| rule.conditions.iter().filter_map(|c| pick(&c.predicate)))
+            .collect()
+    }
+
+    fn destination(predicate: &KernelPredicate) -> Option<u32> {
+        match predicate {
+            KernelPredicate::DestinationIp(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    fn mac(predicate: &KernelPredicate) -> Option<u32> {
+        match predicate {
+            KernelPredicate::Mac(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn many_rules_share_one_ip_list_fact() {
+        let plan = compile(
+            (0..ROUTING_FACT_CAPACITY + 1)
+                .map(|port| json!({"ip": ["10.0.0.0/8", "2001:db8::/32"], "port": [port.to_string()]}))
+                .collect(),
+        );
+        assert!(fact_ids(&plan, destination).iter().all(|id| *id == 0));
+        assert_eq!(plan.facts.destination_v4.len(), 1);
+        assert_eq!(plan.facts.destination_v4[0].1.bitmap[0], 1);
+        assert_eq!(plan.facts.destination_v6.len(), 1);
+    }
+
+    #[test]
+    fn many_rules_share_one_mac_list_fact() {
+        let plan = compile(
+            (0..ROUTING_FACT_CAPACITY + 1)
+                .map(|port| json!({"mac": ["02:00:00:00:00:01"], "port": [port.to_string()]}))
+                .collect(),
+        );
+        assert!(fact_ids(&plan, mac).iter().all(|id| *id == 0));
+        assert_eq!(plan.facts.mac.len(), 1);
+        assert_eq!(plan.facts.mac[0].1.bitmap[0], 1);
+    }
+
+    #[test]
+    fn distinct_lists_and_negations_keep_separate_bits() {
+        let plan = compile(vec![
+            json!({"ip": ["10.0.0.0/8"]}),
+            json!({"not": {"ip": ["10.0.0.0/8"]}, "port": ["80"]}),
+            json!({"ip": ["10.1.0.0/16"]}),
+            json!({"ip": ["10.1.0.0/16", "10.0.0.0/8"]}),
+            json!({"source_ip": ["10.0.0.0/8"]}),
+        ]);
+        assert_eq!(fact_ids(&plan, destination), [0, 0, 1, 2]);
+        let negated = &plan.rules[1].conditions;
+        assert!(
+            negated
+                .iter()
+                .any(|c| c.not && destination(&c.predicate) == Some(0))
+        );
+        let bits: Vec<_> = plan
+            .facts
+            .destination_v4
+            .iter()
+            .map(|(key, value)| (key.prefix_len, value.bitmap[0]))
+            .collect();
+        assert_eq!(bits, [(8, 0b101), (16, 0b111)]);
+        assert_eq!(plan.facts.source_v4.len(), 1);
+        assert_eq!(plan.facts.source_v4[0].1.bitmap[0], 1);
     }
 }

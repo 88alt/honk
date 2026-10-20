@@ -22,7 +22,7 @@ impl AliveDialerSet {
 }
 
 impl AliveDialerSet {
-    fn same_registration(
+    pub(super) fn same_registration(
         current: Option<&Arc<RegisteredNode>>,
         captured: Option<&Arc<RegisteredNode>>,
     ) -> bool {
@@ -72,6 +72,10 @@ impl AliveDialerSet {
     /// proxy node, validating the status code.
     /// Falls back to raw TCP connect when no prober is set.
     pub async fn probe_node(&self, node_id: Uuid, timeout: Duration) -> bool {
+        let Ok(permit) = self.acquire_health_probe() else {
+            return false;
+        };
+        let cancel = permit.cancellation();
         // block has no liveness to measure.
         if node_id == honk_config::config::BLOCK_NODE_ID {
             return true;
@@ -86,7 +90,14 @@ impl AliveDialerSet {
             let registration = self.registered.read().get(&node_id).cloned();
             let target = self.direct_check_addr.read().clone();
             return self
-                .probe_node_tcp(node_id, "direct", &target, timeout, registration.as_ref())
+                .probe_node_tcp(
+                    node_id,
+                    "direct",
+                    &target,
+                    timeout,
+                    registration.as_ref(),
+                    &cancel,
+                )
                 .await;
         }
         let registered = self.registered.read().get(&node_id).cloned();
@@ -97,7 +108,7 @@ impl AliveDialerSet {
         // Clone the Arc out of the lock before awaiting (parking_lot guard is !Send).
         let prober = self.http_prober.read().clone();
         if let Some(prober) = &prober {
-            self.probe_node_http(node_id, &registered, timeout, prober)
+            self.probe_node_http(node_id, &registered, timeout, prober, &cancel)
                 .await
         } else {
             self.probe_node_tcp(
@@ -106,6 +117,7 @@ impl AliveDialerSet {
                 &registered.address,
                 timeout,
                 Some(&registered),
+                &cancel,
             )
             .await
         }
@@ -119,6 +131,7 @@ impl AliveDialerSet {
         registered: &Arc<RegisteredNode>,
         timeout: Duration,
         prober: &HttpProberRef,
+        cancel: &ProbeCancellation,
     ) -> bool {
         let node_name = registered.name.as_str();
         let check_url = self.check_url.read().clone();
@@ -130,6 +143,7 @@ impl AliveDialerSet {
                     &registered.address,
                     timeout,
                     Some(registered),
+                    cancel,
                 )
                 .await;
         }
@@ -142,6 +156,7 @@ impl AliveDialerSet {
                     &registered.address,
                     timeout,
                     Some(registered),
+                    cancel,
                 )
                 .await;
         };
@@ -200,8 +215,27 @@ impl AliveDialerSet {
             }
 
             let mut family_ok = false;
+            let mut family_failed = false;
             for a in family_addrs {
-                match prober.probe_http(node_name, *a, &check_url, timeout).await {
+                let outcome = prober
+                    .probe_http(node_id, *a, &check_url, timeout, cancel.clone())
+                    .await;
+                if let Some(observation) = outcome.observation {
+                    self.record_health_observation(node_id, Some(registered), observation);
+                }
+                match outcome.result {
+                    HttpProbeResult::Cancelled => {
+                        if family_failed {
+                            self.apply_probe_result(
+                                node_id,
+                                Some(registered),
+                                ProbeDomain::Tcp,
+                                ipver,
+                                None,
+                            );
+                        }
+                        return any_ok;
+                    }
                     HttpProbeResult::WarmSuccess(elapsed) => {
                         tracing::debug!(
                             "HTTP health check succeeded for node '{}' via {} ({}ms)",
@@ -225,6 +259,7 @@ impl AliveDialerSet {
                         return any_ok;
                     }
                     HttpProbeResult::SetupFailure(error) => {
+                        family_failed = true;
                         tracing::debug!(
                             "HTTP health check establishment failed for node '{}' via {}: {}",
                             node_name,
@@ -233,6 +268,7 @@ impl AliveDialerSet {
                         );
                     }
                     HttpProbeResult::ExchangeFailure(error) => {
+                        family_failed = true;
                         tracing::debug!(
                             "HTTP health check warm exchange failed for node '{}' via {}: {}",
                             node_name,
@@ -269,21 +305,30 @@ impl AliveDialerSet {
     /// path: try up to 3 resolved addresses (any family),
     /// first success wins. State is tracked per (tag, url) and never
     /// touches the global six domains.
-    pub async fn probe_node_with_url(
+    pub(super) async fn probe_node_with_url(
         &self,
         tag: &str,
-        leaf: &str,
+        leaf: Uuid,
         url: &str,
         timeout: Duration,
+        native: Option<(GroupProbeContext, Uuid)>,
     ) -> bool {
+        let Ok(permit) = self.acquire_health_probe() else {
+            return false;
+        };
+        let cancel = permit.cancellation();
         // direct/block exemption, same rationale as probe_node. The
         // vacuous success still advances the (tag, url) liveness machine:
         // the tag may carry failures earned by a previous non-builtin leaf,
         // and leaving them would filter this member forever.
-        if matches!(leaf, "direct" | "block") {
+        if matches!(
+            leaf,
+            honk_config::config::DIRECT_NODE_ID | honk_config::config::BLOCK_NODE_ID
+        ) {
             self.mark_url_probe_succeeded(tag, url);
             return true;
         }
+        let registration = self.registered.read().get(&leaf).cloned();
         let prober_opt = self.http_prober.read().clone();
         let Some(ref prober) = prober_opt else {
             return false;
@@ -295,6 +340,9 @@ impl AliveDialerSet {
                 return false;
             }
         };
+        if cancel.is_cancelled() {
+            return false;
+        }
         if addrs.is_empty() {
             tracing::debug!(
                 "Health check found no addresses for '{}' (member '{}')",
@@ -306,8 +354,27 @@ impl AliveDialerSet {
         }
 
         let mut any_ok = false;
+        let mut failed = false;
         for a in addrs.into_iter().take(3) {
-            match prober.probe_http(leaf, a, url, timeout).await {
+            let outcome = prober
+                .probe_http(leaf, a, url, timeout, cancel.clone())
+                .await;
+            if let (Some(observation), Some((context, epoch))) = (outcome.observation, native) {
+                self.record_group_health_observation(
+                    leaf,
+                    registration.as_ref(),
+                    context,
+                    epoch,
+                    observation,
+                );
+            }
+            match outcome.result {
+                HttpProbeResult::Cancelled => {
+                    if failed {
+                        self.record_url_probe_failure(tag, url);
+                    }
+                    return any_ok;
+                }
                 HttpProbeResult::WarmSuccess(elapsed) => {
                     tracing::debug!(
                         "HTTP health check succeeded for member '{}' (leaf '{}') via {} ({}ms, url={})",
@@ -326,6 +393,7 @@ impl AliveDialerSet {
                     return false;
                 }
                 HttpProbeResult::SetupFailure(error) => {
+                    failed = true;
                     tracing::debug!(
                         "HTTP health check establishment failed for member '{}' (leaf '{}') via {} (url={}): {}",
                         tag,
@@ -336,6 +404,7 @@ impl AliveDialerSet {
                     );
                 }
                 HttpProbeResult::ExchangeFailure(error) => {
+                    failed = true;
                     tracing::debug!(
                         "HTTP health check warm exchange failed for member '{}' (leaf '{}') via {} (url={}): {}",
                         tag,
@@ -367,6 +436,7 @@ impl AliveDialerSet {
         node_addr: &str,
         timeout: Duration,
         registration: Option<&Arc<RegisteredNode>>,
+        cancel: &ProbeCancellation,
     ) -> bool {
         let addr = node_addr.to_string();
         let (host, port) = match addr.rsplit_once(':') {
@@ -439,16 +509,31 @@ impl AliveDialerSet {
             let reporter = self.raw_probe_reporter(node_id, ipver);
 
             let start = Instant::now();
-            let result = tokio::time::timeout(
-                timeout,
-                crate::util::connect_marked_addr(
-                    *a,
-                    Some(self.so_mark.unwrap_or_else(crate::util::bypass_mark)),
+            let Some(result) = cancel
+                .run(tokio::time::timeout(
                     timeout,
-                ),
-            )
-            .await;
+                    crate::util::connect_marked_addr(
+                        *a,
+                        Some(self.so_mark.unwrap_or_else(crate::util::bypass_mark)),
+                        timeout,
+                    ),
+                ))
+                .await
+            else {
+                return any_ok;
+            };
             let elapsed = start.elapsed();
+            self.record_health_observation(
+                node_id,
+                registration,
+                HealthObservation::probe(
+                    ProbeDomain::Tcp,
+                    HealthMeasurement::TcpConnect,
+                    ipver,
+                    matches!(&result, Ok(Ok(_))).then_some(elapsed),
+                    std::time::SystemTime::now(),
+                ),
+            );
 
             match result {
                 Ok(Ok(_stream)) => {
@@ -543,12 +628,15 @@ impl AliveDialerSet {
             .await
     }
 
-    async fn probe_node_udp_registered(
+    pub(super) async fn probe_node_udp_registered(
         &self,
         node_id: Uuid,
         timeout: Duration,
         registration: Option<Arc<RegisteredNode>>,
     ) -> bool {
+        let Ok(permit) = self.acquire_health_probe() else {
+            return false;
+        };
         if !Self::same_registration(self.registered.read().get(&node_id), registration.as_ref()) {
             return false;
         }
@@ -573,7 +661,12 @@ impl AliveDialerSet {
             .map(|node| node.name.clone())
             .unwrap_or_else(|| node_id.to_string());
         const IPVERS: [IpVersion; 2] = [IpVersion::V4, IpVersion::V6];
-        let outcome = prober.probe_udp(&node_name, timeout).await;
+        let outcome = prober
+            .probe_udp(node_id, timeout, permit.cancellation())
+            .await;
+        for observation in outcome.observations.into_iter().flatten() {
+            self.record_health_observation(node_id, registration.as_ref(), observation);
+        }
         let measured = |result: Option<anyhow::Result<Duration>>| {
             result.filter(|result| {
                 !result
@@ -681,156 +774,6 @@ impl AliveDialerSet {
         }
     }
 
-    pub async fn run_health_check_cycle(self: &Arc<Self>, timeout: Duration) {
-        self.run_health_check_cycle_concurrent(timeout, 1).await;
-    }
-
-    /// Probe only dead protocol families whose exponential backoff elapsed.
-    /// This runs between full configured health cycles so a long check
-    /// interval cannot turn a transient uplink outage into a long lockout.
-    pub(super) async fn run_recovery_check_cycle_concurrent(
-        self: &Arc<Self>,
-        timeout: Duration,
-        concurrency: usize,
-    ) {
-        let nodes: Vec<_> = self
-            .registered
-            .read()
-            .iter()
-            .map(|(id, node)| (*id, Arc::clone(node)))
-            .collect();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
-        let mut join_set = tokio::task::JoinSet::new();
-
-        for (id, registration) in nodes {
-            if self.is_probe_suspended(id) {
-                continue;
-            }
-            let tcp_due = [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
-                !self.is_alive_for(id, ProbeDomain::Tcp, ipver)
-                    && self.should_probe(id, ProbeDomain::Tcp, ipver)
-            });
-            let udp_due = [ProbeDomain::DataUdp, ProbeDomain::DnsUdp]
-                .into_iter()
-                .any(|domain| {
-                    [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
-                        !self.is_alive_for(id, domain, ipver)
-                            && self.should_probe(id, domain, ipver)
-                    })
-                });
-            if !tcp_due && !udp_due {
-                continue;
-            }
-            let this = self.clone();
-            let permit = semaphore.clone();
-            join_set.spawn(async move {
-                let _permit = permit.acquire().await;
-                if tcp_due {
-                    this.probe_node(id, timeout).await;
-                }
-                if udp_due {
-                    this.probe_node_udp_registered(id, timeout, Some(registration))
-                        .await;
-                }
-            });
-        }
-
-        while join_set.join_next().await.is_some() {}
-    }
-
-    /// Run health check cycle with concurrent probing.
-    ///
-    /// Uses a `JoinSet` with a semaphore to limit concurrency (default 10,
-    /// matching sing-box). Nodes in backoff are skipped; the recovery runner
-    /// revisits due dead nodes between full cycles. Emergency probes triggered
-    /// via `trigger_probe` use their own bounded worker set.
-    pub async fn run_health_check_cycle_concurrent(
-        self: &Arc<Self>,
-        timeout: Duration,
-        concurrency: usize,
-    ) {
-        // Refresh cached check URL IPs at start of each full cycle.
-        // Matches Go's TcpCheckOptionRaw.Reset().
-        self.refresh_check_ips().await;
-
-        let nodes: Vec<_> = self
-            .registered
-            .read()
-            .iter()
-            .map(|(id, node)| (*id, Arc::clone(node)))
-            .collect();
-        if nodes.is_empty() {
-            return;
-        }
-
-        let concurrency = concurrency.max(1);
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
-        let mut join_set = tokio::task::JoinSet::new();
-
-        for (id, registration) in nodes {
-            // URLTest idle suspension: skip nodes whose groups are all idle
-            // (lazy start: never-active groups start suspended).
-            if self.is_probe_suspended(id) {
-                tracing::trace!("Skipping health check for '{}' (URLTest groups idle)", id);
-                continue;
-            }
-            let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
-            let state = self.read_state(id, idx);
-            // Stopped nodes are probed too — on their slow max_cooldown
-            // cadence — so recovery stays reachable (see `should_probe`).
-            if Instant::now() < state.cooldown_until {
-                continue;
-            }
-            let this = self.clone();
-            let permit = semaphore.clone();
-            join_set.spawn(async move {
-                let _p = permit.acquire().await;
-                this.probe_node(id, timeout).await;
-                // UDP data-path probe (Go: UdpCheck) after the TCP probe,
-                // gated on the UDP domain's own backoff so a chronically
-                // broken UDP path backs off exponentially (and eventually
-                // stops) instead of re-probing every cycle. No-op without
-                // an installed UdpProber.
-                if this.should_probe(id, ProbeDomain::DataUdp, IpVersion::V4) {
-                    this.probe_node_udp_registered(id, timeout, Some(registration))
-                        .await;
-                }
-            });
-        }
-
-        while join_set.join_next().await.is_some() {}
-
-        // Per-group custom check URLs (sing-box urltest `url` option):
-        // probe each group's members against its own target. Members are
-        // (tag, leaf) pairs resolved fresh every cycle — for a sub-group
-        // member the probe dials its CURRENT pick, and the result is
-        // recorded under the sub-group's tag (sing-box RealTag semantics),
-        // so nested groups rank correctly even as sub-picks change.
-        for (group, url) in self.group_check_urls() {
-            if self.is_urltest_group_idle(&group) {
-                tracing::trace!(
-                    "Skipping custom-URL health checks for idle group '{}'",
-                    group
-                );
-                continue;
-            }
-            for (tag, leaf) in self.url_members_for(&group) {
-                if !self.should_probe_url(&tag, &url) {
-                    continue;
-                }
-                let this = self.clone();
-                let url = url.clone();
-                let permit = semaphore.clone();
-                join_set.spawn(async move {
-                    let _p = permit.acquire().await;
-                    this.probe_node_with_url(&tag, &leaf, &url, timeout).await;
-                });
-            }
-        }
-
-        while join_set.join_next().await.is_some() {}
-    }
-
     /// Get recent probe history for a node for API/UI consumption.
     ///
     /// Returns the last `MAX_PROBE_HISTORY` probe records for the given
@@ -849,88 +792,5 @@ impl AliveDialerSet {
             .get(&key)
             .cloned()
             .unwrap_or_default()
-    }
-
-    pub fn spawn_health_check_loop(
-        self: &Arc<Self>,
-        interval: Duration,
-        timeout: Duration,
-    ) -> tokio::task::JoinHandle<()> {
-        self.spawn_health_check_loop_concurrent(interval, timeout, 10)
-    }
-
-    /// Spawn periodic, recovery, and emergency probes through bounded worker
-    /// pools. Triggered work is node-deduplicated; full periodic cycles and
-    /// dead-node recovery checks remain independently scheduled.
-    pub fn spawn_health_check_loop_concurrent(
-        self: &Arc<Self>,
-        interval: Duration,
-        timeout: Duration,
-        concurrency: usize,
-    ) -> tokio::task::JoinHandle<()> {
-        let this = self.clone();
-        let mut trigger_rx = self.take_trigger_rx();
-        let concurrency = concurrency.max(1);
-        let mut emergency_workers = tokio::task::JoinSet::new();
-        tokio::spawn(async move {
-            // ── Anti-thundering-herd: stagger the first health check by a
-            // random delay within [0, min(5s, interval/4)] to avoid all
-            // nodes probing the proxy server simultaneously at startup.
-            // Matches Go dae's initialConnectivityCheckJitterWindow logic.
-            let stagger_max = std::cmp::min(interval / 4, std::time::Duration::from_secs(5));
-            if stagger_max > std::time::Duration::ZERO {
-                let jitter_ms =
-                    (rand::random::<u64>() % stagger_max.as_millis().max(1) as u64) as u64;
-                tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
-            }
-
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let recovery_interval = std::cmp::max(
-                std::cmp::min(interval, this.base_cooldown),
-                Duration::from_secs(1),
-            );
-            let mut recovery_ticker = tokio::time::interval(recovery_interval);
-            recovery_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            recovery_ticker.tick().await;
-            loop {
-                tokio::select! {
-                    biased;
-                    Some(result) = emergency_workers.join_next(), if !emergency_workers.is_empty() => {
-                        if let Err(error) = result {
-                            tracing::warn!(?error, "emergency health-check worker panicked");
-                        }
-                    }
-                    node = async {
-                        match trigger_rx.as_mut() {
-                            Some(rx) => rx.recv().await,
-                            None => std::future::pending().await,
-                        }
-                    }, if emergency_workers.len() < concurrency => {
-                        if let Some(id) = node {
-                            {
-                                let mut states = this.states.write();
-                                if let Some(entry) = states.get_mut(&id) {
-                                    for e in entry.iter_mut() {
-                                        e.cooldown_until = Instant::now();
-                                    }
-                                }
-                            }
-                            let this = Arc::clone(&this);
-                            emergency_workers.spawn(async move {
-                                this.probe_node(id, timeout).await;
-                                this.finish_trigger_probe(id);
-                            });
-                        }
-                    }
-                    _ = ticker.tick() => {
-                        this.run_health_check_cycle_concurrent(timeout, concurrency).await;
-                    }
-                    _ = recovery_ticker.tick() => {
-                        this.run_recovery_check_cycle_concurrent(timeout, concurrency).await;
-                    }
-                }
-            }
-        })
     }
 }

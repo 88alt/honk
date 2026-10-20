@@ -1,3 +1,4 @@
+use crate::control::retirement_worker::RetirementWorker;
 use crate::control::udp_endpoint::UdpEndpointPool;
 use crate::control::{ControlPlane, ControlPlaneHandle};
 use crate::dns::{self, DnsResolver};
@@ -14,6 +15,45 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
+
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+pub(super) mod netns;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+pub(super) mod wire;
+
+pub(in crate::control) struct TestRetirement {
+    pub(in crate::control) task: RetirementWorker,
+    pub(in crate::control) fatal: tokio::sync::mpsc::UnboundedReceiver<anyhow::Error>,
+}
+
+impl TestRetirement {
+    pub(in crate::control) fn start(handle: &ControlPlaneHandle) -> Self {
+        let (fatal_tx, fatal) = tokio::sync::mpsc::unbounded_channel();
+        let task = crate::control::spawn_retirement_worker(
+            Arc::clone(&handle.udp_pool),
+            Arc::clone(&handle.ebpf),
+            Arc::clone(&handle.connection_tracker),
+            fatal_tx,
+            Arc::clone(&handle.tcp_flow_pins),
+            Arc::clone(&handle.retirement),
+        );
+        Self { task, fatal }
+    }
+
+    pub(in crate::control) async fn join(
+        mut self,
+        handle: &ControlPlaneHandle,
+    ) -> anyhow::Result<()> {
+        let shutdown = handle.udp_pool.shutdown().await;
+        handle.retirement.sink.lock().take();
+        self.task.await?;
+        anyhow::ensure!(shutdown.joined, "test UDP retirement did not join");
+        if let Ok(error) = self.fatal.try_recv() {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
 
 /// A minimal DNS query payload for "a.com" (A record).
 pub(in crate::control) fn dns_query_payload() -> Vec<u8> {
@@ -103,7 +143,8 @@ pub(in crate::control) enum UdpTestMode {
 struct UdpTestTransport {
     mode: UdpTestMode,
     relay: SocketAddr,
-    replied: std::sync::atomic::AtomicBool,
+    /// Last DNS query sent in a `DnsResponse` mode, answered once by `recv_packet`.
+    sent: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 #[async_trait::async_trait]
@@ -135,6 +176,10 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
                 socket.send_to(_data, self.relay).await?;
                 Ok(())
             }
+            UdpTestMode::DnsResponse { .. } | UdpTestMode::DnsResponseCaptureTarget(_) => {
+                *self.sent.lock().expect("sent query") = Some(_data.to_vec());
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -148,18 +193,14 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
         if matches!(
             self.mode,
             UdpTestMode::DnsResponse { .. } | UdpTestMode::DnsResponseCaptureTarget(_)
-        ) && !self
-            .replied
-            .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            let response = [0x12, 0x34, 0x81, 0x80, 0, 1, 0, 0, 0, 0, 0, 0];
-            buf[..response.len()].copy_from_slice(&response);
-            return Ok((response.len(), self.relay));
-        }
-        if matches!(
-            self.mode,
-            UdpTestMode::DnsResponse { .. } | UdpTestMode::DnsResponseCaptureTarget(_)
         ) {
+            // Echo the query as a NOERROR answer (QR set, question intact).
+            let sent = self.sent.lock().expect("sent query").take();
+            if let Some(mut response) = sent {
+                response[2] |= 0x80;
+                buf[..response.len()].copy_from_slice(&response);
+                return Ok((response.len(), self.relay));
+            }
             return std::future::pending().await;
         }
         Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
@@ -314,7 +355,7 @@ impl honk_outbound::proxy::PacketOutbound for UdpTestHandler {
             _ => Ok(Arc::new(UdpTestTransport {
                 mode: self.mode.clone(),
                 relay: target,
-                replied: std::sync::atomic::AtomicBool::new(false),
+                sent: std::sync::Mutex::new(None),
             })),
         }
     }
@@ -668,3 +709,71 @@ pub(in crate::control) fn score_reload_config(revision: u64) -> Config {
     }];
     config
 }
+
+#[cfg(feature = "native-api")]
+pub(in crate::control) struct NativeFlowApi {
+    pub(in crate::control) flows: Arc<crate::observe::flows::FlowStore>,
+    addr: SocketAddr,
+    client: reqwest::Client,
+    server: crate::native_api::NativeServer,
+}
+
+#[cfg(feature = "native-api")]
+impl NativeFlowApi {
+    pub(in crate::control) async fn new() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut config = Config::default();
+        config.global.nfqueue_enable = false;
+        config.global.store_subscribe = false;
+        config.experimental.native_api.enabled = true;
+        config.experimental.native_api.listen = addr.to_string();
+        config.experimental.native_api.secret = "native-flow-test".into();
+        config.ensure_builtin_nodes();
+        let mut control = control_plane(config);
+        let state = Arc::new(
+            crate::native_api::NativeState::new(
+                &mut control,
+                addr,
+                std::time::SystemTime::now(),
+                std::time::Instant::now(),
+            )
+            .await
+            .unwrap(),
+        );
+        let native = Arc::clone(&state.observation);
+        native.attach_for_test();
+        let flows = Arc::clone(&native.core.flows);
+        Self {
+            flows,
+            addr,
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap(),
+            server: crate::native_api::NativeServer::start(listener, state),
+        }
+    }
+
+    pub(in crate::control) async fn detail(&self, id: &str) -> serde_json::Value {
+        self.client
+            .get(format!("http://{}/api/v1/flows/{id}", self.addr))
+            .bearer_auth("native-flow-test")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    pub(in crate::control) async fn shutdown(self) {
+        self.server.shutdown().await;
+    }
+}
+
+mod quic;
+pub(in crate::control) use quic::{QuicStreamHold, QuicUdpMode, QuicUdpPacket, QuicUdpPeer};

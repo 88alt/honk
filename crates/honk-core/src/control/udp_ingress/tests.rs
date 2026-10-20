@@ -5,6 +5,7 @@ use crate::dns::query::is_exact_dns_query;
 #[test]
 fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
     let meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: Some(addr("0.0.0.0:53")),
         packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
         packet_ifindex: None,
@@ -17,6 +18,7 @@ fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
 #[test]
 fn udp_original_dst_cmsg_takes_precedence_over_other_metadata() {
     let meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: Some(addr("203.0.113.10:4444")),
         packet_dst_ip: Some("198.51.100.10".parse().unwrap()),
         packet_ifindex: None,
@@ -44,6 +46,7 @@ fn udp_original_dst_uses_ipv4_pktinfo_for_exact_dns_query() {
     assert_eq!(packet_dst_ip, Some(std::net::IpAddr::V4(expected_ip)));
 
     let meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: None,
         packet_dst_ip,
         packet_ifindex: None,
@@ -69,6 +72,7 @@ fn udp_original_dst_uses_ipv6_pktinfo_for_exact_dns_query() {
     assert_eq!(packet_dst_ip, Some(std::net::IpAddr::V6(expected_ip)));
 
     let meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: None,
         packet_dst_ip,
         packet_ifindex: None,
@@ -84,6 +88,7 @@ fn udp_original_dst_uses_ipv6_pktinfo_for_exact_dns_query() {
 fn udp_original_dst_uses_non_wildcard_local_fallback() {
     let local_addr = addr("192.0.2.20:5353");
     let meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: None,
         packet_dst_ip: None,
         packet_ifindex: None,
@@ -103,6 +108,7 @@ fn udp_original_dst_uses_non_wildcard_local_fallback() {
 fn udp_original_dst_fails_closed_for_wildcard_local_without_metadata() {
     for local_addr in [addr("0.0.0.0:15000"), addr("[::]:15000")] {
         let meta = UdpRecvMeta {
+            packet_priority: None,
             original_dst_cmsg: None,
             packet_dst_ip: None,
             packet_ifindex: None,
@@ -116,6 +122,7 @@ fn udp_original_dst_fails_closed_for_wildcard_local_without_metadata() {
 #[test]
 fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
     let packet_meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: None,
         packet_dst_ip: Some("198.51.100.53".parse().unwrap()),
         packet_ifindex: None,
@@ -124,6 +131,7 @@ fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
     };
     let local_fallback = addr("192.0.2.20:5353");
     let fallback_meta = UdpRecvMeta {
+        packet_priority: None,
         original_dst_cmsg: None,
         packet_dst_ip: None,
         packet_ifindex: None,
@@ -145,4 +153,90 @@ fn udp_original_dst_does_not_rewrite_non_exact_dns_payloads() {
         assert_eq!(destination.address, local_fallback);
         assert!(destination.validated_dns.is_none());
     }
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn transparent_dns_refusal_records_flow_evidence_without_dns_log() {
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api_listener.local_addr().unwrap();
+    let mut config = honk_config::Config::default();
+    config.global.nfqueue_enable = false;
+    config.global.store_subscribe = false;
+    config.experimental.native_api.enabled = true;
+    config.experimental.native_api.record_dns_log = false;
+    config.experimental.native_api.listen = api_addr.to_string();
+    config.experimental.native_api.secret = "refusal-flow-test".into();
+    config.ensure_builtin_nodes();
+    let mut plane = crate::control::tests::support::control_plane(config);
+    let state = Arc::new(
+        crate::native_api::NativeState::new(
+            &mut plane,
+            api_addr,
+            std::time::SystemTime::now(),
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap(),
+    );
+    let native = Arc::clone(&state.observation);
+    let api_server = crate::native_api::NativeServer::start(api_listener, state);
+    native.attach_for_test();
+    let loop_state = UdpLoopState::new(&plane, false);
+    let _held: Vec<_> = (0..2048)
+        .map(|_| plane.dns_controller.try_admit_query(false).unwrap())
+        .collect();
+
+    let query = dns_query_payload();
+    let work = begin_udp_dns_query(
+        &plane.dns_controller,
+        &plane.stats,
+        DatagramPayload::Borrowed(&query),
+        validate_exact_dns_query(&query).unwrap(),
+    );
+    assert!(matches!(work, UdpSlowPathWork::DnsRefused { .. }));
+    loop_state.spawn_work(addr("127.0.0.1:40000"), addr("127.0.0.1:53"), work);
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let steps = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let page: serde_json::Value = client
+                .get(format!("http://{api_addr}/api/v1/flows"))
+                .bearer_auth("refusal-flow-test")
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if let Some(flow) = page["flows"]
+                .as_array()
+                .and_then(|flows| flows.first())
+                .filter(|flow| flow["state"] == "closed")
+            {
+                let detail: serde_json::Value = client
+                    .get(format!(
+                        "http://{api_addr}/api/v1/flows/{}",
+                        flow["id"].as_str().unwrap()
+                    ))
+                    .bearer_auth("refusal-flow-test")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                break detail["trace"]["steps"].as_array().unwrap().clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(steps.iter().any(|step| {
+        step["stage"] == "dns"
+            && step["data"]["status"] == "rejected"
+            && step["data"]["error"] == "admission_refused"
+    }));
+    api_server.shutdown().await;
 }

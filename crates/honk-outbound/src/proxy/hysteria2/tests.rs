@@ -669,7 +669,10 @@ fn test_udp_message_codec_roundtrip() {
     assert_eq!(msg.packet_id, 42);
     assert_eq!(msg.frag_total, 1);
     assert_eq!(msg.frag_id, 0);
-    assert_eq!(msg.addr, "8.8.8.8:53");
+    assert_eq!(
+        msg.addr,
+        super::super::addr::SocksAddr::new("8.8.8.8:53".parse().unwrap(), None).unwrap()
+    );
     assert_eq!(msg.data, b"payload");
 }
 
@@ -684,12 +687,25 @@ fn test_fragmentation_and_defrag() {
     let mut out = None;
     for pkt in frags.iter().rev() {
         let msg = decode_udp_message(pkt).unwrap();
-        assert_eq!(msg.addr, "8.8.8.8:53");
+        let peer = "8.8.8.8:53".parse().unwrap();
+        assert_eq!(
+            msg.addr,
+            super::super::addr::SocksAddr::new(peer, None).unwrap()
+        );
         out = defrag
-            .feed(msg.packet_id, msg.frag_id, msg.frag_total, msg.data)
+            .feed(
+                msg.packet_id,
+                msg.frag_id,
+                msg.frag_total,
+                Some(peer),
+                msg.data,
+            )
             .or(out);
     }
-    assert_eq!(out.expect("reassembled payload"), data);
+    assert_eq!(
+        out.expect("reassembled payload"),
+        (data, "8.8.8.8:53".parse().unwrap())
+    );
 }
 
 #[test]
@@ -843,6 +859,74 @@ async fn test_first_read_sends_tcp_request_and_reports_response_error() {
     );
 }
 
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn observed_target_requires_deferred_request_and_positive_response() {
+    use crate::runtime::flow_observation::{FlowContext, FlowEvent, FlowObserver};
+    for status in [0, 1] {
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let observer = FlowObserver::new(
+            FlowContext {
+                flow_id: uuid::Uuid::new_v4(),
+                generation: 1,
+                attempt_id: None,
+                lookup_id: None,
+                dns_purpose: "proxy_server",
+            },
+            {
+                let events = Arc::clone(&events);
+                Arc::new(move |_, event| events.lock().push(event))
+            },
+        );
+        let address = start_server_with_response(TEST_PASSWORD, Duration::ZERO, status).await;
+        let node = test_node(address.port(), TEST_PASSWORD);
+        let mut stream = observer
+            .scope(Hysteria2Handler::new().dial(
+                &node,
+                "93.184.216.34:80".parse().unwrap(),
+                None,
+                Duration::from_secs(2),
+            ))
+            .await
+            .unwrap();
+        assert!(!events.lock().iter().any(|event| matches!(
+            event,
+            FlowEvent::Milestone {
+                milestone: crate::runtime::flow_observation::Milestone::TargetRequestSent
+                    | crate::runtime::flow_observation::Milestone::TargetConfirmed
+            }
+        )));
+        // I/O is deliberately outside the dial scope: the exclusive stream owns its evidence.
+        stream.stream.write_all(b"x").await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), stream.stream.read_u8())
+            .await
+            .unwrap();
+        if status == 0 {
+            assert_eq!(reply.unwrap(), b'x');
+        } else {
+            assert_eq!(reply.unwrap_err().kind(), io::ErrorKind::ConnectionRefused);
+        }
+        let milestones: Vec<_> = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                FlowEvent::Milestone { milestone } if milestone.as_str().starts_with("target_") => {
+                    Some(milestone.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            milestones,
+            if status == 0 {
+                vec!["target_request_sent", "target_confirmed"]
+            } else {
+                vec!["target_request_sent"]
+            }
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_dial_tcp_domain_echo() {
     let server_addr = start_server(TEST_PASSWORD).await;
@@ -933,8 +1017,7 @@ async fn udp_carrier_close_is_node_failure() {
         .await
         .unwrap();
     let endpoint =
-        crate::quic::packet_transport_endpoint(Arc::clone(&transport), transport.relay_addr())
-            .unwrap();
+        crate::quic::packet_transport_endpoint(transport.clone(), transport.relay_addr()).unwrap();
     let (conn, _) = client.connection(timeout).await.unwrap();
     conn.close(quinn::VarInt::from_u32(0), b"carrier closed");
     let error = transport.send_packet(b"query").await.unwrap_err();
@@ -1471,3 +1554,5 @@ fn test_hop_state_rotation() {
     }
     assert!(seen.len() > 1, "hops should visit multiple ports: {seen:?}");
 }
+
+mod source_udp;

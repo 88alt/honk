@@ -1,5 +1,10 @@
 use super::*;
+pub(super) mod closure;
 
+#[cfg(feature = "native-api")]
+mod native_flow_tests;
+
+mod reclamation;
 mod score;
 
 fn transport(
@@ -157,7 +162,7 @@ async fn recv_and_ack(
     assert!(pool.complete_removal(
         removal.client,
         removal.dst,
-        removal.decision_token,
+        removal.owner,
         removal.generation,
     ));
     Some(removal)
@@ -171,7 +176,7 @@ fn try_recv_and_ack(
     assert!(pool.complete_removal(
         removal.client,
         removal.dst,
-        removal.decision_token,
+        removal.owner,
         removal.generation,
     ));
     Ok(removal)
@@ -209,7 +214,7 @@ async fn run_endpoint_driver(
     first: QueuedDatagram,
     first_ack: oneshot::Sender<io::Result<()>>,
 ) -> io::Result<()> {
-    let outbound_tracker = stats.outbound_tracker(&outbound_name);
+    let outbound_tracker = stats.outbound_tracker(&outbound_name, crate::stats::OutboundKind::Node);
     super::run_endpoint_driver(
         UdpDriverContext {
             endpoint,
@@ -612,6 +617,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
         dst,
         b"first",
         Some(RawDnsRoute::Group("alpha")),
+        UdpFlowOwner::new(0, None).unwrap(),
         expected_epoch,
         permit(),
         queue_now(),
@@ -627,6 +633,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
             dst,
             b"wrong group",
             Some(RawDnsRoute::Group("beta")),
+            UdpFlowOwner::new(0, None).unwrap(),
             expected_epoch,
             permit(),
             queue_now(),
@@ -640,6 +647,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
             dst,
             b"ordinary",
             None,
+            UdpFlowOwner::new(0, None).unwrap(),
             expected_epoch,
             permit(),
             queue_now(),
@@ -653,6 +661,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
             dst,
             b"same group",
             Some(RawDnsRoute::Group("alpha")),
+            UdpFlowOwner::new(0, None).unwrap(),
             expected_epoch,
             permit(),
             queue_now(),
@@ -668,6 +677,7 @@ fn initializing_raw_dns_owner_and_epoch_must_match_before_enqueue() {
             dst,
             b"crossed reload",
             Some(RawDnsRoute::Group("alpha")),
+            UdpFlowOwner::new(0, None).unwrap(),
             expected_epoch,
             permit(),
             queue_now(),
@@ -691,6 +701,7 @@ fn ready_raw_dns_owner_survives_epoch_but_rejects_other_owners() {
         dst,
         b"first",
         Some(RawDnsRoute::Group("alpha")),
+        UdpFlowOwner::new(0, None).unwrap(),
         expected_epoch,
         permit,
         queue_now(),
@@ -736,6 +747,7 @@ fn raw_direct_dns_mark_is_part_of_initializing_and_ready_identity() {
         dst,
         b"first",
         Some(RawDnsRoute::Direct(0x200)),
+        UdpFlowOwner::new(0, None).unwrap(),
         pool.initialization_epoch(),
         permit(),
         queue_now(),
@@ -751,6 +763,7 @@ fn raw_direct_dns_mark_is_part_of_initializing_and_ready_identity() {
                 dst,
                 b"wrong mark",
                 Some(owner),
+                UdpFlowOwner::new(0, None).unwrap(),
                 pool.initialization_epoch(),
                 permit(),
                 queue_now(),
@@ -900,12 +913,27 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
         ),
         EndpointReservation::QueueClosed
     ));
-    assert!(!pool.complete_removal(client, dst, 78, generation));
-    assert!(!pool.complete_removal(client, dst, 77, generation + 1));
+    assert!(!pool.complete_removal(
+        client,
+        dst,
+        UdpFlowOwner::new(78, None).unwrap(),
+        generation
+    ));
+    assert!(!pool.complete_removal(
+        client,
+        dst,
+        UdpFlowOwner::new(77, None).unwrap(),
+        generation + 1
+    ));
     let removal = removed_rx.try_recv().unwrap();
-    assert_eq!(removal.decision_token, 77);
+    assert_eq!(removal.owner.token, 77);
     assert_eq!(removal.generation, generation);
-    assert!(pool.complete_removal(client, dst, 77, generation));
+    assert!(pool.complete_removal(
+        client,
+        dst,
+        UdpFlowOwner::new(77, None).unwrap(),
+        generation
+    ));
 
     let replacement = match pool.reserve_or_enqueue(
         client,
@@ -918,16 +946,171 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
         _ => panic!("acknowledged tombstone must allow replacement"),
     };
     assert_ne!(replacement.generation(), generation);
-    assert!(!pool.complete_removal(client, dst, 77, generation));
+    assert!(!pool.complete_removal(
+        client,
+        dst,
+        UdpFlowOwner::new(77, None).unwrap(),
+        generation
+    ));
     assert!(replacement.still_initializing());
     drop(replacement);
     let replacement_removal = removed_rx.try_recv().unwrap();
     assert!(pool.complete_removal(
         replacement_removal.client,
         replacement_removal.dst,
-        replacement_removal.decision_token,
+        replacement_removal.owner,
         replacement_removal.generation,
     ));
+}
+
+#[test]
+fn udp_kernel_incarnation_survives_ready_and_dirty_retirement() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = StatsManager::new();
+    let client = make_addr("10.0.0.1", 12345);
+    let first_dst = make_addr("8.8.8.8", 443);
+    let second_dst = make_addr("8.8.4.4", 443);
+    let (tx, mut rx) = mpsc::channel(1);
+    pool.set_remove_sink(tx);
+    for (dst, incarnation, ready) in [(first_dst, 41, true), (second_dst, 42, false)] {
+        let mut lease = match pool.reserve_or_enqueue_at(
+            client,
+            dst,
+            b"first",
+            None,
+            UdpFlowOwner::new(0, Some(incarnation)).unwrap(),
+            pool.initialization_epoch(),
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            queue_now(),
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("fresh ordinary incarnation must reserve"),
+        };
+        assert_eq!(lease.owner().incarnation(), Some(incarnation));
+        if ready {
+            let endpoint =
+                driver_test_endpoint(Arc::new(ScriptedPacketTransport::new(dst, [])), dst);
+            assert!(lease.commit_ready(endpoint));
+            assert_eq!(
+                pool.endpoints
+                    .get(&lease.key)
+                    .unwrap()
+                    .owner()
+                    .incarnation(),
+                Some(incarnation)
+            );
+            pool.remove(client, dst);
+        }
+        drop(lease);
+    }
+    let first = rx.try_recv().unwrap();
+    assert_eq!(first.owner.incarnation(), Some(41));
+    assert_eq!(first.owner.token, 0);
+    assert!(!pool.complete_removal(
+        client,
+        first_dst,
+        UdpFlowOwner::new(0, Some(42)).unwrap(),
+        first.generation,
+    ));
+    pool.finish_removal(&first, true);
+    pool.flush_removal_dirty();
+    let second = rx.try_recv().unwrap();
+    assert_eq!(second.owner.incarnation(), Some(42));
+    assert_eq!(second.owner.token, 0);
+    pool.finish_removal(&second, true);
+    assert!(pool.endpoints.is_empty());
+}
+
+#[test]
+fn stateless_udp_retirement_has_no_kernel_flow_identity() {
+    for (client_port, dst_port) in [(12345, 53), (53, 443)] {
+        let pool = Arc::new(UdpEndpointPool::new());
+        let stats = StatsManager::new();
+        let client = make_addr("10.0.0.1", client_port);
+        let dst = make_addr("8.8.8.8", dst_port);
+        let (tx, mut rx) = mpsc::channel(1);
+        pool.set_remove_sink(tx);
+        assert!(matches!(
+            pool.reserve_or_enqueue_at(
+                client,
+                dst,
+                b"malformed DNS",
+                None,
+                UdpFlowOwner::new(0, Some(41)).unwrap(),
+                pool.initialization_epoch(),
+                Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+                queue_now(),
+                &stats,
+            ),
+            EndpointReservation::IdentityMismatch
+        ));
+        let lease = match pool.reserve_or_enqueue_at(
+            client,
+            dst,
+            b"malformed DNS",
+            None,
+            UdpFlowOwner::new(0, None).unwrap(),
+            pool.initialization_epoch(),
+            Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            queue_now(),
+            &stats,
+        ) {
+            EndpointReservation::Initializing(lease) => lease,
+            _ => panic!("stateless UDP must reserve without conn-state authority"),
+        };
+        assert_eq!(lease.owner().incarnation(), None);
+        drop(lease);
+        let removal = rx.try_recv().unwrap();
+        assert_eq!(removal.owner.incarnation(), None);
+        assert_eq!(removal.reason, RemovalReason::RawDnsEndpointRetired);
+        pool.finish_removal(&removal, true);
+    }
+}
+
+#[test]
+fn source53_staged_udp_keeps_token_and_incarnation_proof() {
+    let pool = Arc::new(UdpEndpointPool::new());
+    let stats = StatsManager::new();
+    let client = make_addr("10.0.0.1", 53);
+    let dst = make_addr("8.8.8.8", 443);
+    let (tx, mut rx) = mpsc::channel(1);
+    pool.set_remove_sink(tx);
+    let permit = || Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+    let lease = match pool.reserve_owned_or_enqueue_at(
+        client,
+        dst,
+        Bytes::from_static(b"first"),
+        UdpFlowOwner::new(47, Some(41)).unwrap(),
+        None,
+        permit(),
+        std::time::Instant::now(),
+        &stats,
+    ) {
+        EndpointReservation::Initializing(lease) => lease,
+        _ => panic!("staged source53 must retain its proven ownership"),
+    };
+    for (token, incarnation) in [(48, Some(41)), (47, Some(42)), (47, None)] {
+        assert!(matches!(
+            pool.reserve_owned_or_enqueue_at(
+                client,
+                dst,
+                Bytes::from_static(b"foreign"),
+                UdpFlowOwner::new(token, incarnation).unwrap(),
+                Some(lease.generation()),
+                permit(),
+                std::time::Instant::now(),
+                &stats,
+            ),
+            EndpointReservation::IdentityMismatch
+        ));
+    }
+    drop(lease);
+    let removal = rx.try_recv().unwrap();
+    assert_eq!(removal.owner.token, 47);
+    assert_eq!(removal.owner.incarnation(), Some(41));
+    assert_eq!(removal.reason, RemovalReason::UserspaceEndpointRetired);
+    pool.finish_removal(&removal, true);
 }
 
 #[test]
@@ -954,7 +1137,7 @@ fn udp_kernel_handoff_preserves_terminal_identity_until_ack() {
     assert!(lease.commit_kernel_handoff());
     let removal = removed_rx.try_recv().unwrap();
     assert_eq!(removal.reason, RemovalReason::KernelHandoff);
-    assert_eq!(removal.decision_token, 91);
+    assert_eq!(removal.owner.token, 91);
     assert_eq!(removal.generation, generation);
     assert!(matches!(
         pool.reserve_owned_or_enqueue(
@@ -968,7 +1151,7 @@ fn udp_kernel_handoff_preserves_terminal_identity_until_ack() {
         ),
         EndpointReservation::QueueClosed
     ));
-    assert!(pool.complete_removal(client, dst, 91, generation));
+    assert!(pool.complete_removal(client, dst, removal.owner, generation));
 }
 
 #[tokio::test]
@@ -1002,7 +1185,7 @@ async fn udp_exact_retirement_cancels_matching_initializer() {
     assert!(pool.complete_removal(
         removal.client,
         removal.dst,
-        removal.decision_token,
+        removal.owner,
         removal.generation,
     ));
     drop(lease);
@@ -1351,40 +1534,6 @@ async fn udp_init_lease_commit_before_cancellation_keeps_ready_endpoint() {
     pool.remove(client, dst);
 }
 
-#[test]
-fn udp_init_lease_drop_notifies_registered_tracker_once() {
-    let pool = Arc::new(UdpEndpointPool::new());
-    let stats = StatsManager::new();
-    let client = make_addr("10.0.0.1", 12345);
-    let dst = make_addr("8.8.8.8", 53);
-    let (removed_tx, mut removed_rx) = tokio::sync::mpsc::channel(16);
-    pool.set_remove_sink(removed_tx);
-    let first_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
-    let lease = match pool.reserve_or_enqueue(client, dst, b"first", first_permit, &stats) {
-        EndpointReservation::Initializing(lease) => lease,
-        _ => panic!("first reservation must initialize"),
-    };
-    assert!(lease.set_tracker_id("tracker-before-commit".to_owned()));
-
-    drop(lease);
-
-    assert_eq!(
-        try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
-        EndpointRemoval {
-            client,
-            dst,
-            decision_token: 0,
-            generation: 1,
-            conn_id: Some("tracker-before-commit".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
-        }
-    );
-    assert!(matches!(
-        removed_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
-}
-
 #[tokio::test]
 async fn udp_init_lease_abort_and_panic_release_generation_for_reuse() {
     let pool = Arc::new(UdpEndpointPool::new());
@@ -1466,7 +1615,7 @@ async fn udp_ready_endpoint_survives_ordinary_reload_cancellation() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "test-node".to_owned(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -1536,7 +1685,8 @@ async fn local_reply_failures_do_not_become_upstream_failures() {
                     client_dst: relay,
                     alive_set: Arc::clone(&alive),
                     stats: Arc::clone(&stats),
-                    outbound_tracker: stats.outbound_tracker("test-node"),
+                    outbound_tracker: stats
+                        .outbound_tracker("test-node", crate::stats::OutboundKind::Node),
                     health_family: honk_outbound::alive::IpVersion::V4,
                 },
                 UdpDriverStart {
@@ -1654,8 +1804,8 @@ async fn udp_endpoint_reply_sources_follow_target_policy() {
             queue_rx,
             reply_socket,
             Arc::new(honk_outbound::alive::AliveDialerSet::new()),
-            stats,
-            "test-node".to_owned(),
+            Arc::clone(&stats),
+            stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
         );
         driver.wait_ready().await.unwrap();
         assert!(lease.commit_ready(endpoint));
@@ -1679,7 +1829,7 @@ async fn udp_endpoint_reply_sources_follow_target_policy() {
             assert_eq!(factory.created(), vec![source_a, source_b]);
         }
         driver.abort();
-        assert!(pool.shutdown().await);
+        assert!(pool.shutdown().await.joined);
     }
 }
 
@@ -2122,7 +2272,6 @@ async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let endpoint = driver_test_endpoint(transport, relay);
     endpoint.set_tracker("idle-tracker".to_owned());
-    assert!(lease.set_tracker_id("idle-tracker".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -2134,7 +2283,7 @@ async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
         test_reply_socket().await,
         Arc::clone(&alive),
         Arc::clone(&stats),
-        "test-node".to_owned(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(endpoint));
@@ -2148,10 +2297,10 @@ async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
         Some(EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
             conn_id: Some("idle-tracker".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
     assert!(pool.is_empty());
@@ -2187,7 +2336,9 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("shutdown fixture must initialize"),
     };
-    lease.set_connection_guard(stats.track_connection("shutdown-node"));
+    lease.set_connection_guard(
+        stats.track_connection("shutdown-node", crate::stats::OutboundKind::Node),
+    );
     let transport = Arc::new(ScriptedPacketTransport::with_receive_actions(
         relay,
         [DriverSendAction::Ok],
@@ -2195,7 +2346,6 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
     ));
     let endpoint = driver_test_endpoint(transport, relay);
     endpoint.set_tracker("shutdown-tracker".to_owned());
-    assert!(lease.set_tracker_id("shutdown-tracker".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -2207,7 +2357,7 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         test_reply_socket().await,
         Arc::clone(&alive),
         Arc::clone(&stats),
-        "shutdown-node".to_owned(),
+        stats.outbound_tracker("shutdown-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -2223,7 +2373,9 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         let closed = removed_rx.recv().await;
         (removal, closed)
     });
-    assert!(pool.shutdown().await);
+    let shutdown = pool.shutdown().await;
+    assert!(shutdown.joined);
+    assert!(shutdown.graceful);
     let (removal, removal_channel_closed) = removal_ack.await.unwrap();
 
     assert!(pool.is_terminal());
@@ -2245,10 +2397,10 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         Some(EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
             conn_id: Some("shutdown-tracker".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
     assert_eq!(removal_channel_closed, None);
@@ -2284,8 +2436,9 @@ async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("stuck initializer fixture must initialize"),
     };
-    lease.set_connection_guard(stats.track_connection("stuck-initializer"));
-    assert!(lease.set_tracker_id("stuck-tracker".to_owned()));
+    lease.set_connection_guard(
+        stats.track_connection("stuck-initializer", crate::stats::OutboundKind::Node),
+    );
     assert!(pool.spawn_slow_path(async move {
         std::future::pending::<()>().await;
         drop(lease);
@@ -2300,7 +2453,9 @@ async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
         let closed = removed_rx.recv().await;
         (removal, closed)
     });
-    assert!(pool.shutdown().await);
+    let shutdown = pool.shutdown().await;
+    assert!(shutdown.joined);
+    assert!(!shutdown.graceful);
     let (removal, removal_channel_closed) = removal_ack.await.unwrap();
 
     assert_eq!(pool.slow_task_count(), 0);
@@ -2312,10 +2467,10 @@ async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
         Some(EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("stuck-tracker".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            conn_id: None,
+            reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
     assert_eq!(removal_channel_closed, None);
@@ -2366,7 +2521,6 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
         let endpoint = driver_test_endpoint(transport, relay);
         endpoint.record_pending_reply_peer(relay);
         endpoint.set_tracker("receive-tracker".to_owned());
-        assert!(lease.set_tracker_id("receive-tracker".to_owned()));
         let queue_rx = lease.take_queue_receiver().unwrap();
         let mut driver = pool.spawn_driver(
             client,
@@ -2378,7 +2532,7 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
             test_reply_socket().await,
             Arc::clone(&alive),
             Arc::clone(&stats),
-            "test-node".to_owned(),
+            stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
         );
         driver.wait_ready().await.unwrap();
         assert!(lease.commit_ready(endpoint));
@@ -2390,10 +2544,10 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
             Some(EndpointRemoval {
                 client,
                 dst,
-                decision_token: 0,
+                owner: UdpFlowOwner::new(0, None).unwrap(),
                 generation: 1,
                 conn_id: Some("receive-tracker".to_owned()),
-                reason: RemovalReason::UserspaceEndpointRetired,
+                reason: RemovalReason::RawDnsEndpointRetired,
             })
         );
         assert!(pool.is_empty());
@@ -2446,7 +2600,6 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
     ));
     let endpoint = driver_test_endpoint(Arc::clone(&transport), relay);
     endpoint.set_tracker("blocked-receive-tracker".to_owned());
-    assert!(lease.set_tracker_id("blocked-receive-tracker".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -2458,7 +2611,7 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "test-node".to_owned(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(endpoint));
@@ -2472,10 +2625,10 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
         Some(EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
             conn_id: Some("blocked-receive-tracker".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
     assert!(pool.is_empty());
@@ -2596,7 +2749,7 @@ async fn udp_driver_scores_transport_failure_before_synchronous_node_retirement(
             test_reply_socket().await,
             Arc::clone(&alive),
             Arc::clone(&stats),
-            "failed".to_owned(),
+            stats.outbound_tracker("failed", crate::stats::OutboundKind::Node),
         );
         driver.wait_ready().await.unwrap();
         assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -2650,7 +2803,6 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
     ));
     let endpoint = driver_test_endpoint(transport, relay);
     endpoint.set_tracker("worker-tracker".to_owned());
-    assert!(lease.set_tracker_id("worker-tracker".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -2662,7 +2814,7 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "test-node".to_owned(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(endpoint));
@@ -2676,10 +2828,10 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
         Some(EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
             conn_id: Some("worker-tracker".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
     tokio::task::yield_now().await;
@@ -2704,8 +2856,9 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("panic fixture must initialize"),
     };
-    lease.set_connection_guard(stats.track_connection("driver-node"));
-    assert!(lease.set_tracker_id("panic-tracker".to_owned()));
+    lease.set_connection_guard(
+        stats.track_connection("driver-node", crate::stats::OutboundKind::Node),
+    );
     let transport = Arc::new(ScriptedPacketTransport::new(
         relay,
         [DriverSendAction::Panic],
@@ -2723,7 +2876,7 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "driver-node".to_owned(),
+        stats.outbound_tracker("driver-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -2738,10 +2891,10 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
         Some(EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
             conn_id: Some("panic-tracker".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
     assert!(pool.is_empty());
@@ -2776,8 +2929,9 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
         EndpointReservation::Initializing(lease) => lease,
         _ => panic!("abort fixture must initialize"),
     };
-    lease.set_connection_guard(stats.track_connection("driver-node"));
-    assert!(lease.set_tracker_id("abort-tracker".to_owned()));
+    lease.set_connection_guard(
+        stats.track_connection("driver-node", crate::stats::OutboundKind::Node),
+    );
     let transport = Arc::new(ScriptedPacketTransport::new(relay, [DriverSendAction::Ok]));
     let endpoint = driver_test_endpoint(transport, relay);
     endpoint.set_tracker("abort-tracker".to_owned());
@@ -2792,7 +2946,7 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "driver-node".to_owned(),
+        stats.outbound_tracker("driver-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(Arc::clone(&endpoint)));
@@ -2808,10 +2962,10 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
         Some(EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
             conn_id: Some("abort-tracker".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         })
     );
     assert!(pool.is_empty());
@@ -2859,7 +3013,6 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
     ));
     let old_endpoint = driver_test_endpoint(old_transport.clone(), relay);
     old_endpoint.set_tracker("old-tracker".to_owned());
-    assert!(old_lease.set_tracker_id("old-tracker".to_owned()));
     let old_queue_rx = old_lease.take_queue_receiver().unwrap();
     let mut old_driver = pool.spawn_driver(
         client,
@@ -2871,7 +3024,7 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "test-node".to_owned(),
+        stats.outbound_tracker("test-node", crate::stats::OutboundKind::Node),
     );
     old_driver.wait_ready().await.unwrap();
     assert!(old_lease.commit_ready(old_endpoint));
@@ -2884,10 +3037,10 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
         EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
             conn_id: Some("old-tracker".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
     let replacement_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
@@ -2937,10 +3090,10 @@ async fn udp_endpoint_node_death_before_dial_sends_nothing() {
         EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
             conn_id: None,
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
     assert!(pool.is_empty());
@@ -2985,7 +3138,6 @@ async fn udp_endpoint_node_death_during_dial_sends_nothing() {
         _ => panic!("death-during-dial fixture must initialize"),
     };
     assert!(lease.bind_selected_node(DEAD_NODE_ID));
-    assert!(lease.set_tracker_id("during-dial".to_owned()));
     // Death arrives while dial would be in flight.
     pool.remove_by_node(DEAD_NODE_ID);
     assert!(!lease.still_initializing());
@@ -2994,10 +3146,10 @@ async fn udp_endpoint_node_death_during_dial_sends_nothing() {
         EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("during-dial".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            conn_id: None,
+            reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
 
@@ -3041,8 +3193,6 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
         relay,
         DEAD_NODE_ID,
     ));
-    endpoint.set_tracker("before-commit".to_owned());
-    assert!(lease.set_tracker_id("before-commit".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -3054,7 +3204,7 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "dead-node".to_owned(),
+        stats.outbound_tracker("dead-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
 
@@ -3066,10 +3216,10 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
         EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
-            conn_id: Some("before-commit".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            conn_id: None,
+            reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
     assert!(pool.is_empty());
@@ -3107,7 +3257,6 @@ async fn udp_endpoint_node_death_before_driver_start_sends_nothing() {
     let proxy_socket: Arc<dyn honk_outbound::proxy::PacketTransport> = transport.clone();
     let endpoint = Arc::new(UdpEndpoint::new(proxy_socket, relay, DEAD_NODE_ID));
     endpoint.set_tracker("dead-before-start".to_owned());
-    assert!(lease.set_tracker_id("dead-before-start".to_owned()));
     let queue_rx = lease.take_queue_receiver().unwrap();
     let mut driver = pool.spawn_driver(
         client,
@@ -3119,7 +3268,7 @@ async fn udp_endpoint_node_death_before_driver_start_sends_nothing() {
         test_reply_socket().await,
         Arc::new(honk_outbound::alive::AliveDialerSet::new()),
         Arc::clone(&stats),
-        "dead-node".to_owned(),
+        stats.outbound_tracker("dead-node", crate::stats::OutboundKind::Node),
     );
     driver.wait_ready().await.unwrap();
     assert!(lease.commit_ready(endpoint));
@@ -3130,10 +3279,10 @@ async fn udp_endpoint_node_death_before_driver_start_sends_nothing() {
         EndpointRemoval {
             client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
             conn_id: Some("dead-before-start".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
     assert!(pool.is_empty(), "acknowledged node death must remove Ready");
@@ -3243,10 +3392,10 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
         EndpointRemoval {
             client: node_client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 1,
             conn_id: Some("node-tracker".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
 
@@ -3271,10 +3420,10 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
         EndpointRemoval {
             client: janitor_client,
             dst,
-            decision_token: 0,
+            owner: UdpFlowOwner::new(0, None).unwrap(),
             generation: 2,
             conn_id: Some("janitor-tracker".to_owned()),
-            reason: RemovalReason::UserspaceEndpointRetired,
+            reason: RemovalReason::RawDnsEndpointRetired,
         }
     );
     assert!(matches!(
