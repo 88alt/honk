@@ -141,6 +141,12 @@ pub(super) struct HealthHistory {
     epoch: Option<Uuid>,
 }
 
+/// An earlier wall time is a stale completion, unless the retained sample is
+/// itself in the future: the clock stepped back since it was taken.
+fn stale(observation: &HealthObservation, retained: &HealthObservation) -> bool {
+    observation.observed_at < retained.observed_at && retained.observed_at <= SystemTime::now()
+}
+
 impl HealthObservation {
     pub fn probe(
         domain: ProbeDomain,
@@ -299,11 +305,11 @@ impl AliveDialerSet {
             .iter_mut()
             .find(|old| old.observation.same_key(&observation))
         {
-            if observation.observed_at < previous.observation.observed_at {
+            if stale(&observation, &previous.observation) {
                 return false;
             }
             // A replay at the same instant must not weigh twice.
-            if observation.observed_at > previous.observation.observed_at
+            if observation.observed_at != previous.observation.observed_at
                 && let Some(latency) = observation.latency
             {
                 previous.averages.fold(latency);
@@ -396,21 +402,20 @@ impl AliveDialerSet {
             observation,
         };
         // ponytail: at most 4096 fixed-size group tuples; add an index only if probe cost warrants it.
-        if let Some(old) = retained.groups.iter_mut().find(|old| {
+        if let Some(index) = retained.groups.iter().position(|old| {
             old.group_id == context.group_id
                 && old.member_id == context.member_id
                 && old.observation.same_key(&observation)
         }) {
-            if observation.observed_at < old.observation.observed_at {
+            if stale(&observation, &retained.groups[index].observation) {
                 return false;
             }
-            *old = sample;
-        } else {
-            if retained.groups.len() == 4096 {
-                retained.groups.pop_front();
-            }
-            retained.groups.push_back(sample);
+            // Requeue so eviction follows recency, not first insertion.
+            retained.groups.remove(index);
+        } else if retained.groups.len() == 4096 {
+            retained.groups.pop_front();
         }
+        retained.groups.push_back(sample);
         true
     }
 }
@@ -544,6 +549,68 @@ mod tests {
         assert_eq!(
             set.group_health_observations(context.group_id)[0].observation,
             sample()
+        );
+    }
+
+    #[test]
+    fn a_backward_clock_step_does_not_freeze_retention() {
+        let set = AliveDialerSet::new();
+        let node = Uuid::from_u128(1);
+        set.enable_health_history();
+        set.register_node(node, "node".into(), "127.0.0.1:1".into());
+        let context = GroupProbeContext {
+            group_id: Uuid::from_u128(2),
+            member_id: node,
+        };
+        let at = |observed_at| HealthObservation {
+            observed_at,
+            ..sample()
+        };
+        let before_step = at(SystemTime::now() + Duration::from_secs(3600));
+        let ticket = set.probe_ticket(node);
+        assert!(set.complete_probe(&ticket, Some(context), before_step));
+        assert!(set.complete_probe(&ticket, None, before_step));
+        let after_step = at(SystemTime::now());
+        assert!(set.complete_probe(&ticket, Some(context), after_step));
+        assert!(set.complete_probe(&ticket, None, after_step));
+        assert_eq!(set.health_observations(node), [after_step]);
+        assert_eq!(
+            set.group_health_observations(context.group_id)[0].observation,
+            after_step
+        );
+    }
+
+    #[test]
+    fn group_retention_evicts_the_least_recently_updated_key() {
+        let set = AliveDialerSet::new();
+        set.enable_health_history();
+        let node = honk_config::config::DIRECT_NODE_ID;
+        let ticket = set.probe_ticket(node);
+        let group_id = Uuid::from_u128(1);
+        let record = |member| {
+            let context = GroupProbeContext {
+                group_id,
+                member_id: Uuid::from_u128(member),
+            };
+            assert!(set.complete_probe(&ticket, Some(context), sample()));
+        };
+        for member in 0..4096 {
+            record(member);
+        }
+        record(0);
+        record(4096);
+
+        let retained = set.group_health_observations(group_id);
+        assert_eq!(retained.len(), 4096);
+        assert!(
+            retained
+                .iter()
+                .any(|sample| sample.member_id == Uuid::nil())
+        );
+        assert!(
+            !retained
+                .iter()
+                .any(|sample| sample.member_id == Uuid::from_u128(1))
         );
     }
 

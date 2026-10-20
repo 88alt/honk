@@ -1977,7 +1977,8 @@ fn native_observations_exclude_legacy_and_preserve_zero_and_failures() {
     let node = id(1);
     set.register_node(node, "node".into(), "127.0.0.1:1".into());
     let registration = set.registered.read().get(&node).cloned().unwrap();
-    let at = std::time::SystemTime::now();
+    // In the past, so a later failure is not mistaken for a pre-step sample.
+    let at = std::time::SystemTime::now() - Duration::from_secs(60);
     let zero = HealthObservation::probe(
         ProbeDomain::Tcp,
         HealthMeasurement::HttpHeaders,
