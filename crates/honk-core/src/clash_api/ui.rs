@@ -96,7 +96,7 @@ impl UiDownloadTask {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "native-api"))]
     pub(crate) fn from_handle(handle: JoinHandle<()>) -> Self {
         Self {
             stop: watch::channel(false).0,
