@@ -3781,12 +3781,23 @@ async fn reload_retires_only_the_old_warm_generation_and_starts_the_new_one() {
 #[tokio::test]
 async fn stopping_warm_coordinators_does_not_wait_for_retention_cleanup() {
     use honk_outbound::runtime::{NodeRuntime, ProtocolRuntime, QuicRuntimeClient};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[derive(Clone, Debug, Default)]
     struct GatedQuicRelease {
         started: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
         finished: Arc<tokio::sync::Notify>,
+        settled: Arc<AtomicBool>,
+    }
+
+    struct ReleaseSettlement<'a>(&'a GatedQuicRelease);
+
+    impl Drop for ReleaseSettlement<'_> {
+        fn drop(&mut self) {
+            self.0.settled.store(true, Ordering::Release);
+            self.0.finished.notify_one();
+        }
     }
 
     #[async_trait::async_trait]
@@ -3800,9 +3811,9 @@ async fn stopping_warm_coordinators_does_not_wait_for_retention_cleanup() {
         }
 
         async fn release_warm(&self) {
+            let _settlement = ReleaseSettlement(self);
             self.started.notify_one();
             self.release.notified().await;
-            self.finished.notify_one();
         }
     }
 
@@ -3835,7 +3846,10 @@ async fn stopping_warm_coordinators_does_not_wait_for_retention_cleanup() {
         }
     }
 
-    for selector in [false, true] {
+    for (selector, own_tasks) in [(false, false), (true, false), (false, true), (true, true)] {
+        if own_tasks && !cfg!(feature = "native-api") {
+            continue;
+        }
         let mut node = canonical_socks5("warm-release", "127.0.0.1:443", 443, None);
         node.outbound = honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Hysteria2);
         node.id = node.derive_id();
@@ -3850,7 +3864,18 @@ async fn stopping_warm_coordinators_does_not_wait_for_retention_cleanup() {
                 .with_warmable(gate.clone()),
         );
         cp.proxy_registry = Arc::new(registry);
-        let generation = cp.runtime_registry.read().clone();
+        let (generation, _) =
+            honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+                std::slice::from_ref(&node),
+                1,
+                1,
+                1,
+                own_tasks,
+                None,
+            )
+            .unwrap();
+        let generation = Arc::new(generation);
+        *cp.runtime_registry.write() = Arc::clone(&generation);
         let warmed = if selector {
             cp.proxy_registry
                 .warm_session(Arc::clone(&generation), node.id, Duration::from_secs(1))
@@ -3872,9 +3897,7 @@ async fn stopping_warm_coordinators_does_not_wait_for_retention_cleanup() {
             cp.udp_warm_ids.lock().insert(node.id);
             cp.start_udp_warm_coordinator(Arc::clone(&generation)).await;
         }
-        tokio::time::timeout(Duration::from_secs(1), gate.started.notified())
-            .await
-            .expect("coordinator must enter retained-client cleanup");
+        let started = tokio::time::timeout(Duration::from_secs(1), gate.started.notified()).await;
         let stopped = tokio::time::timeout(Duration::from_secs(1), async {
             if selector {
                 cp.stop_selector_warm_coordinator().await
@@ -3883,14 +3906,46 @@ async fn stopping_warm_coordinators_does_not_wait_for_retention_cleanup() {
             }
         })
         .await;
-        gate.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), gate.finished.notified())
+        let shutdown = generation.shutdown();
+        tokio::pin!(shutdown);
+        let acknowledged = tokio::time::timeout(Duration::from_millis(50), shutdown.as_mut())
             .await
-            .expect("runtime-owned cleanup must survive coordinator cancellation");
+            .is_ok();
+        let settled_at_acknowledgment = gate.settled.load(Ordering::Acquire);
+        gate.release.notify_one();
+        if !acknowledged {
+            shutdown.await;
+        }
+        let finished = tokio::time::timeout(Duration::from_secs(1), gate.finished.notified()).await;
         cp.stop_udp_warm_coordinator().await;
         cp.stop_selector_warm_coordinator().await;
-        generation.shutdown().await;
-        assert!(matches!(stopped, Ok(true)), "selector={selector}");
+        let runtime = generation.get(&node.id).unwrap();
+        let ProtocolRuntime::Quic(quic) = &runtime.runtime else {
+            panic!("QUIC runtime required");
+        };
+        let reopened = quic
+            .client(|| async { Ok(Arc::new(GatedQuicRelease::default())) })
+            .await;
+        assert!(
+            started.is_ok(),
+            "selector={selector}, own_tasks={own_tasks}"
+        );
+        assert!(
+            matches!(stopped, Ok(true)),
+            "selector={selector}, own_tasks={own_tasks}"
+        );
+        assert!(
+            finished.is_ok(),
+            "selector={selector}, own_tasks={own_tasks}"
+        );
+        assert!(
+            !acknowledged || settled_at_acknowledgment,
+            "shutdown acknowledged live cleanup: selector={selector}, own_tasks={own_tasks}"
+        );
+        assert!(
+            reopened.is_err(),
+            "terminal runtime must reject new clients"
+        );
     }
 }
 

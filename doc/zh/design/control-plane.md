@@ -245,7 +245,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 3. 取消 correlator cell 和 token-bound original，推进 UDP initializer epoch，排空 `Initializing` lease，等待 correlator 及已准入的 commit-pump 工作变空，并排空精确 endpoint retirement。
 4. 编译 generation 的 `RoutingPushPlan`；在下述发布 guard 内，只有 compiled plan、learned facts 变化或数据路径健康需要恢复时才调用 `EbpfBackend::publish_routing_plan(&plan, learned_domains)`。后端选择 inactive slot，暂存由该 generation 持有的 IP/source/MAC/domain 事实 map（使用完整的 256 位谓词值），把生成函数附着到每个相关 target，最后切换 `ROUTING_POLICY_ROOT`。调用成功后，原生显式激活使用已经持有的 backend 重置 mode，用户态再于同一串行边界内发布替代出站 registry、DNS runtime pointer、Router、配置、组与 projection snapshot；root 已提交后 mode reset 失败会提交新代为 degraded，并保持准入 fence。
    发布后，退役旧 generation，替换其 UDP 与 Selector warm coordinator，并同步健康检查节点、URLTest 组及自定义组检查 URL。已提交但 degraded 的 generation 仍完成这些步骤，仅准入继续保持 fence。
-   停止 warm coordinator 会取消可能依赖另一 coordinator 的 retention-reconciliation 等待；已经开始的清理仍由 runtime 持有，已派发的子任务仍会先 abort 并 join，再退出 coordinator。
+   停止 warm coordinator 会取消可能依赖另一 coordinator 的 retention-reconciliation 等待；coordinator 退出前仍会 abort 并 join 自己派发的子任务。QUIC warm 释放与终止关闭在 client 槽位上串行化，即使未启用原生任务所有权也一样；取消释放不会提前清空槽位，终止关闭仍能取得 client。
 5. 开放 pending 准入，最后重开 NFQUEUE。规则派生 feature bit 存在 policy descriptor 中，不再单独发布到静态 flag map。
 
 `control/reload/transaction.rs` 在候选准备与提交外层持有 `reload_lock`。新代发布依次取得 `router` → `config` → `datapath_flags.publication()`（仅原生显式源激活）→ `ebpf`，随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`；provider 的 DNS publication guard 在这些 guard 内准备。原生 no-op 激活取得 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 独立 mode/fence 更新按 flags mutex → `ebpf`；`reset_for_activation` 不重新取得这两者，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 外运行。这只是记录既有锁边，不授权新增锁边；变更仍须遵守 CONTRIBUTING §2/§11 与人工审查。
