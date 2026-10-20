@@ -562,15 +562,16 @@ mod tests {
             group_id: Uuid::from_u128(2),
             member_id: node,
         };
-        let at = |observed_at| HealthObservation {
+        let at = |observed_at, latency| HealthObservation {
             observed_at,
+            latency: Some(Duration::from_millis(latency)),
             ..sample()
         };
-        let before_step = at(SystemTime::now() + Duration::from_secs(3600));
+        let before_step = at(SystemTime::now() + Duration::from_secs(3600), 100);
         let ticket = set.probe_ticket(node);
         assert!(set.complete_probe(&ticket, Some(context), before_step));
         assert!(set.complete_probe(&ticket, None, before_step));
-        let after_step = at(SystemTime::now());
+        let after_step = at(SystemTime::now(), 200);
         assert!(set.complete_probe(&ticket, Some(context), after_step));
         assert!(set.complete_probe(&ticket, None, after_step));
         assert_eq!(set.health_observations(node), [after_step]);
@@ -578,6 +579,9 @@ mod tests {
             set.group_health_observations(context.group_id)[0].observation,
             after_step
         );
+        let averages = set.health_samples(node)[0].1;
+        let expected = Some(Duration::from_millis(150));
+        assert_eq!((averages.moving, averages.avg10), (expected, expected));
     }
 
     #[test]
