@@ -997,6 +997,11 @@ classification, backoff, retirement, and idempotent force shutdown.
 Initialization waiters receive one `SharedError`, which clones the original
 `anyhow::Error` through an `Arc` and preserves its source chain. The pool never
 flattens a builder failure to display text before broadcasting it.
+A dial task refused by its terminal runtime owner clears its own in-flight
+registration, wakes waiters and counts one establishment failure under the
+existing redial backoff. A refused janitor leaves no running flag, a refused
+drain worker force-closes the retained sessions, and Mux.Cool fails the carrier
+when its owner refuses END delivery.
 
 AnyTLS configures two reusable physical sessions and 128 streams per session.
 It spreads work: after the first session becomes busy, the pool establishes the

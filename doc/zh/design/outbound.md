@@ -844,6 +844,9 @@ pool 还负责有界重试分类、退避、退役与幂等的强制关闭。
 初始化 waiter 接收同一个 `SharedError`；它通过 `Arc` clone 原始
 `anyhow::Error` 并保留 source chain。pool 在广播 builder failure 前绝不会
 把它压平成 display 文本。
+runtime owner 已终止而拒绝拨号任务时，pool 清除该任务自己的 in-flight 注册、唤醒
+waiter，并按一次建立失败计入既有重拨 backoff。janitor 被拒绝时不保留运行标志，drain
+worker 被拒绝时强制关闭保留的 session；Mux.Cool 的 owner 拒绝 END 发送时使 carrier 失败。
 
 AnyTLS 配置两条可复用物理 session，每条 128 个 stream。它会 spread：
 第一条 session 变忙后，pool 会先建立第二条，再增加复用负载，随后按
