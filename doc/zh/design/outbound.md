@@ -763,8 +763,8 @@ number 视为四字节，就会破坏短 packet number 后面的 payload；与�
 互测时，错误会相互抵消。
 
 进程级、有界 `SESSION_TICKETS` cache 按 ticket key 保存 BoringSSL TLS 1.3
-session（代理 key 包含 host、port、SNI 与有序 ALPN）。BoringSSL 没有隐式客户端缓存；会话恢复要求显式 `SSL_set_session`。`pinSHA256`
-节点绝不 resume，因为 PSK 握手会绕过证书 pin。被拒绝的缓存 session 会
+session（代理 key 包含 host、port、SNI 与有序 ALPN，且所有 key 都按 `skip_cert_verify` 分区，开启与跳过证书验证的连接绝不共享 ticket）。BoringSSL 没有隐式客户端缓存；会话恢复要求显式 `SSL_set_session`。`pinSHA256`
+节点既不 resume 也不保存 ticket，因为 PSK 握手会绕过证书 pin。被拒绝的缓存 session 会
 被淘汰，同时不会删除并发连接写入的更新 ticket。
 
 该 backend 可以为 hy2/juicity/tuic/DoQ/DoH3 承载真实 ECH 与 Chrome QUIC ClientHello。代理出站不向

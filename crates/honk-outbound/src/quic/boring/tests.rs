@@ -101,6 +101,27 @@ async fn chacha20_handshake_and_echo() {
     assert_eq!(echoed, b"ping");
 }
 
+#[test]
+fn ticket_cache_keys_separate_certificate_verification_policies() {
+    for ticket_key in [None, Some("server.test|443|sni.test|h3".to_owned())] {
+        let verified = BoringQuicClientConfig::new(BoringQuicOptions {
+            ticket_key: ticket_key.clone(),
+            ..Default::default()
+        })
+        .unwrap();
+        let unverified = BoringQuicClientConfig::new(BoringQuicOptions {
+            ticket_key,
+            skip_cert_verify: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_ne!(
+            verified.session_ticket_key("sni.test"),
+            unverified.session_ticket_key("sni.test")
+        );
+    }
+}
+
 /// A ticket cached under a rebuilt client config (post-reload SSL_CTX)
 /// or rejected by the server must be evicted on handshake failure —
 /// never poison every later dial until process restart. Production
@@ -113,7 +134,12 @@ async fn rejected_ticket_is_evicted() {
         address: "127.0.0.1:0".to_string(),
         ..skip_verify_node()
     };
-    let ticket_key = format!("{}|{}|{}|h3", node.host(), node.port, node.host());
+    let ticket_key = format!(
+        "{}|{}|{}|h3|skip_cert_verify=true",
+        node.host(),
+        node.port,
+        node.host()
+    );
     // Prime the cache under the first client config (SSL_CTX #1).
     let cfg1 = crate::quic::client_config(&node, &[b"h3"], Default::default())
         .await
@@ -168,7 +194,12 @@ async fn session_resumption_reuses_ticket() {
         address: "127.0.0.1:11".to_string(),
         ..skip_verify_node()
     };
-    let ticket_key = format!("{}|{}|{}|h3", node.host(), node.port, node.host());
+    let ticket_key = format!(
+        "{}|{}|{}|h3|skip_cert_verify=true",
+        node.host(),
+        node.port,
+        node.host()
+    );
     let cfg = crate::quic::client_config(&node, &[b"h3"], Default::default())
         .await
         .unwrap();

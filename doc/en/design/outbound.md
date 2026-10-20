@@ -880,8 +880,9 @@ that many bytes are masked or unmasked. Treating every number as four bytes
 corrupts the following payload for short packet numbers and self-cancels against same-bug peers.
 
 A process-wide, bounded `SESSION_TICKETS` cache stores BoringSSL TLS 1.3
-sessions by ticket key (proxy keys include host, port, SNI, and ordered ALPN). BoringSSL has no implicit client cache and requires
-explicit `SSL_set_session` for resumption. `pinSHA256` nodes never resume because a PSK handshake would bypass
+sessions by ticket key (proxy keys include host, port, SNI, and ordered ALPN, and every key is
+partitioned by `skip_cert_verify`, so verified and unverified connections never share a ticket). BoringSSL has no implicit client cache and requires
+explicit `SSL_set_session` for resumption. `pinSHA256` nodes neither resume nor store tickets because a PSK handshake would bypass
 the certificate pin. Rejected cached sessions are evicted without deleting a
 newer concurrent ticket.
 
