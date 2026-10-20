@@ -15,6 +15,9 @@ two parsers do with one input, separately:
 | `compare` / `differences` | `compare = "equal"` when both accept and the structures are identical; otherwise `differences = [{ path, dae, honk, reason }]` naming every place they differ (`{ absent = true }` for a missing item). Any unrecorded difference, and any recorded one that no longer occurs, fails the case. |
 | `unknown_sections` | Root blocks honk does not recognise (dae keeps them; honk only counts them). |
 
+Fence selection counts lines whose trimmed text is exactly ```` ```dae ````;
+it does not parse Markdown nesting or comments, so markers inside them also count.
+
 To add a case: write the input under `cases/<group>/`, add a `[[case]]` with your
 expectation, then run
 
