@@ -182,31 +182,36 @@ impl Sessions {
     }
 }
 
-/// Accepted attempts and consecutive failures, serialized by the credential worker.
+/// Accepted attempts and each peer's consecutive failures, serialized by the credential worker.
 pub(crate) struct AuthRate {
     inner: Mutex<RateState>,
 }
 
 struct RateState {
     attempts: Vec<(std::net::IpAddr, Instant)>,
+    peers: Vec<PeerFailures>,
+}
+
+struct PeerFailures {
+    peer: std::net::IpAddr,
     failures: u32,
     locked_until: Option<Instant>,
 }
 
-/// Attempts allowed per peer and overall in one minute, and the lock after consecutive failures.
+/// Attempts allowed per peer and overall in one minute, and a peer's lock after consecutive failures.
 pub(crate) const PEER_ATTEMPTS: usize = 5;
 pub(crate) const GLOBAL_ATTEMPTS: usize = 10;
 pub(crate) const FAILURES_BEFORE_LOCK: u32 = 5;
 pub(crate) const LOCK: Duration = Duration::from_secs(60);
 const WINDOW: Duration = Duration::from_secs(60);
+const MAX_TRACKED_PEERS: usize = 2 * GLOBAL_ATTEMPTS;
 
 impl Default for AuthRate {
     fn default() -> Self {
         Self {
             inner: Mutex::new(RateState {
                 attempts: Vec::with_capacity(GLOBAL_ATTEMPTS),
-                failures: 0,
-                locked_until: None,
+                peers: Vec::with_capacity(MAX_TRACKED_PEERS),
             }),
         }
     }
@@ -219,17 +224,28 @@ impl AuthRate {
     }
 
     fn admit_at(&self, peer: std::net::IpAddr, now: Instant) -> Option<u32> {
-        let mut state = self.inner.lock();
-        if let Some(until) = state.locked_until {
-            if until > now {
-                return Some(seconds_until(until, now));
-            }
-            state.locked_until = None;
-            state.failures = 0;
-        }
+        let mut guard = self.inner.lock();
+        let state = &mut *guard;
         state
             .attempts
             .retain(|(_, at)| now.duration_since(*at) < WINDOW);
+        let attempts = &state.attempts;
+        state.peers.retain_mut(|entry| {
+            if entry.locked_until.is_some_and(|until| until <= now) {
+                entry.locked_until = None;
+                entry.failures = 0;
+            }
+            entry.locked_until.is_some()
+                || attempts.iter().any(|(address, _)| *address == entry.peer)
+        });
+        if let Some(until) = state
+            .peers
+            .iter()
+            .find(|entry| entry.peer == peer)
+            .and_then(|entry| entry.locked_until)
+        {
+            return Some(seconds_until(until, now));
+        }
         if state.attempts.len() >= GLOBAL_ATTEMPTS {
             return Some(seconds_until(state.attempts[0].1 + WINDOW, now));
         }
@@ -242,27 +258,49 @@ impl AuthRate {
         {
             return Some(seconds_until(*oldest + WINDOW, now));
         }
+        if !state.peers.iter().any(|entry| entry.peer == peer) {
+            // Retain live locks when rotating source addresses fill the bounded peer table.
+            if state.peers.len() >= MAX_TRACKED_PEERS {
+                return Some(1);
+            }
+            state.peers.push(PeerFailures {
+                peer,
+                failures: 0,
+                locked_until: None,
+            });
+        }
         state.attempts.push((peer, now));
         None
     }
 
-    /// A wrong credential; the global lock closes after `FAILURES_BEFORE_LOCK` in a row.
-    pub(crate) fn failed(&self) {
-        self.failed_at(Instant::now());
+    /// A wrong credential; that peer is locked after `FAILURES_BEFORE_LOCK` in a row.
+    pub(crate) fn failed(&self, peer: std::net::IpAddr) {
+        self.failed_at(peer, Instant::now());
     }
 
-    fn failed_at(&self, now: Instant) {
+    fn failed_at(&self, peer: std::net::IpAddr, now: Instant) {
         let mut state = self.inner.lock();
-        state.failures += 1;
-        if state.failures >= FAILURES_BEFORE_LOCK {
-            state.locked_until = Some(now + LOCK);
+        // A slow credential check can outlive its attempt window and the pruned entry.
+        let index = match state.peers.iter().position(|entry| entry.peer == peer) {
+            Some(index) => index,
+            None => {
+                state.peers.push(PeerFailures {
+                    peer,
+                    failures: 0,
+                    locked_until: None,
+                });
+                state.peers.len() - 1
+            }
+        };
+        let entry = &mut state.peers[index];
+        entry.failures += 1;
+        if entry.failures >= FAILURES_BEFORE_LOCK {
+            entry.locked_until = Some(now + LOCK);
         }
     }
 
-    pub(crate) fn succeeded(&self) {
-        let mut state = self.inner.lock();
-        state.failures = 0;
-        state.locked_until = None;
+    pub(crate) fn succeeded(&self, peer: std::net::IpAddr) {
+        self.inner.lock().peers.retain(|entry| entry.peer != peer);
     }
 }
 

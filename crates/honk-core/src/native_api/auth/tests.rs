@@ -324,24 +324,81 @@ fn admission_bounds_attempts_per_peer_and_overall() {
 }
 
 #[test]
-fn repeated_credential_failures_lock_logins_briefly() {
+fn credential_failures_lock_only_the_failing_peer() {
     let rate = AuthRate::default();
     let now = Instant::now();
-    let peer: std::net::IpAddr = "192.168.1.5".parse().unwrap();
-    for _ in 0..FAILURES_BEFORE_LOCK {
-        rate.failed_at(now);
+    let a: std::net::IpAddr = "192.168.1.5".parse().unwrap();
+    let b: std::net::IpAddr = "192.168.1.6".parse().unwrap();
+    for i in 0..FAILURES_BEFORE_LOCK {
+        let at = now + Duration::from_secs(u64::from(i));
+        assert_eq!(rate.admit_at(a, at), None);
+        rate.failed_at(a, at);
     }
-    let wait = rate.admit_at(peer, now).expect("locked");
-    assert!(wait <= LOCK.as_secs() as u32 && wait > 0);
-    assert!(
-        rate.admit_at(peer, now + LOCK).is_none(),
-        "the lock expires"
+    let last = now + Duration::from_secs(u64::from(FAILURES_BEFORE_LOCK - 1));
+    assert_eq!(rate.admit_at(a, last), Some(LOCK.as_secs() as u32));
+    assert_eq!(rate.admit_at(b, last), None, "another peer is not locked");
+    rate.succeeded(b);
+    assert_eq!(
+        rate.admit_at(a, last + LOCK - Duration::from_secs(1)),
+        Some(1),
+        "the peer stays locked after its attempt window reopens"
     );
-    rate.failed_at(now + LOCK);
-    rate.succeeded();
+    assert_eq!(rate.admit_at(a, last + LOCK), None, "the lock expires");
+}
+
+#[test]
+fn credential_success_clears_only_that_peers_failures() {
+    let rate = AuthRate::default();
+    let now = Instant::now();
+    let a: std::net::IpAddr = "192.168.1.5".parse().unwrap();
+    let b: std::net::IpAddr = "192.168.1.6".parse().unwrap();
+    assert_eq!(rate.admit_at(a, now), None);
+    assert_eq!(rate.admit_at(b, now), None);
+    for _ in 0..FAILURES_BEFORE_LOCK - 1 {
+        rate.failed_at(a, now);
+        rate.failed_at(b, now);
+    }
+    rate.succeeded(a);
+    assert_eq!(rate.admit_at(a, now), None);
+    rate.failed_at(a, now);
+    rate.failed_at(b, now);
+    assert_eq!(
+        rate.admit_at(a, now),
+        None,
+        "a success clears that peer's count"
+    );
     assert!(
-        rate.admit_at(peer, now + LOCK).is_none(),
-        "a success clears the count"
+        rate.admit_at(b, now).is_some(),
+        "a success from one peer leaves another's count"
+    );
+}
+
+#[test]
+fn peer_failure_records_are_bounded_and_expire_after_the_lock() {
+    let rate = AuthRate::default();
+    let now = Instant::now();
+    for i in 0..MAX_TRACKED_PEERS {
+        rate.inner.lock().peers.push(PeerFailures {
+            peer: std::net::Ipv4Addr::new(10, 0, 0, i as u8).into(),
+            failures: FAILURES_BEFORE_LOCK,
+            locked_until: Some(now + LOCK),
+        });
+    }
+    let peer = std::net::Ipv4Addr::LOCALHOST.into();
+    assert!(
+        rate.admit_at(peer, now).is_some(),
+        "live locks are not evicted"
+    );
+    assert_eq!(rate.inner.lock().peers.len(), MAX_TRACKED_PEERS);
+    assert_eq!(rate.admit_at(peer, now + LOCK), None);
+    assert_eq!(rate.inner.lock().peers.len(), 1, "expired peers are pruned");
+    rate.failed_at(peer, now + LOCK);
+    let next = std::net::Ipv4Addr::new(127, 0, 0, 2).into();
+    assert_eq!(rate.admit_at(next, now + LOCK + WINDOW), None);
+    assert_eq!(
+        rate.inner.lock().peers.len(),
+        1,
+        "inactive failure streaks expire"
     );
 }
 
