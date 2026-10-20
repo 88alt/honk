@@ -1,7 +1,11 @@
 use super::*;
-use honk_ebpf_common::conn::{BpfStatsKey, NEW_FLOW_LIMIT_PER_CPU_SECOND};
+use honk_ebpf_common::conn::BpfStatsKey;
 use nix::sched::{CpuSet, sched_setaffinity};
 use nix::unistd::Pid;
+
+/// The documented per-CPU budget (doc/en/design/datapath.md), deliberately not
+/// imported from production so a drifting value fails these tests.
+const NEW_FLOW_LIMIT_PER_CPU_SECOND: u16 = 256;
 
 fn monotonic_ns() -> u64 {
     let mut time: libc::timespec = unsafe { mem::zeroed() };
@@ -87,7 +91,7 @@ fn lan_source_over_the_new_flow_limit_is_dropped_before_any_state_is_published()
                 run(&backend, "lan_ingress_l2", &bytes, SkbInput::default()).verdict
             };
             // All three admission paths must spend the same source budget.
-            for index in 0..NEW_FLOW_LIMIT_PER_CPU_SECOND as u16 {
+            for index in 0..NEW_FLOW_LIMIT_PER_CPU_SECOND {
                 assert_eq!(
                     attempt(attacker, index, kinds[index as usize % kinds.len()]),
                     TC_ACT_REDIRECT,
@@ -152,7 +156,7 @@ fn local_udp_learning_shares_the_source_budget_without_dropping_service_requests
             let (backend, _listeners) = fixture();
             let service = UdpSocket::bind(SocketAddr::new(local, 0)).unwrap();
             let port = service.local_addr().unwrap().port();
-            let limit = NEW_FLOW_LIMIT_PER_CPU_SECOND as u16;
+            let limit = NEW_FLOW_LIMIT_PER_CPU_SECOND;
             let before_drops = limited(&backend);
             align_to_second();
             // Replaying the cached first tuple must not spend another learning slot.
