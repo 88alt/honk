@@ -33,6 +33,15 @@ for real_test in \
   ebpf::real::tests::socket_identity::occupied_sock_ops_slot_refuses_startup_without_leaving_links; do
   test "$("$HONK_CORE_TEST_BIN" "$real_test" --exact --ignored --list --format terse)" = "$real_test: test"
 done
+for receive_test in \
+  ebpf::real::receive_trace::tests::receive_trace_family_failure_is_isolated \
+  ebpf::real::receive_trace::tests::receive_trace_registration_loss_and_successful_zero_byte \
+  ebpf::real::receive_trace::tests::receive_trace_stays_armed_between_receives \
+  ebpf::real::receive_trace::tests::receive_trace_ignores_other_processes; do
+  test "$("$HONK_CORE_TEST_BIN" "$receive_test" --exact --ignored --list --format terse)" = "$receive_test: test"
+done
+"$HONK_CORE_TEST_BIN" ebpf::real::receive_trace::tests --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-receive-trace.log"
 "$HONK_CORE_TEST_BIN" \
   ebpf::real::routing::tests \
   --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-core-routing.log"
