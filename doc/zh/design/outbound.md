@@ -151,7 +151,7 @@ Registry 组装会检查 descriptor capability 与填充的槽是否一致。
 | --- | --- | --- |
 | `direct` | Native 带 mark 目标连接 | `PacketTransport` 后的 native 带 mark UDP |
 | `block` | 拒绝 | 显式拒绝路径例外；不承载 UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association，每个客户端 source 一条控制流和一个连接到中继的 socket，供其所有目的地共用；每个请求头写入自己的目的地，每个应答返回真实线上来源（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名且端口一致时才投影为捕获的目标，其他名字不经 DNS 直接丢弃。发送时只写入拨号域名，其他名字以数值目标发出。`FRAG != 0` 丢弃该 datagram，控制流 EOF 结束 association。协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association，每个客户端 source 一条控制流和一个连接到中继的 socket，供其所有目的地共用；每个请求头写入自己的目的地，每个应答返回真实线上来源（IPv4 映射的 IPv6 规范化为 IPv4）。域名来源仅在等于拨号域名且端口一致时才投影为捕获的目标，其他名字不经 DNS 直接丢弃。发送时只写入拨号域名，其他名字以数值目标发出。被截断、RSV 非零、分片（`FRAG != 0`）或域名不是 UTF-8 的中继 datagram 只丢弃该包并记 DEBUG；未知 ATYP 或控制流 EOF 结束 association。协商和认证、ASSOCIATE 请求和应答（含中继域名解析）各有五秒超时 |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing；每个客户端 source 一个已连接的服务端 socket 与加密状态，可发往任意目的地（见下文） |
 | `trojan` | 共享 transport 上的 Trojan stream | `network` 允许 UDP 时使用 Trojan UDP framing；每个客户端 source 一条 associate 流，每个 frame 自带对端地址 |
 | `vmess` | VMess stream | 未实现 |
