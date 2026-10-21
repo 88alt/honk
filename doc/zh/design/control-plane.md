@@ -51,9 +51,7 @@
 
 关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher、卸载 BPF hook、最多用五秒排空已接受流、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
-UDP receive-priority 辅助元数据不可用时，真实 backend 持有 receive-trace fallback 的 link 与 map。`honk_udp_receive_enter`/`honk_udp_receive_exit` 为 IPv4 socket 挂载到 `udp_recvmsg`，`honk_udp6_receive_enter`/`honk_udp6_receive_exit` 为 IPv6 socket 挂载到 `udpv6_recvmsg`。每个地址族都必须具备完整的 enter/exit 对：失败时卸载该对，不会禁用另一个地址族。两个地址族都依赖 `__skb_recv_udp` 上共享的 `honk_udp_receive_candidate` fexit；它失败时两者都不可用。注册会检查 socket 地址族，因此缺少对应 hook 对的 listener 会报告不可用，而不是无证据地静默注册。
-
-每个 backend 只尝试一次 fallback，失败或部分成功也不例外。Listener 重载会重新检查原生辅助元数据支持和注册结果，但不会重新加载 hook：偏移已在 backend 启动时配置，失败尝试也可能已加载部分 Aya program。修改内核/BTF 支持后需重启才能重试。追踪缺失只影响已记录的内核路由证据，不改变路由或 UDP 交付。`cleanup()` 先卸载 ingress hook，join ring consumer，再于 BPF 对象释放前 drop `receive_trace`；即使 backend 自身仍存活，也会释放这些资源，不等到其 Drop。普通清理仍保留两个持久化 sequence pin。
+UDP receive-priority 辅助元数据不可用时，真实 backend 持有 receive-trace fallback 的 link 与 map。每个地址族都必须具备完整的 enter/exit 对：失败时卸载该对，不会禁用另一个地址族。两个地址族都依赖 `__skb_recv_udp` 上共享的 hook；它失败时两者都不可用。注册会检查 socket 地址族，因此缺少对应 hook 对的 listener 会报告不可用，而不是无证据地静默注册。每个 backend 只尝试一次 fallback，失败或部分成功也不例外。Listener 重载会重新检查原生辅助元数据支持和注册结果，但不会重试挂载；修改内核/BTF 支持后需重启。追踪缺失只影响已记录的内核路由证据，不改变路由或 UDP 交付。`cleanup()` 先卸载 ingress hook，join ring consumer，再于 BPF 对象释放前 drop `receive_trace`；即使 backend 自身仍存活，也会释放这些资源，不等到其 Drop。普通清理仍保留两个持久化 sequence pin。
 
 ## 透明代理入口
 

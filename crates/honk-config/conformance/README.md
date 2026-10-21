@@ -28,9 +28,8 @@ cargo run -p honk-config --features conformance --example project -- <file>   # 
 cd tools/dae-parse && go run . < <file>                                       # dae's
 ```
 
-A failure prints the case id, the first differing path and both values. Unreadable
-sources, missing or unclosed fences, missing fence ordinals and invalid upstream
-line ranges fail their own cases with path `input`; remaining cases still run.
+A failure prints the case id, the first differing path and both values. Source or
+selector errors fail their own cases with path `input`; remaining cases still run.
 When `CONFORMANCE_RESULT` is set, the harness writes counts and the first failure
 as `failure: {case, path, detail}` before failing the test with all collected
 failures. An intended difference goes into `differences` with the path and a

@@ -474,7 +474,6 @@ fn source_failures_write_results_before_failing() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(result_path.is_file(), "CONFORMANCE_RESULT was not written");
     let result: Value = serde_json::from_slice(&std::fs::read(result_path).unwrap()).unwrap();
     assert_eq!(result["total"], cases.len());
     assert_eq!(result["failure"]["case"], "missing-input");
