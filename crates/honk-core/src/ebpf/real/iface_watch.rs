@@ -126,7 +126,9 @@ async fn run(
     mut stop: watch::Receiver<bool>,
     degradations: Arc<crate::degradations::Degradations>,
 ) {
-    let async_fd = match crate::async_fd::with_interest(fd, tokio::io::Interest::READABLE) {
+    let async_fd = match unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE)
+    } {
         Ok(f) => f,
         Err(e) => {
             error!("interface watcher disabled: AsyncFd setup failed: {}", e);
@@ -752,10 +754,12 @@ mod tests {
 
             runtime.block_on(async move {
                 let events = subscribe_network_events().expect("network event subscription");
-                let events = crate::async_fd::with_interest(
-                    events,
-                    tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE,
-                )
+                let events = unsafe {
+                    tokio::io::unix::AsyncFd::register_with_interest(
+                        events,
+                        tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE,
+                    )
+                }
                 .expect("async netlink socket");
                 netlink
                     .add_route(

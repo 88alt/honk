@@ -566,10 +566,12 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
-        let listener = crate::async_fd::with_interest(
-            listener,
-            tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE,
-        )
+        let listener = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(
+                listener,
+                tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE,
+            )
+        }
         .unwrap();
         let limit = Arc::new(tokio::sync::Semaphore::new(1));
         let held_flow = limit.clone().try_acquire_owned().unwrap();
