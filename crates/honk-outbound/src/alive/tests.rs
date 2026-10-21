@@ -2173,7 +2173,7 @@ fn native_group_retention_has_a_fixed_slot_bound() {
         Some(Duration::ZERO),
         std::time::SystemTime::now(),
     );
-    for member in 0..4097 {
+    for member in (0..4096).chain([0, 4096]) {
         set.record_group_health_observation(
             node,
             Some(&registration),
@@ -2187,7 +2187,8 @@ fn native_group_retention_has_a_fixed_slot_bound() {
     }
     let retained = set.group_health_observations(group);
     assert_eq!(retained.len(), 4096);
-    assert!(!retained.iter().any(|sample| sample.member_id == id(0)));
+    assert!(retained.iter().any(|sample| sample.member_id == id(0)));
+    assert!(!retained.iter().any(|sample| sample.member_id == id(1)));
     assert!(retained.iter().any(|sample| sample.member_id == id(4096)));
 }
 

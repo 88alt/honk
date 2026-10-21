@@ -168,7 +168,7 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 健康数据来自 producer 已完成且符合资格要求的测量，不把乐观的 alive 标志、跨 IPv4/IPv6 复制的排名信号、合成失败或从缓存恢复的延迟当作真实测量。原始 TCP、HTTP 响应头、DNS 交换和 QUIC 握手测量保留实际目标地址族与完成时间。节点行另带每个测量维度的两个平均值，仅由成功的原生探测累计，重启后清零：`moving_avg_ms` 是 URLTest 排名使用的减半平均 `(previous + sample) / 2`，`avg10_ms` 是最近十次成功探测的算术平均（预热期不足十次时按已有次数）；测量行不可用时二者为 null，针对特定组的测量中恒为 null。未知的排名和冷热状态保持 null/unknown。针对特定组的测量保留测量时的成员和叶节点，不绑定到后来的选择。GET 不推进 URLTest、轮询或 Score 状态；`icon` 返回通过配置校验并应用监听凭据遮罩的 HTTP(S) URL 或 data URI，未配置为 null，不猜测或抓取图标。
 
-同一测量 key 上，完成时间早于已保留样本的健康数据会被丢弃，但若已保留样本的时间晚于当前系统时钟（时钟发生回拨），则接受新样本；同一时间戳的重放会更新该行，但不会在平均值中重复计入。针对特定组的样本最多保留 4096 个测量 key，每次接受的更新都会刷新该 key 的淘汰顺序，最久未更新的 key 最先淘汰。
+同一测量 key 上，完成时间早于已保留样本的健康数据会被丢弃，但若已保留样本的时间晚于当前系统时钟（时钟发生回拨），则接受新样本；同一时间戳的重放会更新该行，但不会在平均值中重复计入。针对特定组的样本最多保留 4096 个测量 key；容量已满时采用 second-chance 替换而非严格的最久未更新优先：自扫描上次经过后被刷新的 key 会被跳过，因此持续刷新的 key 比长期未更新的 key 保留得更久。
 
 `PUT /groups/{groupId}/selection` 的请求体为 `{"member_id":"<direct-member-id>","network":"tcp"}`，`network` 必填，另接受 `udp` 或 `both`。向 Selector 写入会替换其选择，报告 `source: runtime`。TCP 与 UDP 的选择分开保存，仅写入 TCP 不改变 UDP，`both` 在发布前一次校验两个网络，并原子发布选择；对自动策略组（`can_override: true`）的写入会固定该成员，报告 `source: override`；固定成员不可用时不改选同组其他成员。固定只存在于运行时，不持久化，每次配置激活（包括更改节点的订阅刷新）都会清除；未变化或为空的刷新不激活任何配置，保留固定，健康检查照常执行。`DELETE /groups/{groupId}/selection?network=` 清除 `tcp`、`udp` 或 `both`（默认）的固定，返回 `GroupOverrideCleared` 与各网络当前选择；未固定的网络保持原选择，对 Selector 返回 `409 state_conflict`。原生与 Clash 写入都由同一 control/reload 所有者串行处理，并更新既有持久化和预热逻辑，Clash 写入等价于 `both`，读取 `now` 是 TCP 投影。返回独立的 `selection_revision` 与实际 `connections_interrupted`，不将选择 revision 当作配置 ETag。启用 `interrupt_connections` 时，按流量建立时捕获的组身份/路径和发生变更的网络关闭旧所有者，而非按当前可达叶名称删除记录；重复写入当前选择不触发中断。关闭确认失败可能在选择已发布后报错，不承诺回滚。
 

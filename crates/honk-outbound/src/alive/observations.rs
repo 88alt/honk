@@ -1,6 +1,6 @@
 use super::{AliveDialerSet, IpVersion, ProbeDomain, RegisteredNode};
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
@@ -134,10 +134,18 @@ pub(super) struct RetainedHealth {
     averages: LatencyAverages,
 }
 
+const GROUP_SAMPLES: usize = 4096;
+
 #[derive(Default)]
 pub(super) struct HealthHistory {
-    pub nodes: HashMap<Uuid, Vec<RetainedHealth>>,
-    pub groups: VecDeque<GroupHealthObservation>,
+    nodes: HashMap<Uuid, Vec<RetainedHealth>>,
+    groups: Vec<GroupHealthObservation>,
+    /// Second-chance marks parallel to `groups`: an accepted update marks its key,
+    /// and a full table replaces the first unmarked key from `group_hand`, clearing
+    /// marks as it passes. A hit stays as cheap as a lookup and eviction is
+    /// amortized O(1); keeping the marks apart leaves each row at its natural size.
+    group_recent: Vec<bool>,
+    group_hand: usize,
     epoch: Option<Uuid>,
 }
 
@@ -145,6 +153,52 @@ pub(super) struct HealthHistory {
 /// itself in the future: the clock stepped back since it was taken.
 fn stale(observation: &HealthObservation, retained: &HealthObservation) -> bool {
     observation.observed_at < retained.observed_at && retained.observed_at <= SystemTime::now()
+}
+
+impl HealthHistory {
+    // ponytail: at most 4096 fixed-size group tuples; add an index only if probe cost warrants it.
+    fn record_group(&mut self, sample: GroupHealthObservation) -> bool {
+        let hit = self.groups.iter().position(|old| {
+            old.group_id == sample.group_id
+                && old.member_id == sample.member_id
+                && old.observation.same_key(&sample.observation)
+        });
+        match hit {
+            Some(index) => {
+                if stale(&sample.observation, &self.groups[index].observation) {
+                    return false;
+                }
+                self.groups[index] = sample;
+                self.group_recent[index] = true;
+            }
+            None if self.groups.len() < GROUP_SAMPLES => {
+                self.groups.push(sample);
+                self.group_recent.push(false);
+            }
+            None => {
+                let mut at = self.group_hand % GROUP_SAMPLES;
+                while std::mem::take(&mut self.group_recent[at]) {
+                    at = (at + 1) % GROUP_SAMPLES;
+                }
+                self.groups[at] = sample;
+                self.group_hand = at + 1;
+            }
+        }
+        true
+    }
+
+    fn clear_groups(&mut self) {
+        self.groups.clear();
+        self.group_recent.clear();
+    }
+
+    /// Dropping rows shifts indices, so the marks restart; they only bias replacement.
+    pub(super) fn remove_node(&mut self, node: Uuid) {
+        self.nodes.remove(&node);
+        self.groups.retain(|sample| sample.node_id != node);
+        self.group_recent.clear();
+        self.group_recent.resize(self.groups.len(), false);
+    }
 }
 
 impl HealthObservation {
@@ -184,6 +238,9 @@ impl HealthObservation {
         }
     }
 
+    /// Out of line so the group scan keeps its two ids in registers; inlined, the
+    /// key bytes spill them and the 4096-row scan slows by about a quarter.
+    #[inline(never)]
     fn same_key(&self, other: &Self) -> bool {
         self.transport == other.transport
             && self.purpose == other.purpose
@@ -355,14 +412,14 @@ impl AliveDialerSet {
     pub fn invalidate_group_health_observations(&self) {
         if let Some(retained) = self.health_observations.write().as_mut() {
             retained.epoch = None;
-            retained.groups.clear();
+            retained.clear_groups();
         }
     }
 
     pub(super) fn reset_group_health_observations(&self) {
         if let Some(retained) = self.health_observations.write().as_mut() {
             retained.epoch = Some(Uuid::new_v4());
-            retained.groups.clear();
+            retained.clear_groups();
         }
     }
 
@@ -401,22 +458,7 @@ impl AliveDialerSet {
             node_id: node,
             observation,
         };
-        // ponytail: at most 4096 fixed-size group tuples; add an index only if probe cost warrants it.
-        if let Some(index) = retained.groups.iter().position(|old| {
-            old.group_id == context.group_id
-                && old.member_id == context.member_id
-                && old.observation.same_key(&observation)
-        }) {
-            if stale(&observation, &retained.groups[index].observation) {
-                return false;
-            }
-            // Requeue so eviction follows recency, not first insertion.
-            retained.groups.remove(index);
-        } else if retained.groups.len() == 4096 {
-            retained.groups.pop_front();
-        }
-        retained.groups.push_back(sample);
-        true
+        retained.record_group(sample)
     }
 }
 
@@ -582,40 +624,6 @@ mod tests {
         let averages = set.health_samples(node)[0].1;
         let expected = Some(Duration::from_millis(150));
         assert_eq!((averages.moving, averages.avg10), (expected, expected));
-    }
-
-    #[test]
-    fn group_retention_evicts_the_least_recently_updated_key() {
-        let set = AliveDialerSet::new();
-        set.enable_health_history();
-        let node = honk_config::config::DIRECT_NODE_ID;
-        let ticket = set.probe_ticket(node);
-        let group_id = Uuid::from_u128(1);
-        let record = |member| {
-            let context = GroupProbeContext {
-                group_id,
-                member_id: Uuid::from_u128(member),
-            };
-            assert!(set.complete_probe(&ticket, Some(context), sample()));
-        };
-        for member in 0..4096 {
-            record(member);
-        }
-        record(0);
-        record(4096);
-
-        let retained = set.group_health_observations(group_id);
-        assert_eq!(retained.len(), 4096);
-        assert!(
-            retained
-                .iter()
-                .any(|sample| sample.member_id == Uuid::nil())
-        );
-        assert!(
-            !retained
-                .iter()
-                .any(|sample| sample.member_id == Uuid::from_u128(1))
-        );
     }
 
     #[test]
