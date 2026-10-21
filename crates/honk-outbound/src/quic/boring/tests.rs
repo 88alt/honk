@@ -103,7 +103,7 @@ async fn chacha20_handshake_and_echo() {
 
 #[tokio::test]
 async fn ticket_resumption_separates_certificate_verification_policies() {
-    let (server, addr) = crate::quic::testutil::server_endpoint(&[b"h3"], true).unwrap();
+    let addr = spawn_echo_server(&[b"h3"]);
     let endpoint = crate::quic::client_endpoint(false).unwrap();
     let identity = format!("verification-policy|{addr}");
     let crypto = |skip_cert_verify| {
@@ -117,18 +117,7 @@ async fn ticket_resumption_separates_certificate_verification_policies() {
             .unwrap(),
         )
     };
-    let echo = async {
-        while let Some(incoming) = server.accept().await {
-            let Ok(conn) = incoming.await else { continue };
-            if let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                let buf = recv.read_to_end(16).await.unwrap();
-                send.write_all(&buf).await.unwrap();
-                send.finish().unwrap();
-            }
-            conn.closed().await;
-        }
-    };
-    let dial = async {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
         let config = crypto(true);
         let ticket_key = config.session_ticket_key("localhost");
         let conn = endpoint
@@ -191,12 +180,7 @@ async fn ticket_resumption_separates_certificate_verification_policies() {
         );
         conn.close(0u32.into(), b"done");
         endpoint.close(0u32.into(), b"done");
-        server.close(0u32.into(), b"done");
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        tokio::join!(echo, dial);
         endpoint.wait_idle().await;
-        server.wait_idle().await;
     })
     .await
     .expect("verification-policy loopback test timed out");

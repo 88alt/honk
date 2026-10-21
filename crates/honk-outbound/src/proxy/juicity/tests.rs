@@ -542,18 +542,6 @@ async fn captured_domain_projects_and_unknown_domains_drop() {
         recv(&*transport).await,
         ("203.0.113.9:1".parse().unwrap(), Vec::new())
     );
-}
-
-/// An empty or non-UTF-8 reply name is a malformed address, but its frame
-/// still has a length and payload: only that frame drops.
-#[tokio::test]
-async fn malformed_reply_names_drop_only_their_frame() {
-    let (server, mut streams) = start_wire_server().await;
-    let target: SocketAddr = "192.0.2.1:443".parse().unwrap();
-    let (_runtime, transport) = shared_source(server, false, target, Some("example.test")).await;
-    transport.send_packet(b"open").await.unwrap();
-    let mut stream = streams.recv().await.unwrap();
-    stream.frame().await;
 
     for name in [&b""[..], &[0xff, 0xfe][..]] {
         let mut burst = vec![3, name.len() as u8];

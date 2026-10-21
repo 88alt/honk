@@ -203,15 +203,6 @@ async fn unrecognised_domain_frames_are_consumed_and_the_next_decodes() {
     assert_eq!((peer, &buf[..n]), (target, &b"mine"[..]));
     let (n, peer) = transport.recv_packet(&mut buf).await.unwrap();
     assert_eq!((peer, &buf[..n]), (numeric, &b"next"[..]));
-}
-
-/// An empty or non-UTF-8 name is a malformed address, but its frame still
-/// has a length and payload: only that frame drops.
-#[tokio::test]
-async fn malformed_domain_frames_are_consumed_and_the_next_decodes() {
-    let (client, mut server) = tokio::io::duplex(4096);
-    let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
-    let transport = transport_over(client, target, Some("example.com"));
 
     for payload in [&b"mine"[..], &b""[..]] {
         for address in [
