@@ -754,13 +754,8 @@ mod tests {
 
             runtime.block_on(async move {
                 let events = subscribe_network_events().expect("network event subscription");
-                let events = unsafe {
-                    tokio::io::unix::AsyncFd::register_with_interest(
-                        events,
-                        tokio::io::Interest::READABLE | tokio::io::Interest::WRITABLE,
-                    )
-                }
-                .expect("async netlink socket");
+                let events = unsafe { tokio::io::unix::AsyncFd::register(events) }
+                    .expect("async netlink socket");
                 netlink
                     .add_route(
                         crate::netlink::FAM_V4,
