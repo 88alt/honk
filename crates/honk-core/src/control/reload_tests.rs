@@ -1399,19 +1399,9 @@ async fn mode_reset_failure_still_restarts_warm_and_syncs_probes() {
         ebpf.arm_datapath_flags_write_fault(2).unwrap();
     }
     let drain = DrainTracker::new();
-    let mut authorizations = crate::subscription::SubscriptionAuthorizations::new(&[]).unwrap();
-    let sources = source_update("# mode reset fails after commit\n");
     assert_eq!(
-        cp.apply_sighup_config(
-            config,
-            Vec::new(),
-            &drain,
-            &mut authorizations,
-            Some(&sources),
-            None,
-        )
-        .await
-        .unwrap(),
+        cp.apply_runtime_config(config, Default::default(), &drain)
+            .await,
         ReloadOutcome::CommittedDegraded {
             generation: before_generation.get() + 1,
         }

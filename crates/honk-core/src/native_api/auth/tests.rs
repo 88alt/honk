@@ -374,32 +374,17 @@ fn credential_success_clears_only_that_peers_failures() {
 }
 
 #[test]
-fn peer_failure_records_are_bounded_and_expire_after_the_lock() {
+fn inactive_failure_streaks_expire() {
     let rate = AuthRate::default();
     let now = Instant::now();
-    for i in 0..MAX_TRACKED_PEERS {
-        rate.inner.lock().peers.push(PeerFailures {
-            peer: std::net::Ipv4Addr::new(10, 0, 0, i as u8).into(),
-            failures: FAILURES_BEFORE_LOCK,
-            locked_until: Some(now + LOCK),
-        });
-    }
     let peer = std::net::Ipv4Addr::LOCALHOST.into();
-    assert!(
-        rate.admit_at(peer, now).is_some(),
-        "live locks are not evicted"
-    );
-    assert_eq!(rate.inner.lock().peers.len(), MAX_TRACKED_PEERS);
-    assert_eq!(rate.admit_at(peer, now + LOCK), None);
-    assert_eq!(rate.inner.lock().peers.len(), 1, "expired peers are pruned");
-    rate.failed_at(peer, now + LOCK);
-    let next = std::net::Ipv4Addr::new(127, 0, 0, 2).into();
-    assert_eq!(rate.admit_at(next, now + LOCK + WINDOW), None);
-    assert_eq!(
-        rate.inner.lock().peers.len(),
-        1,
-        "inactive failure streaks expire"
-    );
+    for at in [now, now + WINDOW] {
+        for _ in 0..FAILURES_BEFORE_LOCK - 1 {
+            assert_eq!(rate.admit_at(peer, at), None);
+            rate.failed_at(peer, at);
+        }
+    }
+    assert_eq!(rate.admit_at(peer, now + WINDOW), None);
 }
 
 #[test]

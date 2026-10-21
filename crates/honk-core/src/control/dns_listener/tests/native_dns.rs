@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(feature = "native-api")]
 #[tokio::test]
 async fn native_log_records_bound_udp_success_and_header_only_refusal() {
     let (controller, _) = controller([192, 0, 2, 10]);
@@ -56,7 +55,6 @@ async fn native_log_records_bound_udp_success_and_header_only_refusal() {
     assert_eq!(log["records"][1]["answers"][0]["data"], "192.0.2.10");
 }
 
-#[cfg(feature = "native-api")]
 #[tokio::test]
 async fn native_bound_dns_records_each_udp_query_and_tcp_frame_without_dns_log() {
     let api_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

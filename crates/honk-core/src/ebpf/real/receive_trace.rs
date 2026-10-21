@@ -136,31 +136,22 @@ impl ReceiveTrace {
         if let (Err(ipv4), Err(ipv6)) = (&ipv4, &ipv6) {
             anyhow::bail!("UDP receive hooks unavailable: IPv4: {ipv4:#}; IPv6: {ipv6:#}");
         }
-        let ipv4 = ipv4
-            .inspect_err(|error| {
+        for (family, result) in [("ipv4", &ipv4), ("ipv6", &ipv6)] {
+            if let Err(error) = result {
                 tracing::warn!(
-                    family = "ipv4",
+                    family,
                     error = %format_args!("{error:#}"),
                     "kernel UDP trace attach unavailable"
                 );
-            })
-            .ok();
-        let ipv6 = ipv6
-            .inspect_err(|error| {
-                tracing::warn!(
-                    family = "ipv6",
-                    error = %format_args!("{error:#}"),
-                    "kernel UDP trace attach unavailable"
-                );
-            })
-            .ok();
+            }
+        }
         let Some(Map::HashMap(map)) = bpf.map("RECEIVE_TRACE") else {
             anyhow::bail!("missing RECEIVE_TRACE hash map");
         };
         Ok(Arc::new(Self {
             map: handle(map)?,
-            ipv4,
-            ipv6,
+            ipv4: ipv4.ok(),
+            ipv6: ipv6.ok(),
             _candidate: candidate,
         }))
     }
@@ -331,13 +322,8 @@ mod tests {
                     missing_btf = without_target(data, target)?;
                     &missing_btf
                 };
-                let trace = ReceiveTrace::attach(&mut bpf, attach_btf);
-                assert!(
-                    trace.is_ok(),
-                    "one family must survive a sibling hook failure: {:?}",
-                    trace.as_ref().err()
-                );
-                let trace = trace?;
+                let trace = ReceiveTrace::attach(&mut bpf, attach_btf)
+                    .expect("one family must survive a sibling hook failure");
                 if fail_exit {
                     let failed_entry_id = bpf.program(enter).unwrap().info()?.id();
                     for link in aya::programs::loaded_links() {

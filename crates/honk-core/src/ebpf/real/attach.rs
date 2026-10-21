@@ -6,12 +6,6 @@ struct StartupPins<'a> {
     names: Vec<String>,
 }
 
-impl StartupPins<'_> {
-    fn release(mut self) -> Vec<String> {
-        std::mem::take(&mut self.names)
-    }
-}
-
 impl Drop for StartupPins<'_> {
     fn drop(&mut self) {
         for name in &self.names {
@@ -550,7 +544,7 @@ impl RealEbpfBackend {
         Ok(Self {
             bpf: Some(bpf),
             pin_root: pin_root.to_path_buf(),
-            pinned_maps: pinned_maps.release(),
+            pinned_maps: std::mem::take(&mut pinned_maps.names),
             interface_links,
             cgroup_sock_links,
             cgroup_sock_addr_links,

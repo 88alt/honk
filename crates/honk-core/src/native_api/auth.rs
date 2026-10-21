@@ -204,14 +204,13 @@ pub(crate) const GLOBAL_ATTEMPTS: usize = 10;
 pub(crate) const FAILURES_BEFORE_LOCK: u32 = 5;
 pub(crate) const LOCK: Duration = Duration::from_secs(60);
 const WINDOW: Duration = Duration::from_secs(60);
-const MAX_TRACKED_PEERS: usize = 2 * GLOBAL_ATTEMPTS;
 
 impl Default for AuthRate {
     fn default() -> Self {
         Self {
             inner: Mutex::new(RateState {
                 attempts: Vec::with_capacity(GLOBAL_ATTEMPTS),
-                peers: Vec::with_capacity(MAX_TRACKED_PEERS),
+                peers: Vec::with_capacity(GLOBAL_ATTEMPTS + 1),
             }),
         }
     }
@@ -230,12 +229,8 @@ impl AuthRate {
             .attempts
             .retain(|(_, at)| now.duration_since(*at) < WINDOW);
         let attempts = &state.attempts;
-        state.peers.retain_mut(|entry| {
-            if entry.locked_until.is_some_and(|until| until <= now) {
-                entry.locked_until = None;
-                entry.failures = 0;
-            }
-            entry.locked_until.is_some()
+        state.peers.retain(|entry| {
+            entry.locked_until.is_some_and(|until| until > now)
                 || attempts.iter().any(|(address, _)| *address == entry.peer)
         });
         if let Some(until) = state
@@ -259,10 +254,6 @@ impl AuthRate {
             return Some(seconds_until(*oldest + WINDOW, now));
         }
         if !state.peers.iter().any(|entry| entry.peer == peer) {
-            // Retain live locks when rotating source addresses fill the bounded peer table.
-            if state.peers.len() >= MAX_TRACKED_PEERS {
-                return Some(1);
-            }
             state.peers.push(PeerFailures {
                 peer,
                 failures: 0,
