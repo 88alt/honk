@@ -124,8 +124,9 @@ async fn spread_sessions_fills_idle_capacity_before_multiplexing() {
 }
 
 /// A concurrent burst can occupy the session this caller just dialed before
-/// the caller re-elects. With its dial spent it cannot open a second session,
-/// so it must take the healthy one rather than fail and arm the breaker.
+/// the caller re-elects, and another caller may already be dialing. With its
+/// dial spent it cannot open a second session, so it must take the healthy
+/// one rather than fail and arm the breaker or wait on that other dial.
 #[tokio::test(start_paused = true)]
 async fn spread_reelection_with_a_spent_dial_reuses_the_busy_session() {
     let pool = pool(SessionPoolConfig {
@@ -135,17 +136,26 @@ async fn spread_reelection_with_a_spent_dial_reuses_the_busy_session() {
     });
     let dials = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&dials);
-    let session = pool
-        .offer(move || async move {
+    let (other_dial, _) = tokio::sync::watch::channel(DialSignal::Pending);
+    let inflight = (Arc::clone(&pool.pool), other_dial.clone());
+    let session = tokio::time::timeout(
+        Duration::from_secs(1),
+        pool.offer(move || async move {
             counted.fetch_add(1, Ordering::Relaxed);
             let session = TestSession::new();
             session.streams.store(1, Ordering::Relaxed);
+            let (pool, other_dial) = inflight;
+            pool.lock().dial_done = Some((u64::MAX, other_dial));
             Ok(session)
-        })
-        .await
-        .expect("a healthy dialed session must be returned");
+        }),
+    )
+    .await
+    .expect("a spent dial must not wait on another caller's dial")
+    .expect("a healthy dialed session must be returned");
     assert!(!session.is_closed());
     assert_eq!(dials.load(Ordering::Relaxed), 1);
+    pool.pool.lock().dial_done = None;
+    drop(other_dial);
 
     let next = pool
         .offer(|| async { Ok(TestSession::new()) })
