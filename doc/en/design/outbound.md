@@ -1056,11 +1056,12 @@ Control-only batches have a 5-second deadline (`writeControlFrame` sing-anytls
 parity); expiry fails the session. Data-containing batches have no deadline:
 congestion backpressures the cap without killing siblings.
 
-`AnyTlsStream::poll_write` is cancellation-safe through an owned outbound slot.
-It returns `Ok(n)` only after exactly those `n` bytes have entered the ordered
-queue, and a retried write enqueues its chunk once. A write that returned
-`Pending` accepted nothing: flush and shutdown drop its chunk instead of sending
-it, and return without waiting for writer capacity.
+`AnyTlsStream::poll_write` is cancellation-safe because it copies nothing until
+it holds a writer-queue permit. It returns `Ok(n)` only after exactly those `n`
+bytes have entered the ordered queue, and a retried write enqueues its chunk
+once. A write that returned `Pending` accepted nothing: flush and shutdown drop
+its permit wait, so the abandoned bytes are never sent, and return without
+waiting for writer capacity.
 
 ### Non-blocking demultiplexing
 
