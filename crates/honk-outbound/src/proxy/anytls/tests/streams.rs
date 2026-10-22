@@ -176,14 +176,14 @@ async fn failed_session_preserves_node_failure_after_stream_unregistration() {
         session
             .enqueue_data_with_permit(
                 transport.sid,
-                bytes::Bytes::from_static(b"x"),
+                data_frame(transport.sid, b"x"),
                 queued_permit,
             )
             .unwrap_err(),
         session
             .enqueue_confirmed_data_with_permit(
                 transport.sid,
-                bytes::Bytes::from_static(b"x"),
+                data_frame(transport.sid, b"x"),
                 confirmed_permit,
             )
             .unwrap_err(),
@@ -383,8 +383,8 @@ pub(super) fn spawn_echo_server(
     addr_rx
 }
 
-/// poll_write cancel safety: a resumed write enqueues its payload once,
-/// reusing the stored slot instead of copying it again.
+/// poll_write cancel safety: a cancelled write copies nothing, and the call
+/// that resumes the permit copies its own buffer and enqueues it once.
 #[tokio::test]
 async fn test_poll_write_cancel_safety() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

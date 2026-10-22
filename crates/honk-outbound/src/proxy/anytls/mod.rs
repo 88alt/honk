@@ -37,7 +37,7 @@ use overflow::{OVERFLOW_EMERGENCY_WAIT, OVERFLOW_STALL_GRACE, StreamOverflow};
 use padding::PaddingInstruction;
 pub(crate) use uot::AnyTlsUotTransport;
 use uot::{UOT_DRAIN_QUEUE_CAP, UotReceiveState};
-use writer::{FrameCommand, WRITER_DATA_BYTES_CAP, session_writer};
+use writer::{FrameCommand, WRITER_DATA_BYTES_CAP, data_frame, session_writer};
 #[cfg(test)]
 use writer::{WRITER_CONTROL_RESERVED, WRITER_IO_TIMEOUT, WRITER_QUEUE_CAP};
 
@@ -95,6 +95,9 @@ const MAX_STREAM_ERROR_SOURCE_BYTES: usize = 1024;
 /// an in-memory duplex instead of a real TLS connection.
 type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
 type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
+/// One pending writer-queue permit acquisition.
+type PermitWait =
+    std::pin::Pin<Box<dyn Future<Output = std::io::Result<DataPermit>> + Send + 'static>>;
 
 /// AnyTLS proxy handler. Stateless: the node's session pool lives in its
 /// generation-owned runtime; node-based calls (tests, standalone probing)
@@ -652,7 +655,7 @@ impl AnyTlsSession {
     fn enqueue_confirmed_data_with_permit(
         &self,
         sid: u32,
-        payload: bytes::Bytes,
+        frame: bytes::Bytes,
         permit: DataPermit,
     ) -> std::io::Result<tokio::sync::oneshot::Receiver<bool>> {
         let (completion, completed) = tokio::sync::oneshot::channel();
@@ -669,7 +672,7 @@ impl AnyTlsSession {
             }
             self.writer_q.push_batch([FrameCommand::Data {
                 sid,
-                payload,
+                frame,
                 _permit: permit,
                 completion: Some(completion),
             }])
@@ -727,45 +730,48 @@ impl AnyTlsSession {
         u32::try_from(bytes.min(WRITER_DATA_BYTES_CAP)).expect("byte cap fits u32")
     }
 
-    /// Try to enqueue a data frame without waiting; returns the payload
-    /// back when the writer queue is full (caller keeps it in its slot).
-    fn try_enqueue_data(&self, sid: u32, payload: bytes::Bytes) -> Result<(), bytes::Bytes> {
+    /// Take a writer-queue data permit for `bytes` of payload without
+    /// waiting: a write that gets one copies its buffer straight into the
+    /// queued frame, so a resumed write neither copies nor compares first.
+    fn try_data_permit(&self, bytes: usize) -> Option<DataPermit> {
         if self.is_closed() {
-            return Err(payload);
+            return None;
         }
-        let Ok(frame) = Arc::clone(&self.writer_q.data_permits).try_acquire_owned() else {
-            return Err(payload);
-        };
-        let Ok(bytes) = Arc::clone(&self.writer_q.data_bytes)
-            .try_acquire_many_owned(Self::byte_permits(payload.len()))
-        else {
-            return Err(payload);
-        };
-        match self.writer_q.push_batch([FrameCommand::Data {
-            sid,
-            payload,
-            _permit: DataPermit {
-                _frame: frame,
-                _bytes: bytes,
-            },
-            completion: None,
-        }]) {
-            Ok(()) => Ok(()),
-            Err(commands) => {
-                let [FrameCommand::Data { payload, .. }] = commands else {
-                    unreachable!("queued one data command")
-                };
-                let _ = self.writer_queue_error();
-                Err(payload)
-            }
-        }
+        let frame = Arc::clone(&self.writer_q.data_permits)
+            .try_acquire_owned()
+            .ok()?;
+        let bytes = Arc::clone(&self.writer_q.data_bytes)
+            .try_acquire_many_owned(Self::byte_permits(bytes))
+            .ok()?;
+        Some(DataPermit {
+            _frame: frame,
+            _bytes: bytes,
+        })
     }
 
-    /// Enqueue a data frame with an already-acquired permit.
+    /// Queue a [`data_frame`] of a live stream with a permit just taken.
+    fn push_data(&self, sid: u32, frame: bytes::Bytes, permit: DataPermit) -> std::io::Result<()> {
+        if self.is_closed() {
+            return Err(self.session_error(
+                std::io::ErrorKind::ConnectionAborted,
+                "AnyTLS session is closed",
+            ));
+        }
+        self.writer_q
+            .push_batch([FrameCommand::Data {
+                sid,
+                frame,
+                _permit: permit,
+                completion: None,
+            }])
+            .map_err(|_| self.writer_queue_error())
+    }
+
+    /// Enqueue a [`data_frame`] with an already-acquired permit.
     fn enqueue_data_with_permit(
         &self,
         sid: u32,
-        payload: bytes::Bytes,
+        frame: bytes::Bytes,
         permit: DataPermit,
     ) -> std::io::Result<()> {
         let queued = {
@@ -781,7 +787,7 @@ impl AnyTlsSession {
             }
             self.writer_q.push_batch([FrameCommand::Data {
                 sid,
-                payload,
+                frame,
                 _permit: permit,
                 completion: None,
             }])
@@ -1520,15 +1526,12 @@ pub(crate) struct AnyTlsStream {
     /// in the same poll: the error is owed to the next poll (data
     /// first, then the error — never silently merge them).
     read_err: Option<std::io::Error>,
-    /// Outbound frame slot: the payload of a write that returned `Pending`,
-    /// owned by the stream until it is enqueued, so a resumed write cannot
-    /// enqueue it twice. It was not accepted: a cancelled write leaves it to
-    /// be replaced by the next write or dropped by flush, never sent.
-    /// `poll_write` only returns `Ok(n)` after exactly these `n` bytes were
-    /// queued (never a number derived from a different call's buffer).
-    out_slot: Option<(bytes::Bytes, usize)>,
-    /// Waiter for a writer-queue data permit while `out_slot` is occupied.
-    permit_fut: Option<std::pin::Pin<Box<dyn Future<Output = std::io::Result<DataPermit>> + Send>>>,
+    /// Writer-queue permit wait of a write that returned `Pending`, with the
+    /// payload bytes it reserves. Nothing is copied before the permit is in
+    /// hand: the call that collects it copies its own buffer once, so a
+    /// cancelled write leaves nothing behind to send, and `poll_write` only
+    /// ever answers `Ok(n)` after queueing exactly those `n` bytes.
+    permit_wait: Option<(PermitWait, usize)>,
     /// Stream-slot capacity, held until either endpoint closes the stream.
     /// A server FIN releases it immediately even if callers retain the EOF
     /// stream object.
@@ -1561,8 +1564,7 @@ impl AnyTlsStream {
             receive,
             read_eof: false,
             read_err: None,
-            out_slot: None,
-            permit_fut: None,
+            permit_wait: None,
             _permit: Some(permit),
         }
     }
@@ -1602,72 +1604,53 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         }
         let this = self.as_mut().get_mut();
 
-        // A payload sits here only while it is still unqueued — a successful
-        // enqueue takes it — and a write that returned Pending accepted no
-        // bytes, so a cancelled call's payload belongs to nobody and this
-        // call's buffer replaces it. Equal bytes need no replacement, which
-        // keeps a resumed write from reallocating on every poll.
-        match &this.out_slot {
-            Some((payload, _)) if payload.as_ref() == &buf[..chunk] => {}
-            _ => {
-                // A permit being awaited was sized for the replaced payload.
-                this.permit_fut = None;
-                this.out_slot = Some((bytes::Bytes::copy_from_slice(&buf[..chunk]), chunk));
+        // The queue's permit comes first: only the call that holds it copies
+        // this buffer, and it copies straight into the queued frame. A write
+        // that returns Pending has accepted nothing, so a cancelled call
+        // leaves no payload behind and a resumed one never compares bytes.
+        if this.permit_wait.is_none() {
+            if let Some(permit) = this.session.try_data_permit(chunk) {
+                let frame = data_frame(this.sid, &buf[..chunk]);
+                return std::task::Poll::Ready(
+                    this.session
+                        .push_data(this.sid, frame, permit)
+                        .map(|()| chunk),
+                );
             }
-        }
-
-        if let Some((payload, n)) = this.out_slot.take() {
-            match this.session.try_enqueue_data(this.sid, payload) {
-                Ok(()) => {
-                    // A retry that got in through the fast path leaves its
-                    // earlier waiter behind; that waiter may already hold
-                    // permits for this payload, so drop it here rather than
-                    // keep a second reservation until the next write.
-                    this.permit_fut = None;
-                    return std::task::Poll::Ready(Ok(n));
-                }
-                Err(payload) => this.out_slot = Some((payload, n)),
-            }
-        }
-
-        if this.permit_fut.is_none() {
             let session = Arc::clone(&this.session);
-            let bytes = this
-                .out_slot
-                .as_ref()
-                .map_or(0, |(payload, _)| payload.len());
-            this.permit_fut = Some(Box::pin(
-                async move { session.acquire_data_permit(bytes).await },
-            ));
+            let wait = async move { session.acquire_data_permit(chunk).await };
+            this.permit_wait = Some((Box::pin(wait), chunk));
         }
-        let fut = this.permit_fut.as_mut().expect("permit wait just queued");
-        match fut.as_mut().poll(cx) {
-            std::task::Poll::Ready(Ok(permit)) => {
-                this.permit_fut = None;
-                let (payload, n) = this.out_slot.take().expect("slot held while waiting");
-                let r = this
-                    .session
-                    .enqueue_data_with_permit(this.sid, payload, permit);
-                std::task::Poll::Ready(r.map(|()| n))
+        let (mut wait, reserved) = this.permit_wait.take().expect("permit wait just set");
+        let permit = match wait.as_mut().poll(cx) {
+            std::task::Poll::Pending => {
+                // Keep this exact future: it holds the semaphore's place in
+                // line and its waker registration.
+                this.permit_wait = Some((wait, reserved));
+                return std::task::Poll::Pending;
             }
-            std::task::Poll::Ready(Err(e)) => {
-                this.permit_fut = None;
-                std::task::Poll::Ready(Err(e))
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+            std::task::Poll::Ready(Ok(permit)) => permit,
+            std::task::Poll::Ready(Err(error)) => return std::task::Poll::Ready(Err(error)),
+        };
+        // The call that collects the permit may pass another buffer than the
+        // one that started the wait; it queues up to the reserved bytes. A
+        // smaller buffer leaves the difference reserved until the flush.
+        let n = chunk.min(reserved);
+        let frame = data_frame(this.sid, &buf[..n]);
+        std::task::Poll::Ready(
+            this.session
+                .enqueue_data_with_permit(this.sid, frame, permit)
+                .map(|()| n),
+        )
     }
 
-    /// Every accepted byte is already in the ordered queue. A slot left by a
-    /// write that returned `Pending` accepted nothing, so it is dropped here
-    /// rather than sent, and so is the waiter sized for it.
+    /// Every accepted byte is already in the ordered queue. A write that
+    /// returned `Pending` copied nothing, so flush only drops its wait.
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.as_mut().get_mut();
-        this.permit_fut = None;
-        this.out_slot = None;
+        self.as_mut().get_mut().permit_wait = None;
         std::task::Poll::Ready(Ok(()))
     }
 

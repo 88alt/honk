@@ -875,14 +875,18 @@ permit：每个 session 896 个 frame 与 1 MiB 已排队或在途的 payload，
 而不会继续增长内存。
 
 限制排队 payload 的是字节预算：一个 frame 最多 65,535 字节，只按 frame 计数时一个
-session 可以排队 56 MiB，线速上传会把它填满。预算不计 stream 尚未入队的 slot、取得
-permit 之前的 UoT 包与编码后的 batch 缓冲。relay 每次最多读 65,535 字节，一次非空读
+session 可以排队 56 MiB，线速上传会把它填满。预算不计取得 permit 之前的 UoT 包与编码后的
+batch 缓冲。relay 每次最多读 65,535 字节，一次非空读
 最多对应一个 AnyTLS frame；原先读 64 KiB 会变成一个 65,535 字节的 frame 加一个
 1 字节的 frame。stream 的 SYN 与
 第一个 PSH 作为一个 atomic batch 插入，因此其他 stream 不能插入两者之间。打开流的注册被中途放弃时，会发送 FIN，而不会终止 session。
 
 完成一次 blocking pop 后，writer 只收集已排队的 frame，最多 63 frame 或 256 KiB
-（均不含首帧），再执行一次 `write_all` 与一次 `flush`，不等待凑满 batch。只有物
+（均不含首帧），再执行一次 `flush`，不等待凑满 batch。data frame 在接纳 payload 的那一次
+复制中连同 header 一起序列化；stream 先取得队列 permit 再复制，因此返回 `Pending` 的写入
+没有复制任何字节。不加 padding 时，writer 直接从该缓冲区写出其完整的 TLS
+record，只复制 control frame 与不足一个 record 的 data 字节，因此 batch 的 record 边界
+与一次连续写入相同。只有物
 理 batch 成功或 session 变为 terminal 后，才释放 data permit 与 confirmed-write
 completion。
 

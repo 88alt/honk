@@ -1032,8 +1032,8 @@ cap also bounds how long a new stream's SYN waits behind a saturated upload.
 Control frames retain reserved headroom; the whole queue is capped at 1,024
 commands. The byte budget bounds queued payload: a frame carries up to 65,535
 bytes, so frames alone allowed 56 MiB per session, which a line-rate upload fills.
-It does not count a stream's unqueued slot, a UoT packet before its permit, or
-the encoded batch buffer. Exhausting the 1,024-command queue or a push after
+It does not count a UoT packet before its permit or the encoded batch buffer.
+Exhausting the 1,024-command queue or a push after
 close makes the session terminal instead of growing memory. The relay reads at
 most 65,535 bytes at a time, so one nonempty read is at most one AnyTLS frame;
 a 64 KiB read became a 65,535-byte frame and a 1-byte frame. A stream's SYN and
@@ -1042,8 +1042,14 @@ so another stream cannot interleave between them.
 Abandoned mid-open registrations send FIN rather than killing the session.
 
 After one blocking pop, the writer gathers only frames already queued, up to 63
-frames or 256 KiB on top of the first frame, into one `write_all` and one `flush`. It never waits to fill
-a batch. Data permits and confirmed-write completions are released only after
+frames or 256 KiB on top of the first frame, and sends them with one `flush`. It never waits to fill
+a batch. A data frame is serialized, header included, in the one copy that
+admits its payload, and a stream takes its queue permit before copying, so a
+write that returns `Pending` has copied nothing. Without padding the writer sends the frame's whole TLS
+records straight from that buffer and copies only control frames and the data
+bytes that do not fill a record of their own, so the batch keeps the record
+boundaries of one contiguous write.
+Data permits and confirmed-write completions are released only after
 the physical batch succeeds or the session becomes terminal.
 
 Control-only batches have a 5-second deadline (`writeControlFrame` sing-anytls
