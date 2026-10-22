@@ -718,7 +718,7 @@ async fn dead_on_arrival_session_engages_the_breaker() {
             Ok(session)
         })
     };
-    let error = offer_dead(&dials).await.unwrap_err().to_string();
+    let error = format!("{:#}", offer_dead(&dials).await.unwrap_err());
     assert!(error.contains("immediately unusable"), "{error}");
     assert_eq!(dials.load(Ordering::Relaxed), 1);
     let error = offer_dead(&dials).await.unwrap_err().to_string();
