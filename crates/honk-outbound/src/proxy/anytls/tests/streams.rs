@@ -383,8 +383,8 @@ pub(super) fn spawn_echo_server(
     addr_rx
 }
 
-/// poll_write cancel safety: a cancelled write neither loses the
-/// payload nor enqueues it twice; a retry reuses the stored slot.
+/// poll_write cancel safety: a resumed write enqueues its payload once,
+/// reusing the stored slot instead of copying it again.
 #[tokio::test]
 async fn test_poll_write_cancel_safety() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -584,6 +584,64 @@ async fn a_cancelled_write_does_not_send_or_count_its_bytes() {
         .unwrap()
         .unwrap();
     assert_eq!(echoed, new, "the cancelled payload must not reach the peer");
+}
+
+/// A Pending write accepted no bytes. Flushing or shutting down afterwards
+/// must not send the payload of the write the caller abandoned.
+#[tokio::test]
+async fn flush_after_a_cancelled_write_sends_nothing() {
+    use tokio::io::AsyncWriteExt;
+
+    for (shutdown, release_first) in [(false, true), (true, true), (false, false), (true, false)] {
+        let (session, mut server) = establish_test_session("127.0.0.1:447").await;
+        expect_handshake(&mut server).await;
+        let mut stream = session
+            .open_stream_direct(
+                vec![0x01, 127, 0, 0, 1, 0x01, 0xbb],
+                session.try_reserve().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_SYN);
+        assert_eq!(read_frame(&mut server).await.unwrap().0, CMD_PSH);
+
+        let held = Arc::clone(&session.writer_q.data_permits)
+            .try_acquire_many_owned((WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED) as u32)
+            .unwrap();
+        {
+            let write = stream.write(b"never-accepted");
+            tokio::pin!(write);
+            assert!(futures_util::poll!(&mut write).is_pending());
+        }
+        // Flushing must neither wait for the abandoned write's capacity nor
+        // send it once that capacity frees up.
+        let held = if release_first {
+            drop(held);
+            None
+        } else {
+            Some(held)
+        };
+        let close = async {
+            if shutdown {
+                stream.shutdown().await
+            } else {
+                stream.flush().await
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), close)
+            .await
+            .expect("flush must not wait on an abandoned write's capacity")
+            .unwrap();
+        drop(held);
+
+        let emitted =
+            tokio::time::timeout(Duration::from_millis(100), read_frame(&mut server)).await;
+        assert!(
+            emitted.is_err(),
+            "shutdown={shutdown} release_first={release_first}: the abandoned write reached the wire: {emitted:?}"
+        );
+        session.close();
+    }
 }
 
 #[tokio::test]

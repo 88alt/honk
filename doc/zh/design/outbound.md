@@ -888,8 +888,9 @@ completion。
 仅含控制帧的 batch 有 5 秒 deadline（与 sing-anytls `writeControlFrame` 一致），到期使 session 失败。含数据帧的 batch 没有 deadline：拥塞只对容量上限施加反压，不会终止同一 session 中的其他流。
 
 `AnyTlsStream::poll_write` 通过自有 outbound slot 保证 cancellation-safe。
-只有恰好这 `n` 字节进入有序 queue 后才返回 `Ok(n)`；取消既不会丢失
-pending chunk，也不会重复入队。
+只有恰好这 `n` 字节进入有序 queue 后才返回 `Ok(n)`，重试的写入只入队一次。
+返回 `Pending` 的写入没有接受任何字节：flush 与 shutdown 会丢弃该 chunk 而不是
+发送它，并且不等待 writer 容量即返回。
 
 ### 非阻塞 demultiplex
 

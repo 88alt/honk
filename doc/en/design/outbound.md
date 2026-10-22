@@ -1050,7 +1050,9 @@ congestion backpressures the cap without killing siblings.
 
 `AnyTlsStream::poll_write` is cancellation-safe through an owned outbound slot.
 It returns `Ok(n)` only after exactly those `n` bytes have entered the ordered
-queue; cancellation cannot lose a pending chunk or enqueue it twice.
+queue, and a retried write enqueues its chunk once. A write that returned
+`Pending` accepted nothing: flush and shutdown drop its chunk instead of sending
+it, and return without waiting for writer capacity.
 
 ### Non-blocking demultiplexing
 

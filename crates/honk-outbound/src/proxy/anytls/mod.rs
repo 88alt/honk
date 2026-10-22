@@ -1518,11 +1518,12 @@ pub(crate) struct AnyTlsStream {
     /// in the same poll: the error is owed to the next poll (data
     /// first, then the error — never silently merge them).
     read_err: Option<std::io::Error>,
-    /// Outbound frame slot: the payload is owned by the stream until it
-    /// is enqueued, so a resumed write cannot enqueue it twice, and a
-    /// cancelled one queued nothing to lose. `poll_write` only returns
-    /// `Ok(n)` after exactly these `n` bytes were queued (never a number
-    /// derived from a different call's buffer).
+    /// Outbound frame slot: the payload of a write that returned `Pending`,
+    /// owned by the stream until it is enqueued, so a resumed write cannot
+    /// enqueue it twice. It was not accepted: a cancelled write leaves it to
+    /// be replaced by the next write or dropped by flush, never sent.
+    /// `poll_write` only returns `Ok(n)` after exactly these `n` bytes were
+    /// queued (never a number derived from a different call's buffer).
     out_slot: Option<(bytes::Bytes, usize)>,
     /// Waiter for a writer-queue data permit while `out_slot` is occupied.
     permit_fut: Option<std::pin::Pin<Box<dyn Future<Output = std::io::Result<DataPermit>> + Send>>>,
@@ -1655,27 +1656,16 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         }
     }
 
+    /// Every accepted byte is already in the ordered queue. A slot left by a
+    /// write that returned `Pending` accepted nothing, so it is dropped here
+    /// rather than sent, and so is the waiter sized for it.
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
-        if let Some(fut) = this.permit_fut.as_mut() {
-            match fut.as_mut().poll(cx) {
-                std::task::Poll::Ready(Ok(permit)) => {
-                    this.permit_fut = None;
-                    if let Some((payload, _)) = this.out_slot.take() {
-                        this.session
-                            .enqueue_data_with_permit(this.sid, payload, permit)?;
-                    }
-                }
-                std::task::Poll::Ready(Err(e)) => {
-                    this.permit_fut = None;
-                    return std::task::Poll::Ready(Err(e));
-                }
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
-        }
+        this.permit_fut = None;
+        this.out_slot = None;
         std::task::Poll::Ready(Ok(()))
     }
 
