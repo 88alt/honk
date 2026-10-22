@@ -60,11 +60,10 @@ pub(super) const WRITER_QUEUE_CAP: usize = 1024;
 /// fill the queue past `WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED`.
 pub(super) const WRITER_CONTROL_RESERVED: usize = 128;
 /// Payload bytes queued ahead of the TLS writer, per session. The frame cap
-/// alone allowed 896 × 65,535 bytes (56 MiB) of in-flight payload: at line
-/// rate the relay fills it and RSS follows (124 MB peak measured with four
-/// upload streams). 8 MiB covers the writer's latency without changing
-/// throughput on the same run (62 MB peak).
-pub(super) const WRITER_DATA_BYTES_CAP: usize = 8 * 1024 * 1024;
+/// alone allowed 896 × 65,535 bytes (56 MiB) of in-flight payload. Every
+/// later frame, a new stream's SYN included, drains behind this backlog:
+/// 8 MiB is ~0.7 s at 100 Mbit/s, 1 MiB ~84 ms.
+pub(super) const WRITER_DATA_BYTES_CAP: usize = 1024 * 1024;
 /// sing-anytls bounds control writes at five seconds. A stuck shared writer
 /// must become terminal instead of remaining selectable by the session pool.
 /// Data batches stay unbounded like upstream: under uplink congestion the

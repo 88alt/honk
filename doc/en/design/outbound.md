@@ -1025,8 +1025,9 @@ last owner release drains future reuse without terminating live streams.
 ### Ordered write path
 
 Every frame crosses one `WriterQueue` and one physical writer task. Data permits
-are bounded by 896 frames and 8 MiB of queued or in-flight payload per session,
-whichever fills first. A full budget backpressures the writing stream.
+are bounded by 896 frames and 1 MiB of queued or in-flight payload per session,
+whichever fills first. A full budget backpressures the writing stream; the byte
+cap also bounds how long a new stream's SYN waits behind a saturated upload.
 Control frames retain reserved headroom; the whole queue is capped at 1,024
 commands. The byte budget bounds queued payload: a frame carries up to 65,535
 bytes, so frames alone allowed 56 MiB per session, which a line-rate upload fills.

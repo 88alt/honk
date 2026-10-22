@@ -868,8 +868,9 @@ UDP warm 所有权分别提高有效保留值；最后一个所有者释放时�
 ### 有序 write 路径
 
 所有 frame 都通过一个 `WriterQueue` 与一个物理 writer task。Data 使用两种单位的有界
-permit：每个 session 896 个 frame 与 8 MiB 已排队或在途的 payload，先满者生效，预算
-用尽时写入的 stream 被反压；control frame 保留 queue headroom，整个 queue 封顶
+permit：每个 session 896 个 frame 与 1 MiB 已排队或在途的 payload，先满者生效，预算
+用尽时写入的 stream 被反压；字节上限同时限制新 stream 的 SYN 在饱和上传之后等待的
+时间。control frame 保留 queue headroom，整个 queue 封顶
 1,024 条命令。1,024 条命令的 queue 耗尽或关闭后再 push 时 session 会转为 terminal，
 而不会继续增长内存。
 
