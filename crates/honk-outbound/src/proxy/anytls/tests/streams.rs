@@ -587,7 +587,8 @@ async fn a_cancelled_write_does_not_send_or_count_its_bytes() {
 }
 
 /// A Pending write accepted no bytes. Flushing or shutting down afterwards
-/// must not send the payload of the write the caller abandoned.
+/// must neither send the payload of the write the caller abandoned nor keep
+/// the queue slot its wait was granted.
 #[tokio::test]
 async fn flush_after_a_cancelled_write_sends_nothing() {
     use tokio::io::AsyncWriteExt;
@@ -633,6 +634,11 @@ async fn flush_after_a_cancelled_write_sends_nothing() {
             .expect("flush must not wait on an abandoned write's capacity")
             .unwrap();
         drop(held);
+        assert_eq!(
+            session.writer_q.data_permits.available_permits(),
+            WRITER_QUEUE_CAP - WRITER_CONTROL_RESERVED,
+            "shutdown={shutdown} release_first={release_first}: the abandoned write kept its queue slot"
+        );
 
         let emitted =
             tokio::time::timeout(Duration::from_millis(100), read_frame(&mut server)).await;
