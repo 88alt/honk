@@ -736,9 +736,7 @@ impl AnyTlsSession {
         u32::try_from(bytes.min(WRITER_DATA_BYTES_CAP)).expect("byte cap fits u32")
     }
 
-    /// Take a writer-queue data permit for `bytes` of payload without
-    /// waiting: a write that gets one copies its buffer straight into the
-    /// queued frame, so a resumed write neither copies nor compares first.
+    /// Take a writer-queue data permit for `bytes` of payload without waiting.
     fn try_data_permit(&self, bytes: usize) -> Option<DataPermit> {
         if self.is_closed() {
             return None;
@@ -1592,10 +1590,8 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         }
         let this = self.as_mut().get_mut();
 
-        // The queue's permit comes first: only the call that holds it copies
-        // this buffer, and it copies straight into the queued frame. A write
-        // that returns Pending has accepted nothing, so a cancelled call
-        // leaves no payload behind and a resumed one never compares bytes.
+        // Copy `buf` only with the queue's permit in hand, so a cancelled
+        // Pending write leaves nothing behind to send.
         let (mut wait, reserved) = match this.permit_wait.take() {
             Some(wait) => wait,
             None => {
