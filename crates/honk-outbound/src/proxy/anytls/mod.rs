@@ -1596,25 +1596,28 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         // this buffer, and it copies straight into the queued frame. A write
         // that returns Pending has accepted nothing, so a cancelled call
         // leaves no payload behind and a resumed one never compares bytes.
-        if this.permit_wait.is_none() {
-            if let Some(permit) = this.session.try_data_permit(chunk) {
-                let frame = data_frame(this.sid, &buf[..chunk]);
-                return std::task::Poll::Ready(
-                    this.session
-                        .push(FrameCommand::Data {
-                            sid: this.sid,
-                            frame,
-                            _permit: permit,
-                            completion: None,
-                        })
-                        .map(|()| chunk),
-                );
+        let (mut wait, reserved) = match this.permit_wait.take() {
+            Some(wait) => wait,
+            None => {
+                if let Some(permit) = this.session.try_data_permit(chunk) {
+                    let frame = data_frame(this.sid, &buf[..chunk]);
+                    return std::task::Poll::Ready(
+                        this.session
+                            .push(FrameCommand::Data {
+                                sid: this.sid,
+                                frame,
+                                _permit: permit,
+                                completion: None,
+                            })
+                            .map(|()| chunk),
+                    );
+                }
+                let session = Arc::clone(&this.session);
+                let wait: PermitWait =
+                    Box::pin(async move { session.acquire_data_permit(chunk).await });
+                (wait, chunk)
             }
-            let session = Arc::clone(&this.session);
-            let wait = async move { session.acquire_data_permit(chunk).await };
-            this.permit_wait = Some((Box::pin(wait), chunk));
-        }
-        let (mut wait, reserved) = this.permit_wait.take().expect("permit wait just set");
+        };
         let permit = match wait.as_mut().poll(cx) {
             std::task::Poll::Pending => {
                 // Keep this exact future: it holds the semaphore's place in
