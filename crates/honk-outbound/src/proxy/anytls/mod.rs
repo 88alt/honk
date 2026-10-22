@@ -641,6 +641,12 @@ impl AnyTlsSession {
     /// headroom, uncancellable once queued. Exhausting the bounded queue
     /// makes the shared session terminal rather than growing memory.
     fn enqueue_control(&self, cmd: u8, sid: u32, payload: bytes::Bytes) -> std::io::Result<()> {
+        self.push(FrameCommand::Control { cmd, sid, payload })
+    }
+
+    /// Queue one frame without a stream-registration check; a data frame
+    /// carries the permit its caller just took.
+    fn push(&self, frame: FrameCommand) -> std::io::Result<()> {
         if self.is_closed() {
             return Err(self.session_error(
                 std::io::ErrorKind::ConnectionAborted,
@@ -648,7 +654,7 @@ impl AnyTlsSession {
             ));
         }
         self.writer_q
-            .push_batch([FrameCommand::Control { cmd, sid, payload }])
+            .push_batch([frame])
             .map_err(|_| self.writer_queue_error())
     }
 
@@ -747,24 +753,6 @@ impl AnyTlsSession {
             _frame: frame,
             _bytes: bytes,
         })
-    }
-
-    /// Queue a [`data_frame`] of a live stream with a permit just taken.
-    fn push_data(&self, sid: u32, frame: bytes::Bytes, permit: DataPermit) -> std::io::Result<()> {
-        if self.is_closed() {
-            return Err(self.session_error(
-                std::io::ErrorKind::ConnectionAborted,
-                "AnyTLS session is closed",
-            ));
-        }
-        self.writer_q
-            .push_batch([FrameCommand::Data {
-                sid,
-                frame,
-                _permit: permit,
-                completion: None,
-            }])
-            .map_err(|_| self.writer_queue_error())
     }
 
     /// Enqueue a [`data_frame`] with an already-acquired permit.
@@ -1613,7 +1601,12 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
                 let frame = data_frame(this.sid, &buf[..chunk]);
                 return std::task::Poll::Ready(
                     this.session
-                        .push_data(this.sid, frame, permit)
+                        .push(FrameCommand::Data {
+                            sid: this.sid,
+                            frame,
+                            _permit: permit,
+                            completion: None,
+                        })
                         .map(|()| chunk),
                 );
             }
