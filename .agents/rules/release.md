@@ -29,13 +29,15 @@ The independent weekly `fuzz` job uses the nightly channel from `crates/honk-ebp
 
 Before upload, every x86_64 matrix entry extracts its packaged tarball into a clean temporary directory and runs the nested `honk-core --version`. This covers the loader and early startup for gnu/musl and both allocators, not configuration or datapath behavior. aarch64 artifacts are not executed. Manual release runs keep the same build checks; publication remains restricted to `v*` and `debug.*` tag refs, never branches.
 
+Every publication, formal or Debug, also uploads one `SHA256SUMS` covering all published archives and records a build-provenance attestation for each archive, checked with `gh attestation verify <archive> -R daeuniverse/honk`. The publication job alone holds `id-token: write` and `attestations: write` for that, next to `contents: write`.
+
 ### Debug releases
 
 - Push a source tag such as `debug.2026.9.19.score.1`; the trigger accepts `debug.*` without prescribing a date or component format. It runs the same tests and sixteen release-profile builds as formal tags.
 - Before publishing, `.github/ci/check-debug-artifacts.sh` requires all sixteen expected tarballs to be regular, nonempty files. Missing or empty inputs fail without publishing. The release test job runs `.github/ci/test-debug-artifacts.sh` against the same check.
 - Each source tag gets its own release, titled with the tag, at `/releases/tag/<tag>`. Earlier Debug releases are never moved or overwritten. Every Debug release is a prerelease with `make_latest: false`; notes identify the source tag, commit and workflow run.
 - After the tag release, the workflow force-moves `refs/tags/debug` to the same commit and updates the release titled `Debug` at `/releases/tag/debug` with the same tarballs, so that page and `/releases/download/debug/<asset>` always serve the newest published build. Assets the new build does not have, such as the previous `doona-source-<version>.tar.gz`, are deleted. Downstream pins name the per-tag release, never `debug`. Updating `debug` cannot retrigger `debug.*`.
-- Assets keep the fixed `honk-core-debug-<target>[-stock][-clash-api|-native-api].tar.gz` names inside each release; the unsuffixed name remains the full build. Re-running the same tag replaces that release's attachments only. Retrying only the release job requires all build artifacts to remain available; if any have expired (one-day retention) or been deleted, use **Re-run all jobs** to rebuild the complete set.
+- Assets keep the fixed `honk-core-debug-<target>[-stock]-{full|clash-api|native-api}.tar.gz` names inside each release. Before the variant suffix existed, the unsuffixed name was the full build; older releases keep that spelling. Re-running the same tag replaces that release's attachments only. Retrying only the release job requires all build artifacts to remain available; if any have expired (one-day retention) or been deleted, use **Re-run all jobs** to rebuild the complete set.
 - All Debug workflows share a concurrency group with `cancel-in-progress: false`, so a new push does not interrupt a running publication. `contents: write` stays confined to the publication job; formal `v*` publication remains independent.
 
 ### Release process (standing convention)
@@ -71,6 +73,7 @@ Before upload, every x86_64 matrix entry extracts its packaged tarball into a cl
     ```
 
     - Attribute commits to GitHub-resolved authors (`gh api repos/daeuniverse/honk/commits/<sha> --jq .author.login`), never raw git `Author:` names: the daeuniverse-org Release must show org-visible identity.
+    - Keep the workflow's `## Downloads` section, the archive table written by `.github/ci/release-assets.sh`, below the curated notes.
     - Group commits by their `type(scope)` prefix (`feat` → New Features, `fix` → Bug Fixes, `perf` → Performance, `docs`/`bench` → Documentation, `refactor`/`test` → fold into the nearest section or omit).
     - Apply `gh release edit <tag> --repo daeuniverse/honk --notes-file <file>` only after the build and workflow `release` job finish; the Release page does not exist earlier.
 
