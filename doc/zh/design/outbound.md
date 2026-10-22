@@ -841,6 +841,9 @@ stream permit、event-driven capacity wait、least-loaded 选择与 pool 所有�
 物理拨号 single-flight。Draining session 不计入可复用 cap，并可在存活
 stream 完成期间与 replacement 重叠。
 pool 还负责有界重试分类、退避、退役与幂等的强制关闭。
+dial 完成时已关闭的 session 计为拨号失败，不会发布。自己的 dial 已执行过的调用方不会再次拨号，依次：
+取有空位且 least-loaded 的 active session、等待其他调用方进行中的 dial、在退避窗口内快速失败、在已满的 active
+session 上等待容量；没有 active session 时失败并计一次拨号失败。
 初始化 waiter 接收同一个 `SharedError`；它通过 `Arc` clone 原始
 `anyhow::Error` 并保留 source chain。pool 在广播 builder failure 前绝不会
 把它压平成 display 文本。

@@ -993,6 +993,12 @@ waits, least-loaded selection, and pool-owned single-flight physical dials.
 Draining sessions are excluded from the reusable cap and can overlap
 replacements while live streams finish. The pool also owns bounded retry
 classification, backoff, retirement, and idempotent force shutdown.
+A session already closed when its dial completes counts as a dial failure and
+is never published. A caller whose own dial already ran never dials again; in
+order it takes the least-loaded active session with room, waits on another caller's
+in-flight dial, fails fast inside the backoff window, or waits for room on a
+full active session, and with no active session it fails and counts a dial
+failure.
 Initialization waiters receive one `SharedError`, which clones the original
 `anyhow::Error` through an `Arc` and preserves its source chain. The pool never
 flattens a builder failure to display text before broadcasting it.
