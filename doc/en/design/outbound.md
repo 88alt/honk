@@ -1050,8 +1050,7 @@ Abandoned mid-open registrations send FIN rather than killing the session.
 After one blocking pop, the writer gathers only frames already queued, up to 63
 frames or 256 KiB on top of the first frame, and sends them with one `flush`. It never waits to fill
 a batch. A data frame is serialized, header included, in the one copy that
-admits its payload, and a stream takes its queue permit before copying, so a
-write that returns `Pending` has copied nothing. Without padding the writer sends the frame's whole TLS
+admits its payload. Without padding the writer sends the frame's whole TLS
 records straight from that buffer and copies only control frames and the data
 bytes that do not fill a record of their own, so the batch keeps the record
 boundaries of one contiguous write.

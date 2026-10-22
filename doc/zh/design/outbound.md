@@ -886,8 +886,7 @@ batch 缓冲。relay 每次最多读 65,535 字节，一次非空读
 
 完成一次 blocking pop 后，writer 只收集已排队的 frame，最多 63 frame 或 256 KiB
 （均不含首帧），再执行一次 `flush`，不等待凑满 batch。data frame 在接纳 payload 的那一次
-复制中连同 header 一起序列化；stream 先取得队列 permit 再复制，因此返回 `Pending` 的写入
-没有复制任何字节。不加 padding 时，writer 直接从该缓冲区写出其完整的 TLS
+复制中连同 header 一起序列化。不加 padding 时，writer 直接从该缓冲区写出其完整的 TLS
 record，只复制 control frame 与不足一个 record 的 data 字节，因此 batch 的 record 边界
 与一次连续写入相同。只有物
 理 batch 成功或 session 变为 terminal 后，才释放 data permit 与 confirmed-write
