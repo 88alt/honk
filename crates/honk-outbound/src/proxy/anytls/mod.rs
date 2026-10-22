@@ -1634,7 +1634,8 @@ impl tokio::io::AsyncWrite for AnyTlsStream {
         };
         // The call that collects the permit may pass another buffer than the
         // one that started the wait; it queues up to the reserved bytes. A
-        // smaller buffer leaves the difference reserved until the flush.
+        // smaller buffer leaves the difference reserved until the writer has
+        // sent the frame.
         let n = chunk.min(reserved);
         let frame = data_frame(this.sid, &buf[..n]);
         std::task::Poll::Ready(
