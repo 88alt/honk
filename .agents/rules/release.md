@@ -38,18 +38,19 @@ Every publication, formal or Debug, also uploads one `SHA256SUMS` covering all p
 - Each source tag gets its own release, titled with the tag, at `/releases/tag/<tag>`. Earlier Debug releases are never moved or overwritten. Every Debug release is a prerelease with `make_latest: false`; notes identify the source tag, commit and workflow run.
 - After the tag release, the workflow force-moves `refs/tags/debug` to the same commit and updates the release titled `Debug` at `/releases/tag/debug` with the same tarballs, so that page and `/releases/download/debug/<asset>` always serve the newest published build. Assets the new build does not have, such as the previous `doona-source-<version>.tar.gz`, are deleted. Downstream pins name the per-tag release, never `debug`. Updating `debug` cannot retrigger `debug.*`.
 - Assets keep the fixed `honk-core-debug-<target>[-stock]-{full|clash-api|native-api}.tar.gz` names inside each release. Before the variant suffix existed, the unsuffixed name was the full build; older releases keep that spelling. Re-running the same tag replaces that release's attachments only. Retrying only the release job requires all build artifacts to remain available; if any have expired (one-day retention) or been deleted, use **Re-run all jobs** to rebuild the complete set.
+- After publishing, the workflow deletes per-tag Debug releases beyond the newest ten. Their source tags remain, so `git` can still check them out, but downloads from an older per-tag release stop working; downstream pins should follow the newest Debug tags.
 - All Debug workflows share a concurrency group with `cancel-in-progress: false`, so a new push does not interrupt a running publication. `contents: write` stays confined to the publication job; formal `v*` publication remains independent.
 
 ### Release process (standing convention)
 
-- **Tag naming:** `v0.0.1.beta.N` (strictly incrementing; check `git tag -l | sort -V | tail`). Tag the current `main` tip after it is pushed and its branch CI is green.
-- **Trigger:** tag push runs the full workflow above and creates the GitHub Release with `generate_release_notes: true` as a base.
-- **Release notes (agent-curated, dae `v2.0.0` style):** replace auto notes with this format after Release creation:
+- **Versions:** SemVer, `vMAJOR.MINOR.PATCH` with an optional `-alpha.N`, `-beta.N` or `-rc.N` suffix. `[workspace.package] version` in `Cargo.toml` is the only source: bump it (and `Cargo.lock` and `crates/honk-ebpf/Cargo.lock`) in a pull request, then tag `v<that version>` on the merged `main` tip once its branch CI is green. The test job runs `.github/ci/check-release-version.sh` and fails a tag that is not SemVer or differs from the manifest. A tag with a suffix publishes as a prerelease. Tags from before this scheme (`v0.0.1.beta.N`) stay as they are; never move or delete a published tag.
+- **Draft:** the tag creates a draft Release. Nobody outside the repository sees it until the maintainer publishes it.
+- **Notes:** `.github/ci/release-notes.sh` writes the draft body from the commits since the previous `v*` tag, followed by the `## Downloads` section from `.github/ci/release-assets.sh`:
 
     ```markdown
     ## Highlights
 
-    <2-5 bullets: what this release means to a gateway operator>
+    <!-- Maintainer: two to five bullets on what this release means to a gateway operator. -->
 
     ## What's Changed
 
@@ -57,25 +58,16 @@ Every publication, formal or Debug, also uploads one `SHA256SUMS` covering all p
 
     - <subject> by @<github-author> in <short-hash>
 
-    ### Bug Fixes
-
-    - <subject> by @<github-author> in <short-hash>
-
-    ### Performance
-
-    - <subject> by @<github-author> in <short-hash>
-
-    ### Documentation
-
-    - <subject> by @<github-author> in <short-hash>
+    ### Bug Fixes / ### Performance / ### Documentation
 
     **Full Changelog**: https://github.com/daeuniverse/honk/compare/<prev-tag>...<tag>
+
+    ## Downloads
     ```
 
-    - Attribute commits to GitHub-resolved authors (`gh api repos/daeuniverse/honk/commits/<sha> --jq .author.login`), never raw git `Author:` names: the daeuniverse-org Release must show org-visible identity.
-    - Keep the workflow's `## Downloads` section, the archive table written by `.github/ci/release-assets.sh`, below the curated notes.
-    - Group commits by their `type(scope)` prefix (`feat` → New Features, `fix` → Bug Fixes, `perf` → Performance, `docs`/`bench` → Documentation, `refactor`/`test` → fold into the nearest section or omit).
-    - Apply `gh release edit <tag> --repo daeuniverse/honk --notes-file <file>` only after the build and workflow `release` job finish; the Release page does not exist earlier.
+    - Commits are grouped by their `type(scope)` prefix: `feat` → New Features, `fix` → Bug Fixes, `perf` → Performance, `docs`/`bench` → Documentation; other types are counted, not listed.
+    - Authors are GitHub logins from `gh api repos/daeuniverse/honk/commits/<sha> --jq .author.login`, never raw git `Author:` names; a commit without a login is listed without one.
+- **Publish:** the maintainer replaces the Highlights comment, adjusts entries if needed, checks the assets against the build, then publishes with `gh release edit <tag> --repo daeuniverse/honk --draft=false` or **Publish release** in the web UI.
 
 - **Deployment:** after tagging, use the canonical musl mimalloc gateway tarball. Note development/manual `scp` deployments in the PR/issue of record when they differ from release artifacts.
 
