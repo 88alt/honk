@@ -105,7 +105,9 @@ pub struct AnyTlsHandler;
 /// Pool configuration shared by generation-owned and ephemeral AnyTLS runtimes.
 pub(crate) fn session_pool_config() -> crate::session::SessionPoolConfig {
     crate::session::SessionPoolConfig {
-        max_sessions: 2,
+        // Streams sharing a carrier share its TCP head-of-line stalls; on a
+        // lossy WAN two carriers left an interactive stream behind bulk ones.
+        max_sessions: 8,
         max_streams_per_session: MAX_STREAMS_PER_SESSION,
         spread_sessions: true,
         janitor_interval: Duration::from_secs(DEFAULT_IDLE_CHECK_INTERVAL_SECS),

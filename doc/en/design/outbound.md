@@ -997,9 +997,10 @@ Initialization waiters receive one `SharedError`, which clones the original
 `anyhow::Error` through an `Arc` and preserves its source chain. The pool never
 flattens a builder failure to display text before broadcasting it.
 
-AnyTLS configures two reusable physical sessions and 128 streams per session.
-It spreads work: after the first session becomes busy, the pool establishes the
-second before adding more load, then schedules least-loaded. Consecutive dial
+AnyTLS configures eight reusable physical sessions and 128 streams per session.
+It spreads work: while every session is busy and fewer than eight exist, the
+pool establishes another before adding more load, then schedules least-loaded,
+so concurrent streams do not share one TCP carrier's head-of-line stalls. Consecutive dial
 failures use bounded backoff instead of one physical connect per proxied flow.
 H2MUX and Mux.Cool instead fill the least-loaded carrier within their caps.
 

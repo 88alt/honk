@@ -845,9 +845,9 @@ pool 还负责有界重试分类、退避、退役与幂等的强制关闭。
 `anyhow::Error` 并保留 source chain。pool 在广播 builder failure 前绝不会
 把它压平成 display 文本。
 
-AnyTLS 配置两条可复用物理 session，每条 128 个 stream。它会 spread：
-第一条 session 变忙后，pool 会先建立第二条，再增加复用负载，随后按
-least-loaded 调度。连续拨号失败使用有界 backoff，而不是让每条代理 flow
+AnyTLS 配置八条可复用物理 session，每条 128 个 stream。它会 spread：
+所有 session 都忙且不足八条时，pool 会先建立新的一条，再增加复用负载，随后按
+least-loaded 调度，使并发 stream 不共享同一条 TCP carrier 的队头阻塞。连续拨号失败使用有界 backoff，而不是让每条代理 flow
 各执行一次物理连接。
 
 协商 v2 server settings（`CMD_SERVER_SETTINGS`、`v=2`）后，每个复用逻辑 stream（SID 2 及以后）的 SYN 写出后

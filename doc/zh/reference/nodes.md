@@ -96,7 +96,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
 | `tuic_init_stream_recv_window` / `tuic_init_conn_recv_window` | u64? | null | TUIC QUIC 接收窗口；有效默认值为 8 MiB / 8 MiB，conn 窗口自动增长至最多 32 MiB |
 | `juicity_uuid` / `juicity_password` | string? | null | Juicity 凭据；扁平字段须与别名 `username` / `password` 一致 |
 | `anytls_password` | string? | null | 从链接 userinfo 复制的 AnyTLS 密钥 |
-| `anytls_min_idle_session` | usize? | null | 来自 `min_idle_session` 的空闲 session 目标下限；有效默认值 0，受两条 session 的池上限约束 |
+| `anytls_min_idle_session` | usize? | null | 来自 `min_idle_session` 的空闲 session 目标下限；有效默认值 0，受八条 session 的池上限约束 |
 | `anytls_idle_session_check_interval` | u64? | null | 解析后的 `idle_session_check_interval` 秒数；当前运行时 janitor 周期仍固定为 30 秒 |
 | `anytls_idle_session_timeout` | u64? | null | 来自 `idle_session_timeout` 的空闲驱逐；有效默认值 30 秒 |
 | `mark` | u32? | null | 结构化模型中的出站 `SO_MARK`；不是 dae 分享链接 query |
@@ -317,7 +317,7 @@ node {
 | 链接输入 | 节点字段 / 行为 |
 | --- | --- |
 | userinfo 密钥 | `password` 与 `anytls_password` |
-| `min_idle_session` | `anytls_min_idle_session`；按 u16 解析并用作请求的待机下限，受两条 session 的池上限约束 |
+| `min_idle_session` | `anytls_min_idle_session`；按 u16 解析并用作请求的待机下限，受八条 session 的池上限约束 |
 | `idle_session_check_interval` | 以秒存储的 duration；当前不生效，因为 janitor 周期固定为 30 秒 |
 | `idle_session_timeout` | 以秒存储的 duration；默认 30 秒 |
 
