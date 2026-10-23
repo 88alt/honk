@@ -134,8 +134,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     }
 
     /// Use a custom endpoint constructor instead of [`super::client_endpoint`] (see
-    /// the field docs). Like the default constructor, the factory is called for
-    /// every dial.
+    /// the field docs). The factory runs for every dial and must return a fresh
+    /// socket.
     pub fn with_endpoint_factory(
         mut self,
         factory: impl Fn(bool) -> io::Result<Endpoint> + Send + Sync + 'static,
@@ -250,13 +250,14 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             anyhow::bail!("resolve {host}: no addresses");
         }
 
-        // Every dial binds a fresh socket, so a redial never inherits the local port of a
-        // black-holed flow: middleboxes keep dropping its NAT mapping for later connections.
         let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
             let ipv6 = server_addr.is_ipv6();
             let dial_config = self.config.clone();
             let selection = selection.as_ref();
             async move {
+                // Every dial binds a fresh socket, so a redial does not inherit the
+                // local port of a black-holed flow: middleboxes keep dropping its NAT
+                // mapping for later connections.
                 let endpoint =
                     crate::runtime::new_owned_quic_endpoint(|| match &self.endpoint_factory {
                         Some(factory) => factory(ipv6),
@@ -389,7 +390,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
         state.prune_connections();
     }
 
-    /// Close the cached connection and endpoint, terminating every flow that
+    /// Close the cached connection and the latest dial's endpoint, terminating every flow that
     /// still owns a connection clone, and reject future dials. Awaits an
     /// in-flight dial's single-flight section so its late connection is also
     /// closed; a try-lock skip would leak that connection and endpoint driver.
