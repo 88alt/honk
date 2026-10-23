@@ -688,7 +688,6 @@ async fn native_ephemeral_close_waits_for_quic_endpoint_idle() {
         .endpoint
         .as_ref()
         .unwrap()
-        .1
         .clone();
     assert!(endpoint.wait_idle().now_or_never().is_none());
     guard.close().await.unwrap();
