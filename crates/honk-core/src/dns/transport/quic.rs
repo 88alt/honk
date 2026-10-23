@@ -22,8 +22,7 @@ pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::Cli
 }
 
 /// Per-family endpoint of the latest direct dial, closed at shutdown, plus the
-/// owner of packet-backed endpoints. Every direct dial binds a fresh socket, as
-/// `QuicClient` does, so a redial never inherits a black-holed local port.
+/// owner of packet-backed endpoints.
 pub(super) struct SharedQuicEndpoint {
     direct: tokio::sync::Mutex<[Option<quinn::Endpoint>; 2]>,
     tasks: std::sync::Arc<honk_outbound::runtime::TaskOwner>,
@@ -37,7 +36,9 @@ impl SharedQuicEndpoint {
         }
     }
 
-    async fn get(&self, ipv6: bool) -> anyhow::Result<quinn::Endpoint> {
+    /// Binds a fresh socket for every direct dial, so a redial does not inherit
+    /// the local port of a black-holed flow.
+    async fn bind_direct(&self, ipv6: bool) -> anyhow::Result<quinn::Endpoint> {
         let created = honk_outbound::quic::client_endpoint(ipv6)
             .map_err(|e| anyhow::anyhow!("QUIC client endpoint: {e}"))?;
         self.direct.lock().await[usize::from(ipv6)] = Some(created.clone());
@@ -117,7 +118,7 @@ pub(super) fn with_packet_cause(
     }
 }
 
-/// Connect `config` to `addr`, using either the shared direct endpoint or an
+/// Connect `config` to `addr`, using either a freshly bound direct endpoint or an
 /// endpoint backed by the selected proxy's PacketTransport. `label` prefixes
 /// error messages (`DoQ` / `DoH3 QUIC`).
 async fn quic_connect(
@@ -150,7 +151,7 @@ async fn quic_connect(
     let endpoint = if let Some(owner) = &owner {
         owner.endpoint()
     } else {
-        direct = direct_endpoint.get(addr.is_ipv6()).await?;
+        direct = direct_endpoint.bind_direct(addr.is_ipv6()).await?;
         &direct
     };
     let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
