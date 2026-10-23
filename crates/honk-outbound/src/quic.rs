@@ -430,9 +430,9 @@ struct TrackedConnection<C> {
 }
 
 struct State<C> {
-    /// Lazily created endpoint, tagged with its address family. Recreated when
-    /// the family of the resolved server address changes.
-    endpoint: Option<(bool, crate::runtime::RuntimeEndpoint)>,
+    /// Endpoint of the most recent dial, closed by [`QuicClient::force_close`].
+    /// Never reused: each dial binds its own socket.
+    endpoint: Option<crate::runtime::RuntimeEndpoint>,
     conn: Option<(Connection, Arc<C>)>,
     connections: Vec<TrackedConnection<C>>,
     next_connection_id: u64,

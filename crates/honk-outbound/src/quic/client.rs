@@ -134,8 +134,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
     }
 
     /// Use a custom endpoint constructor instead of [`super::client_endpoint`] (see
-    /// the field docs). The factory is called once per address family and the
-    /// resulting endpoint is cached like the default one.
+    /// the field docs). Like the default constructor, the factory is called for
+    /// every dial.
     pub fn with_endpoint_factory(
         mut self,
         factory: impl Fn(bool) -> io::Result<Endpoint> + Send + Sync + 'static,
@@ -250,29 +250,20 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             anyhow::bail!("resolve {host}: no addresses");
         }
 
-        let cached_endpoint = state
-            .endpoint
-            .as_ref()
-            .map(|(ipv6, endpoint)| (*ipv6, endpoint.clone()));
+        // Every dial binds a fresh socket: a re-dial runs only after the previous
+        // connection died or was invalidated, and middleboxes that black-hole a
+        // flow keep dropping its NAT mapping for later connections on that port.
         let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
             let ipv6 = server_addr.is_ipv6();
             let dial_config = self.config.clone();
-            let endpoint = cached_endpoint
-                .as_ref()
-                .filter(|(cached_ipv6, _)| *cached_ipv6 == ipv6)
-                .map(|(_, endpoint)| endpoint.clone());
             let selection = selection.as_ref();
             async move {
-                let endpoint = match endpoint {
-                    Some(endpoint) => endpoint,
-                    None => {
-                        crate::runtime::new_owned_quic_endpoint(|| match &self.endpoint_factory {
-                            Some(factory) => factory(ipv6),
-                            None => client_endpoint_with_mtu(ipv6, self.mtu),
-                        })
-                        .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?
-                    }
-                };
+                let endpoint =
+                    crate::runtime::new_owned_quic_endpoint(|| match &self.endpoint_factory {
+                        Some(factory) => factory(ipv6),
+                        None => client_endpoint_with_mtu(ipv6, self.mtu),
+                    })
+                    .with_context(|| format!("create QUIC endpoint (ipv6={ipv6})"))?;
                 if let Some(selection) = selection {
                     selection.selected_ip(server_addr.ip());
                 }
@@ -331,7 +322,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             Some(result) => result?,
             None => anyhow::bail!("resolve {host}: no addresses"),
         };
-        state.endpoint = Some((ipv6, endpoint.clone()));
+        state.endpoint = Some(endpoint.clone());
         let mut close_guard = ConnectionCloseGuard::new(conn.clone());
         let ctx = match setup(conn.clone()).await {
             Ok(ctx) => ctx,
@@ -413,7 +404,7 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
                     .connection
                     .close(VarInt::from_u32(0), b"generation shutdown");
             }
-            state.endpoint.take().map(|(_, endpoint)| endpoint)
+            state.endpoint.take()
         };
         if let Some(endpoint) = endpoint {
             endpoint.close(VarInt::from_u32(0), b"generation shutdown");
