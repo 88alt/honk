@@ -250,9 +250,8 @@ impl<C: Send + Sync + 'static> QuicClient<C> {
             anyhow::bail!("resolve {host}: no addresses");
         }
 
-        // Every dial binds a fresh socket: a re-dial runs only after the previous
-        // connection died or was invalidated, and middleboxes that black-hole a
-        // flow keep dropping its NAT mapping for later connections on that port.
+        // Every dial binds a fresh socket, so a redial never inherits the local port of a
+        // black-holed flow: middleboxes keep dropping its NAT mapping for later connections.
         let raced = crate::address_race::race_resolved_addrs(&addrs, |server_addr| {
             let ipv6 = server_addr.is_ipv6();
             let dial_config = self.config.clone();

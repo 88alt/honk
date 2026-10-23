@@ -22,9 +22,8 @@ pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::Cli
 }
 
 /// Per-family endpoint of the latest direct dial, closed at shutdown, plus the
-/// owner of packet-backed endpoints. Every direct dial binds a fresh socket: a
-/// re-dial follows a dead or retired connection, and middleboxes that black-hole
-/// a flow keep dropping its NAT mapping for later connections on that port.
+/// owner of packet-backed endpoints. Every direct dial binds a fresh socket, as
+/// `QuicClient` does, so a redial never inherits a black-holed local port.
 pub(super) struct SharedQuicEndpoint {
     direct: tokio::sync::Mutex<[Option<quinn::Endpoint>; 2]>,
     tasks: std::sync::Arc<honk_outbound::runtime::TaskOwner>,
