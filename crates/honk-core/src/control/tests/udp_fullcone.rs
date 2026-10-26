@@ -87,7 +87,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
     })?;
     let target_b = targets.pop().context("target B socket")?;
     let target_a = targets.pop().context("target A socket")?;
-    let _dae0 = daens::create_dae0_link()?;
+    let (_dae0, dae0_setup) = daens::create_dae0_link()?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -96,15 +96,16 @@ fn run_child(case: &str) -> anyhow::Result<()> {
             let scenario = async {
                 let config = lab_config(peer.node());
                 let pin_root = Path::new("/sys/fs/bpf/fullcone");
+                let local_ip = RealEbpfBackend::test_local_ip(&["honk-lan0"], &["honk-wan0"]);
                 let mut backend = RealEbpfBackend::load(
                     crate::DEFAULT_BPF_OBJECT,
                     pin_root,
                     config.global.tproxy_port,
-                    Some("honk-lan0"),
-                    "honk-wan0",
-                    false,
+                    &dae0_setup,
+                    local_ip,
                 )
                 .await?;
+                backend.bind_test_interfaces(&["honk-lan0"], &["honk-wan0"]);
                 backend.attach_dae0_programs()?;
                 daens::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
                 backend.attach_sk_lookup()?;
