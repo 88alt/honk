@@ -8,8 +8,8 @@
 //!   bridge port resolves to the bridge;
 //! - a member of any other master except `vrf`/`openvswitch` resolves to that
 //!   master (one level); `vrf`/`openvswitch` members stay themselves;
-//! - a LAN-intent bridge root also binds every port, and a bond root also binds
-//!   every member (a bond that is a bridge port is a port, never expanded).
+//! - a LAN-intent bridge root also binds every port (a bond port stays one
+//!   logical port); a bond root binds only itself, never its members.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -87,7 +87,7 @@ pub(crate) struct Binding {
     pub ifindex: NonZeroU32,
     pub direction: Direction,
     pub program: TcProgram,
-    /// Name of the bound link itself (a port or member, not its root).
+    /// Name of the bound link itself (a bridge port, not its root).
     pub interface: String,
 }
 
@@ -203,7 +203,7 @@ pub(crate) struct InterfacePlan {
     /// Canonical roots with WAN intent, `LanWan` included (accept_ra targets).
     pub wan_roots: Vec<(NonZeroU32, String)>,
     /// Configured entries as written that resolve to a bindable root, with every
-    /// ifindex their bindings derive from (root, bridge ports, bond members).
+    /// ifindex their bindings derive from (root and bridge ports).
     /// Unresolved `auto`, absent and refused entries are in `unbound` instead.
     pub bound: Vec<(String, Vec<NonZeroU32>)>,
 }
@@ -409,7 +409,7 @@ struct Root<'a> {
     link: &'a LinkSnapshot,
     lan: bool,
     wan: bool,
-    /// Root plus the ports/members its intent binds.
+    /// Root plus the bridge ports its intent binds.
     derived: Vec<NonZeroU32>,
 }
 
@@ -504,7 +504,7 @@ fn bind(
     direction: Direction,
     lan: bool,
 ) {
-    // A bridge port or bond member the programs cannot parse is skipped.
+    // A bridge port the programs cannot parse is skipped.
     let l2 = match Framing::of(link.arphrd, link.flags) {
         Framing::L2 => true,
         Framing::L3 => false,
@@ -554,33 +554,16 @@ pub(crate) fn plan(lan: &[String], wan: &[String], topology: &Topology) -> Inter
         );
     }
     for root in &mut roots {
-        match root.link.kind.as_deref() {
-            Some("bridge") if root.lan => {
-                for port in topology
-                    .links
-                    .iter()
-                    .filter(|l| l.master == Some(root.link.ifindex))
-                {
-                    bind(&mut bindings, port, Direction::Ingress, true);
-                    bind(&mut bindings, port, Direction::Egress, true);
-                    root.derived.push(port.ifindex);
-                }
+        if root.link.kind.as_deref() == Some("bridge") && root.lan {
+            for port in topology
+                .links
+                .iter()
+                .filter(|l| l.master == Some(root.link.ifindex))
+            {
+                bind(&mut bindings, port, Direction::Ingress, true);
+                bind(&mut bindings, port, Direction::Egress, true);
+                root.derived.push(port.ifindex);
             }
-            // The bond may emit host traffic directly on a member.
-            Some("bond") => {
-                for member in topology
-                    .links
-                    .iter()
-                    .filter(|l| l.master == Some(root.link.ifindex))
-                {
-                    if root.lan {
-                        bind(&mut bindings, member, Direction::Ingress, true);
-                    }
-                    bind(&mut bindings, member, Direction::Egress, false);
-                    root.derived.push(member.ifindex);
-                }
-            }
-            _ => {}
         }
     }
 

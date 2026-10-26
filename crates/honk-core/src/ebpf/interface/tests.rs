@@ -193,27 +193,15 @@ fn wan_bridge_root_binds_only_itself() {
 }
 
 #[test]
-fn bond_root_and_member_alias_dedup() {
-    let lan_expected = [
-        "20 in lan_ingress_l2",
-        "20 eg lan_egress_l2",
-        "21 in lan_ingress_l2",
-        "21 eg wan_egress_l2",
-        "22 in lan_ingress_l2",
-        "22 eg wan_egress_l2",
-    ];
+fn bond_root_binds_only_itself_whatever_alias_names_it() {
+    let lan_expected = ["20 in lan_ingress_l2", "20 eg lan_egress_l2"];
     for lan in [&["bond0"][..], &["m1"], &["m1", "bond0", "m2"]] {
         let plan = run(lan, &[], &[bond()]);
         assert_eq!(set(&plan), lan_expected, "{lan:?}");
         assert_eq!(plan.lan_roots, ["bond0"], "{lan:?}");
-        assert_eq!(bound(&plan, lan[0]), ids(&[20, 21, 22]), "{lan:?}");
+        assert_eq!(bound(&plan, lan[0]), ids(&[20]), "{lan:?}");
     }
-    let wan_expected = [
-        "20 in wan_ingress_l2",
-        "20 eg wan_egress_l2",
-        "21 eg wan_egress_l2",
-        "22 eg wan_egress_l2",
-    ];
+    let wan_expected = ["20 in wan_ingress_l2", "20 eg wan_egress_l2"];
     for wan in [&["bond0"][..], &["m2", "bond0"]] {
         let plan = run(&[], wan, &[bond()]);
         assert_eq!(set(&plan), wan_expected, "{wan:?}");
@@ -222,6 +210,9 @@ fn bond_root_and_member_alias_dedup() {
             [(NonZeroU32::new(20).unwrap(), "bond0".to_string())]
         );
     }
+    // Shared LAN/WAN through a member name and the master: one LanWan root.
+    let plan = run(&["m1"], &["bond0"], &[bond()]);
+    assert_eq!(set(&plan), ["20 in lan_ingress_l2", "20 eg wan_egress_l2"]);
 }
 
 #[test]
@@ -319,19 +310,13 @@ fn l3_devices_use_l3_programs_per_device() {
         ]
     );
 
-    // Ports and members classify by their own ARPHRD, not the root's.
+    // Ports classify by their own ARPHRD, not the root's.
     let mut links = bridge();
     links.push(link(13, "p3").master(10).arphrd(NONE));
     let plan = run(&["br0"], &[], &[links]);
     assert!(set(&plan).contains(&"13 in lan_ingress_l3".to_string()));
     assert!(set(&plan).contains(&"13 eg lan_egress_l3".to_string()));
     assert!(set(&plan).contains(&"12 eg lan_egress_l2".to_string()));
-
-    let mut links = bond();
-    links.push(link(23, "m3").master(20).arphrd(NONE));
-    let plan = run(&["bond0"], &[], &[links]);
-    assert!(set(&plan).contains(&"23 in lan_ingress_l3".to_string()));
-    assert!(set(&plan).contains(&"23 eg wan_egress_l3".to_string()));
 }
 
 #[test]
@@ -395,13 +380,13 @@ fn absent_names_are_unbound_and_not_bound_entries() {
 }
 
 #[test]
-fn bound_entries_cover_roots_ports_and_members() {
+fn bound_entries_cover_roots_and_bridge_ports() {
     let plan = run(&["br0", "ens3"], &["eth1"], &[base(), bridge()]);
     assert_eq!(bound(&plan, "br0"), ids(&[10, 11, 12]));
     assert_eq!(bound(&plan, "ens3"), ids(&[2]));
     assert_eq!(bound(&plan, "eth1"), ids(&[3]));
     let plan = run(&["ens3"], &["bond0", "eth1"], &[base(), bond()]);
-    assert_eq!(bound(&plan, "bond0"), ids(&[20, 21, 22]));
+    assert_eq!(bound(&plan, "bond0"), ids(&[20]));
 }
 #[test]
 fn unsupported_nesting_refuses_only_the_affected_entry() {
@@ -697,19 +682,13 @@ fn non_ethernet_bond_root_is_refused() {
 }
 
 #[test]
-fn unsupported_ports_and_members_are_skipped_silently() {
+fn unsupported_bridge_ports_are_skipped_silently() {
     let mut links = bridge();
     links.push(link(13, "p3").master(10).arphrd(32));
     let plan = run(&["br0"], &[], &[links]);
     assert!(plan.unbound.is_empty());
     assert!(set(&plan).iter().all(|b| !b.starts_with("13 ")));
     assert!(set(&plan).contains(&"11 in lan_ingress_l2".to_string()));
-
-    let mut links = bond();
-    links.push(link(23, "m3").master(20).arphrd(LOOPBACK));
-    let plan = run(&["bond0"], &[], &[links]);
-    assert!(plan.unbound.is_empty());
-    assert!(set(&plan).iter().all(|b| !b.starts_with("23 ")));
 }
 #[test]
 fn local_ip_interface_never_names_a_refused_root() {
