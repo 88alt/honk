@@ -5,26 +5,27 @@
 //! owner (`bindings`). Every step that can wait on rtnl (link dump, TCX
 //! create/update/query, closing a link FD, sysctl) runs on a blocking thread
 //! with no backend lock held; the backend lock is taken only to snapshot
-//! (read) and to commit (write).
+//! (read) and to commit (write). Without a usable event
+//! subscription the same loop runs on the ticker alone.
 
 use nix::errno::Errno;
 use nix::sys::socket::{
     AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, socket,
 };
-use std::collections::HashSet;
-use std::num::NonZeroU32;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context as _;
+use tokio::io::unix::AsyncFd;
 use tokio::sync::{RwLock, mpsc, watch};
-use tracing::{debug, error, info, warn};
+use tokio::time::Instant;
+use tracing::{debug, info, warn};
 
+use super::interface_startup::InterfaceHandoff;
+use super::interface_state::{self, InterfaceState, SysctlWrite};
 use crate::ebpf::EbpfBackend;
-use crate::ebpf::interface::{
-    self, ApplyReport, Binding, BindingSnapshot, Direction, InterfacePlan, TcProgram, Topology,
-};
+use crate::ebpf::interface::status::{BindFailure, ReconcileStep};
+use crate::ebpf::interface::{self, ApplyReport, BindingSnapshot, InterfacePlan, Topology};
 use crate::netlink::{RTM_DELLINK, RTM_NEWLINK};
 
 // A captive-portal login may add only a default route to an already-up link.
@@ -40,13 +41,13 @@ const RTMGRP_NETWORK_MASK: u32 = RTMGRP_LINK_MASK
     | RTMGRP_IPV6_ROUTE;
 // Events are a wakeup hint only — reconcile re-reads ground truth — but a
 // dropped datagram would stall a pending interface forever, so a slow ticker
-// backstops the subscription.
+// backstops the subscription (and is the only trigger without one).
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
 type ReadTopology = dyn Fn(bool) -> anyhow::Result<Topology> + Send + Sync;
 type ApplyBindings =
     dyn Fn(BindingSnapshot, &InterfacePlan, &Topology, bool) -> ApplyReport + Send + Sync;
-type AcceptRa = dyn Fn(&str) + Send + Sync;
+type WriteSysctl = dyn Fn(&SysctlWrite) -> anyhow::Result<()> + Send + Sync;
 
 /// The blocking steps of a batch, injectable so watcher logic is tested
 /// without a kernel.
@@ -54,7 +55,10 @@ type AcceptRa = dyn Fn(&str) + Send + Sync;
 pub(super) struct Reconciler {
     read_topology: Arc<ReadTopology>,
     apply: Arc<ApplyBindings>,
-    accept_ra: Arc<AcceptRa>,
+    sysctl: Arc<WriteSysctl>,
+    /// Ticker period; also the shortest gap between two verifications that
+    /// only a failed binding asks for.
+    interval: Duration,
 }
 
 impl Default for Reconciler {
@@ -62,7 +66,8 @@ impl Default for Reconciler {
         Self {
             read_topology: Arc::new(interface::read_topology),
             apply: Arc::new(super::bindings::apply),
-            accept_ra: Arc::new(crate::sysctl::enable_wan_accept_ra),
+            sysctl: Arc::new(interface_state::write_sysctl),
+            interval: RECONCILE_INTERVAL,
         }
     }
 }
@@ -79,37 +84,27 @@ pub struct IfaceWatcher {
 }
 
 impl IfaceWatcher {
+    /// Takes over the subscription and the interface state startup built; with
+    /// no subscription the watcher reconciles on its ticker alone.
     pub(crate) fn spawn(
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
         degradations: Arc<crate::degradations::Degradations>,
-    ) -> Option<Self> {
-        let fd = match subscribe_network_events() {
-            Ok(fd) => fd,
-            Err(e) => {
-                error!(
-                    "interface watcher disabled; subscribe network events failed: {}",
-                    e
-                );
-                degradations.set(
-                    crate::degradations::Component::IfaceWatch,
-                    watcher_disabled("subscribe_failed"),
-                );
-                return None;
-            }
-        };
+        handoff: InterfaceHandoff,
+    ) -> Self {
         let (stop, rx) = watch::channel(false);
         let handle = tokio::spawn(run(
-            fd,
+            handoff.subscription,
             ebpf,
             config,
             commands,
             rx,
             degradations,
+            handoff.state,
             Reconciler::default(),
         ));
-        Some(Self { handle, stop })
+        Self { handle, stop }
     }
 
     /// Stop between batches and wait for the task. A batch in flight always
@@ -127,11 +122,31 @@ impl IfaceWatcher {
     }
 }
 
-fn watcher_disabled(reason: &'static str) -> crate::degradations::Issue {
+fn watcher_ticker_only(reason: &'static str) -> crate::degradations::Issue {
     crate::degradations::Issue {
         code: "interface_watcher_disabled",
-        message: "The interface watcher is not running; interface changes take effect after a restart.",
+        message: "The interface watcher reconciles every 60 seconds without event notifications.",
         reason,
+    }
+}
+
+/// The rtnetlink subscription, opened before the startup dump and handed to
+/// the watcher. Its initial reconcile also covers changes during startup.
+/// A failure is reported and the watcher runs on its ticker.
+pub(super) fn subscribe(degradations: &crate::degradations::Degradations) -> Option<OwnedFd> {
+    match subscribe_network_events() {
+        Ok(fd) => Some(fd),
+        Err(error) => {
+            warn!(
+                "interface watcher has no event subscription ({error}); reconciling every {}s",
+                RECONCILE_INTERVAL.as_secs()
+            );
+            degradations.set(
+                crate::degradations::Component::IfaceWatch,
+                watcher_ticker_only("subscribe_failed"),
+            );
+            None
+        }
     }
 }
 
@@ -205,35 +220,40 @@ fn drain_with(
     Ok(drained)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
-    fd: OwnedFd,
+    subscription: Option<OwnedFd>,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     mut stop: watch::Receiver<bool>,
     degradations: Arc<crate::degradations::Degradations>,
+    state: InterfaceState,
     reconciler: Reconciler,
 ) {
-    let async_fd = match unsafe {
-        tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE)
-    } {
-        Ok(f) => f,
-        Err(e) => {
-            error!("interface watcher disabled: AsyncFd setup failed: {}", e);
-            degradations.set(
-                crate::degradations::Component::IfaceWatch,
-                watcher_disabled("poll_setup_failed"),
-            );
-            return;
+    let async_fd = subscription.and_then(|fd| {
+        match unsafe { AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE) } {
+            Ok(async_fd) => Some(async_fd),
+            Err(error) => {
+                warn!(
+                    "interface watcher cannot poll its subscription ({error}); reconciling every {}s",
+                    reconciler.interval.as_secs()
+                );
+                degradations.set(
+                    crate::degradations::Component::IfaceWatch,
+                    watcher_ticker_only("poll_setup_failed"),
+                );
+                None
+            }
         }
-    };
-    let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
+    });
+    let mut ticker = tokio::time::interval(reconciler.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut buf = [0u8; 8192];
     let mut network_state = read_network_state(&config).await;
     let mut netlink_retry_at = tokio::time::Instant::now();
     let notification_queue = commands.clone();
-    let mut watch = Watch::new(ebpf, config, commands, reconciler);
+    let mut watch = Watch::new(ebpf, config, commands, reconciler, degradations, state);
 
     // Interface-dependent state may have changed before the watcher was ready;
     // the control-plane refresh is content-deduplicated.
@@ -253,10 +273,12 @@ async fn run(
                 let changed = update_network_state(&watch.config, &mut network_state).await;
                 watch.reconcile_and_notify(changed, true).await;
             }
-            guard = async {
-                tokio::time::sleep_until(netlink_retry_at).await;
-                async_fd.readable().await
-            } => {
+            // The second write of a late device's sysctls, after its udev run;
+            // without this a quiet host would wait for the ticker.
+            _ = sysctl_due(watch.state.sysctl_due()) => {
+                watch.reconcile_and_notify(false, false).await;
+            }
+            guard = readable(async_fd.as_ref(), netlink_retry_at) => {
                 // A transient read failure must not kill the watcher: the
                 // ticker keeps reconciling regardless.
                 let mut guard = match guard {
@@ -288,6 +310,29 @@ async fn run(
     debug!("interface watcher stopped");
 }
 
+/// Never ready when nothing is owed. A due time that has passed (the last
+/// pass failed before claiming) waits a second rather than spinning.
+async fn sysctl_due(due: Option<Instant>) {
+    match due {
+        Some(due) => {
+            tokio::time::sleep_until(due.max(Instant::now() + Duration::from_secs(1))).await
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Readiness of the subscription; never ready without one.
+async fn readable<'a>(
+    async_fd: Option<&'a AsyncFd<OwnedFd>>,
+    retry_at: Instant,
+) -> std::io::Result<tokio::io::unix::AsyncFdReadyGuard<'a, OwnedFd>> {
+    let Some(async_fd) = async_fd else {
+        return std::future::pending().await;
+    };
+    tokio::time::sleep_until(retry_at).await;
+    async_fd.readable().await
+}
+
 async fn read_network_state(config: &Arc<RwLock<Arc<honk_config::Config>>>) -> NetworkState {
     let config = config.read().await.clone();
     tokio::task::spawn_blocking(move || NetworkState {
@@ -315,9 +360,8 @@ pub(super) struct Watch {
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     commands: mpsc::Sender<crate::control::ControlCommand>,
     reconciler: Reconciler,
-    /// Interfaces whose attach failure was already warned; reconcile retries
-    /// on every event and tick.
-    warned: HashSet<String>,
+    degradations: Arc<crate::degradations::Degradations>,
+    state: InterfaceState,
     pending_notification: bool,
 }
 
@@ -327,25 +371,26 @@ impl Watch {
         config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: mpsc::Sender<crate::control::ControlCommand>,
         reconciler: Reconciler,
+        degradations: Arc<crate::degradations::Degradations>,
+        state: InterfaceState,
     ) -> Self {
         Self {
             ebpf,
             config,
             commands,
             reconciler,
-            warned: HashSet::new(),
+            degradations,
+            state,
             pending_notification: true,
         }
     }
 
     async fn reconcile_and_notify(&mut self, network_state_changed: bool, verify: bool) {
         self.pending_notification |= network_state_changed;
+        // Failures are logged by their episodes; any of them still asks for a refresh.
         match self.reconcile(verify).await {
             Ok(changed) => self.pending_notification |= changed,
-            Err(error) => {
-                debug!("interface reconcile: {error:#}");
-                self.pending_notification = true;
-            }
+            Err(_) => self.pending_notification = true,
         }
         if self.pending_notification {
             match self
@@ -362,6 +407,12 @@ impl Watch {
         }
     }
 
+    /// A stage failed as a whole: log its episode and keep what is bound.
+    fn step_failed(&mut self, step: ReconcileStep, error: anyhow::Error) -> anyhow::Error {
+        self.state.step_failed(step, &error);
+        error
+    }
+
     /// One batch: read and plan, snapshot (read lock), apply (no lock), commit
     /// (write lock). Once started it always finishes its commit. `verify`
     /// re-proves retained links against the kernel chain.
@@ -373,104 +424,141 @@ impl Watch {
                 config.global.wan_interface.clone(),
             )
         };
-        let any_auto = interface::any_auto(&lan, &wan);
+
         let mut changed = false;
-        let mut failed = Vec::new();
+        let mut last = None;
         // A device that changed under the apply is retried once; the ticker
         // handles anything that keeps moving.
         for round in 0..2 {
             let read = Arc::clone(&self.reconciler.read_topology);
             let (lan, wan) = (lan.clone(), wan.clone());
-            let (topology, plan) = tokio::task::spawn_blocking(move || {
-                let topology = read(any_auto)?;
-                let plan = interface::plan(&lan, &wan, &topology)?;
-                anyhow::Ok((topology, plan))
+            let planned = tokio::task::spawn_blocking(move || {
+                let topology = read(interface::any_auto(&lan, &wan))?;
+                let plan = interface::plan(&lan, &wan, &topology);
+                Ok::<_, anyhow::Error>((topology, plan))
             })
-            .await
-            .context("topology task")??;
-
-            let snapshot = {
-                let backend = self.ebpf.read().await;
-                backend.interface_binding_snapshot()?
+            .await;
+            let (topology, plan) = match planned {
+                Ok(Ok(planned)) => planned,
+                Ok(Err(error)) => return Err(self.step_failed(ReconcileStep::Topology, error)),
+                Err(error) => return Err(self.step_failed(ReconcileStep::Join, error.into())),
             };
 
+            // On sight: the device is in the dump, whether or not it binds.
+            let owed = self.state.claim_sysctls(&plan, &topology, Instant::now());
+            if !owed.is_empty() {
+                let write = Arc::clone(&self.reconciler.sysctl);
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || interface_state::perform(&owed, &*write))
+                        .await
+                {
+                    return Err(self.step_failed(ReconcileStep::Join, error.into()));
+                }
+            }
+
+            let snapshot = self.ebpf.read().await.interface_binding_snapshot();
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => return Err(self.step_failed(ReconcileStep::Snapshot, error)),
+            };
+            let held: Vec<_> = snapshot
+                .owned
+                .iter()
+                .map(|(binding, ..)| binding.key())
+                .collect();
+
+            let now = Instant::now();
+            // A binding that failed its proof is looked at again, but no more
+            // often than the ticker, so one stuck binding does not turn every
+            // route event into a TCX query per binding.
+            let retry_due = !self.state.unproven.is_empty()
+                && self
+                    .state
+                    .last_verify
+                    .is_none_or(|at| now.duration_since(at) >= self.reconciler.interval);
+            let verify = verify || retry_due || round != 0;
+            if verify {
+                self.state.last_verify = Some(now);
+            }
             let apply = Arc::clone(&self.reconciler.apply);
-            let verify = verify || !self.warned.is_empty() || round != 0;
-            let (report, plan) = tokio::task::spawn_blocking(move || {
+            let applied = tokio::task::spawn_blocking(move || {
                 let report = apply(snapshot, &plan, &topology, verify);
                 (report, plan)
             })
-            .await
-            .context("apply task")?;
+            .await;
+            let (report, plan) = match applied {
+                Ok(applied) => applied,
+                Err(error) => return Err(self.step_failed(ReconcileStep::Join, error.into())),
+            };
             let ApplyReport {
                 commit,
-                failed: round_failed,
+                failed,
                 topology_changed,
             } = report;
+            let touched: Vec<_> = commit
+                .add
+                .iter()
+                .map(|(binding, ..)| binding.key())
+                .chain(
+                    commit
+                        .reprogram
+                        .iter()
+                        .map(|(ifindex, direction, _)| (*ifindex, *direction)),
+                )
+                .collect();
+            let owned = commit.keys_after(&held);
             if !commit.is_empty() {
                 changed = true;
                 log_commit(&commit);
-                // accept_ra follows WAN-role roots that gained a binding or moved
-                // onto a WAN egress program.
-                let accept_ra: Vec<String> = plan
-                    .wan_roots
-                    .iter()
-                    .filter(|(ifindex, _)| gains_wan_egress(&commit, *ifindex))
-                    .map(|(_, name)| name.clone())
-                    .collect();
                 let closed = self.ebpf.write().await.commit_interface_bindings(commit);
-                let write_accept_ra = Arc::clone(&self.reconciler.accept_ra);
-                tokio::task::spawn_blocking(move || {
-                    drop(closed);
-                    for name in &accept_ra {
-                        write_accept_ra(name);
-                    }
-                })
-                .await
-                .context("close task")?;
+                // The last close of a link takes the rtnl lock.
+                if let Err(error) = tokio::task::spawn_blocking(move || drop(closed)).await {
+                    return Err(self.step_failed(ReconcileStep::Join, error.into()));
+                }
             }
-            failed = round_failed;
+            let mut failures: Vec<BindFailure> = failed
+                .iter()
+                .map(|(binding, error)| BindFailure::new(binding, error))
+                .collect();
+            if !verify {
+                // Not looked at this pass: still as unproven as before.
+                let carried: Vec<_> = self
+                    .state
+                    .unproven
+                    .iter()
+                    .filter(|old| {
+                        owned.contains(&old.key)
+                            && !touched.contains(&old.key)
+                            && !failures.iter().any(|f| f.key == old.key)
+                    })
+                    .cloned()
+                    .collect();
+                failures.extend(carried);
+            }
+            self.state
+                .settle(&plan, &owned, &failures, &self.degradations);
+            self.state.unproven = failures
+                .iter()
+                .filter(|failure| owned.contains(&failure.key))
+                .cloned()
+                .collect();
+            last = Some(failures);
             if !topology_changed || round == 1 {
                 break;
             }
         }
-        self.note_failures(&failed);
-        match failed.into_iter().next() {
-            Some((binding, error)) => Err(error.context(format!(
-                "attach {} to interface {}",
-                binding.program.name(),
-                binding.interface
-            ))),
+        let failures = last.expect("the first round always runs");
+        self.state.step_recovered();
+        match failures.first() {
+            Some(failure) => Err(anyhow::anyhow!(
+                "{} on {}: {}",
+                failure.program,
+                failure.interface,
+                failure.message
+            )),
             None => Ok(changed),
         }
     }
-
-    /// WARN once per interface and failure episode; an interface that binds (or
-    /// leaves the plan) ends its episode.
-    fn note_failures(&mut self, failed: &[(Binding, anyhow::Error)]) {
-        self.warned
-            .retain(|name| failed.iter().any(|(binding, _)| &binding.interface == name));
-        for (binding, error) in failed {
-            crate::logging::warn_on_entry!(
-                self.warned.insert(binding.interface.clone()),
-                interface = %binding.interface,
-                program = binding.program.name(),
-                "interface attach failed: {:#}",
-                error
-            );
-        }
-    }
-}
-
-/// True when the commit added a binding on `ifindex` or moved it onto a WAN
-/// egress program (an `auto` WAN landing on an already-bound LAN root).
-fn gains_wan_egress(commit: &interface::BindingCommit, ifindex: NonZeroU32) -> bool {
-    commit.add.iter().any(|(b, ..)| b.ifindex == ifindex)
-        || commit.reprogram.iter().any(|(i, direction, program)| {
-            *i == ifindex
-                && *direction == Direction::Egress
-                && matches!(program, TcProgram::WanEgressL2 | TcProgram::WanEgressL3)
-        })
 }
 
 fn log_commit(commit: &interface::BindingCommit) {

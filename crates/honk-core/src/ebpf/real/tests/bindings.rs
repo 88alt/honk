@@ -32,7 +32,7 @@ fn ip(args: &[&str]) {
 fn plan_for(lan: &[&str], wan: &[&str]) -> (InterfacePlan, Topology) {
     let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
     let topology = read_topology(false).unwrap();
-    let plan = plan_interfaces(&owned(lan), &owned(wan), &topology).unwrap();
+    let plan = plan_interfaces(&owned(lan), &owned(wan), &topology);
     (plan, topology)
 }
 
@@ -300,6 +300,8 @@ async fn kernel_held(
 }
 
 mod failure;
+mod framing;
+mod lazy;
 mod watcher;
 
 #[test]

@@ -40,9 +40,9 @@ flowchart LR
 
 ### 接口挂钩集合
 
-接口的链路类型为以太网（`ARPHRD_ETHER`）时使用 `_l2` 程序，否则使用 `_l3`；每个 bridge 端口和 bond 成员各自套用该规则。所有程序变体随 BPF 对象一并预加载，且早于 BPF logger 启动，因此运行期协调只创建 TCX link，从不加载程序。
+每个接口的[帧格式分类](../reference/global.md#网卡语义)选择 `_l2` 或 `_l3`；所有变体都早于 BPF logger 预加载，因此运行期协调只创建 TCX link，从不加载程序。
 
-每个配置的名称先解析为规范根接口：bond 或 bridge 的成员解析为其 master；本身是 bridge 端口的 bond 解析为该 bridge；其他 master 的成员也解析为该 master，但 `vrf` 与 `openvswitch` 的成员保持自身。受支持的嵌套为一层 bond/bridge，外加作为 bridge 端口的 bond；其他任何 bond/bridge 嵌套，或自身即 master 的接口，均不受支持，会使整个计划失败。各根接口独立规划。只出现在 `lan_interface` 的根为 LAN，只出现在 `wan_interface` 的为 WAN，两者都出现的为 LAN/WAN 共用：
+每个配置的名称先解析为规范根接口：bond 或 bridge 的成员解析为其 master；本身是 bridge 端口的 bond 解析为该 bridge；其他 master 的成员也解析为该 master，但 `vrf` 与 `openvswitch` 的成员保持自身。受支持的嵌套为一层 bond/bridge，外加作为 bridge 端口的 bond；其他任何 bond/bridge 嵌套，或自身即 master 的接口，仅将该配置项以 `unsupported_type` 拒绝。其他项仍在启动时绑定并正常协调。各根接口独立规划。只出现在 `lan_interface` 的根为 LAN，只出现在 `wan_interface` 的为 WAN，两者都出现的为 LAN/WAN 共用：
 
 | 根接口角色 | 挂钩 |
 | --- | --- |
@@ -60,13 +60,15 @@ Linux 6.12+ 上，honk 把接口挂钩创建为 FD 持有的 TCX BPF link，追�
 
 ### 接口协调
 
-唯一的 `InterfaceBindings` 持有者保存预加载的程序 FD，并为每个自有 `(ifindex, direction)` 保存一个由 FD 持有的 TCX link。启动时读取一次 rtnetlink 拓扑快照，推导计划，解析 `local_ip`，加载 BPF 对象，然后绑定。以下情况启动失败：拓扑无法读取；任一已存在的项（不限于第一项）解析为不受支持的嵌套；第一个已解析的 LAN 项或第一个已解析的 WAN 项不存在；由这两项派生的任何绑定（根接口、端口、成员）绑定后仍未持有。当某个 WAN 名称同时也是 LAN 名称时不检查第一个 WAN 项：`lan_interface: a` 且 `wan_interface: b, a` 时只检查 `a`，不存在的 `b` 保持待定。其余各项的挂载失败记录警告并由 watcher 重试，不存在的其余项保持待定。watcher 不带种子启动，自行重新读取拓扑；因同一嵌套原因而规划失败的批次保持现有绑定不变（仅记录 debug 日志），直到拓扑变化。
+唯一的 `InterfaceBindings` 持有者保存预加载的程序 FD，并为每个自有 `(ifindex, direction)` 保存一个由 FD 持有的 TCX link。启动时先打开 rtnetlink 订阅，再读取一次拓扑快照（被打断的 link dump 会重试，最多三次），推导计划，解析 `local_ip`，加载 BPF 对象，然后绑定。配置项的行为契约见[网卡语义](../reference/global.md#网卡语义)。启动仅在以下情况失败：无法读取拓扑（打断的 dump 之外的任何错误立即失败），存在 `auto` 项时无法读取默认路由，八个 TC 变体中任何一个无法预加载（即使它属于未使用的程序族），或内部 link（`dae0`/`dae0peer`、cgroup、`sk_lookup`）失败；为零的 `dae0`/`dae0peer` ifindex 或全零的 `dae0peer` MAC 同样视为失败。启动序列是一个与真实 eBPF VM 测试共用的函数，并在数据路径准入或 READY 前完成。
 
-接口存在即绑定，不要求 `IFF_UP`。`auto`（去除首尾空白后不区分 ASCII 大小写，或为空）解析为当前默认路由接口，在没有 IPv4 默认路由时保持待定，绝不回退到 `lo`；仅当某项为 `auto` 时才读取 `/proc/net/route`，读取错误会使计划失败，而不是被当作“没有默认路由”。
+仅当某项为 `auto` 时才读取 `/proc/thread-self/net/route`；读取错误并不表示“没有默认路由”（启动时致命；之后属于 reconcile 失败，保持现有绑定）。
 
-`IfaceWatcher` 订阅 rtnetlink 的链路、IPv4/IPv6 地址和 IPv4/IPv6 路由组，每批最多排空 64 条消息，每 60 秒一次的 tick 作为事件交付的后备。每一批都在 backend 锁之外运行：读取拓扑并规划；仅在 backend 读锁下复制自有 link 的快照；无锁应用计划（TCX 创建/更新/查询、变更后的拓扑复核、FD 关闭、sysctl）；再仅在写锁下转移结果 commit，并在释放锁后关闭被替换的 FD。当该批包含 link 消息、排空溢出或为 tick 时，保留的 link 会对照命名空间本地的 `BPF_PROG_QUERY` 校验；计划不变的纯地址/路由批次跳过该查询。计划不变且 link 健康时不提交任何内容；角色变化就地更新已有 link（`BPF_F_REPLACE`），而不是再叠加一个。若 link 在 dump 与 attach 之间发生变化，新 link 会被丢弃，该批最多重试一次。
+[API 参考](../reference/api.md#原生-api)定义 `interface_binding` 降级与原因优先级。Reconcile 层面的失败会保留最近一轮已完成的 apply/commit 结果所对应的绑定与降级。
 
-关闭时先发送 stop，再 join watcher，它会等待进行中的批次完成（超过阶段超时后记录警告，但继续等待），然后才释放 BPF 挂钩。启动时对每个 WAN 根接口写入 `accept_ra=2`，对第一个 LAN 名称写入 `rp_filter=0`；之后新绑定或改挂 WAN egress 挂钩的 WAN 根接口在其 commit 落地时启用 `accept_ra`。
+`IfaceWatcher` 接管启动时在拓扑 dump 之前打开的 rtnetlink 订阅；每 60 秒一次的 tick 作为事件交付的后备，无条件执行的首次 reconcile 覆盖启动期间的变化。若订阅或其 poll 注册失败，则仅由 tick 驱动 reconcile，并报告 `iface_watch` 降级。每一批都在 backend 锁之外运行：读取拓扑并规划，仅在读锁下复制自有 link 的快照，无锁应用计划（不在持锁时进行内核 I/O），再仅在写锁下转移 commit。计划不变且 link 健康时不提交任何内容；角色变化就地更新已有 link，而不是再叠加一个。
+
+关闭时先发送 stop，再 join watcher，它会等待进行中的批次完成（超过阶段超时后记录警告，但继续等待），然后才释放 BPF 挂钩。
 
 链路、地址、路由或接口角色变化时，接口地址仍用于拓扑检测与 ECS 刷新，不再发布生成的 `direct(must)` 规则，也没有隐藏的内核地址白名单。系统仍清除健康检查 cooldown 并触发新探测。在新探测成功前，失效 UDP 和多叶节点出站仍保持 fail-closed；未配置 `final` 的单叶节点 TCP 组仍可作为用户态最后尝试。
 
@@ -260,7 +262,7 @@ TCP 健康检查只作用于新 SYN 发布；已建立及缓存命中的重传 T
 
 ## 准入顺序
 
-`DATAPATH_STATE_MAP[0]` 保持为零、原样放行流量，直到所有挂钩安装完成、listener 绑定并发布完整 TCP/UDP FD 集合、接收循环启动，且已启用的 NFQUEUE ready。纯 WAN 部署也必须挂载 `dae0_ingress`；失败会在准入前中止启动。
+`DATAPATH_STATE_MAP[0]` 保持为零、原样放行流量，直到内部挂钩全部就绪、listener 绑定并发布完整 TCP/UDP FD 集合、接收循环启动，且已启用的 NFQUEUE ready。已配置的接口惰性绑定，不是准入前提（见[接口协调](#接口协调)）。纯 WAN 部署也必须挂载 `dae0_ingress`；失败会在准入前中止启动。
 
 关闭时，系统先在适用时阻止新的 NFQUEUE 暂存，在拆除监听器前关闭 `DATAPATH_STATE_MAP[0]`，然后 drain 并 detach producer。准入 map 操作失败是 fatal，而不会在所有权不明确的状态下静默继续。
 
