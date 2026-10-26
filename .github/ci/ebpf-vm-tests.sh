@@ -14,7 +14,7 @@ kernel=$(uname -r)
 printf 'Guest uname -r: %s\n' "$kernel" >> "${GITHUB_STEP_SUMMARY:?}"
 test "$kernel" = "${HONK_CI_EXPECTED_KERNEL:?}"
 test -d "/lib/modules/$kernel"
-modprobe -a tun veth bonding bridge sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue
+modprobe -a tun veth bonding bridge sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue 8021q macsec
 test -e /sys/fs/cgroup/cgroup.controllers
 test -r "${HONK_ROUTING_TEST_OBJECT:?}"
 if ! mountpoint -q /sys/fs/bpf; then
@@ -66,7 +66,8 @@ done
   2>&1 | tee "$log_dir/ebpf-datapath.log"
 "$HONK_NFQUEUE_TEST_BIN" nfqueue_service_isolated_netns_kernel_contract \
   --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-nfqueue.log"
-for ownership_test in \
+# Exact checks keep the substring-selected routing/netns runs from silently omitting a case.
+for kernel_test in \
   control::tests::bond_binding::netns_bond_lan_tcp_udp_master_reply_and_failover \
   control::tests::bond_binding::netns_bond_wan_only_local_failover \
   control::tests::bond_binding::netns_bond_inactive_member_respects_receive_admission \
@@ -74,8 +75,15 @@ for ownership_test in \
   control::tests::bond_binding::netns_bond_non_lacp_modes_proxy_tcp_udp \
   control::tests::tcp_binding::netns_tcp_accepted_fd_proves_original_syn \
   control::tests::tcp_tuple_reuse::netns_tcp_reuses_tuple_during_daens_time_wait \
-  control::tests::udp_fullcone::netns_udp_full_cone_source_contract; do
-  test "$("$HONK_CORE_TEST_BIN" "$ownership_test" --exact --ignored --list --format terse)" = "$ownership_test: test"
+  control::tests::udp_fullcone::netns_udp_full_cone_source_contract \
+  control::tests::vlan_frames::netns_vlan_client_on_parent_lan_is_forwarded_natively \
+  control::tests::vlan_frames::netns_vlan_device_lan_is_proxied_beside_its_parent \
+  control::tests::vlan_frames::netns_vlan_priority_tagged_lan_client_is_still_proxied \
+  control::tests::vlan_frames::netns_vlan_host_connection_on_parent_wan_is_native \
+  control::tests::vlan_frames::netns_vlan_device_wan_intercepts_host_connection \
+  control::tests::vlan_frames::netns_macsec_upper_device_lan_flow_is_classified \
+  ebpf::real::routing::tests::dns_ownership::tcx::unsupported_lan_ingress_frames_continue_tcx_without_marking; do
+  test "$("$HONK_CORE_TEST_BIN" "$kernel_test" --exact --ignored --list --format terse)" = "$kernel_test: test"
 done
 "$HONK_CORE_TEST_BIN" netns --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-netns.log"

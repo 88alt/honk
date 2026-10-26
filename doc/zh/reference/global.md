@@ -96,6 +96,8 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 
 `lan_interface` 为空时，honk 不安装 LAN TC hook，也绝不会用 `lo` 替代。WAN-only 网关因此只使用 `wan_interface`；经过这些 WAN hook 的本机 TCP/UDP 流量仍会被代理，但不会额外安装 LAN 拦截。
 
+在以太网父设备上，VID 非零的 VLAN 标签帧属于 VLAN 设备；要管理该子网，请列出 `eth1.20`（VLAN-aware bridge 请列出 `br0.N`）。VLAN-aware bridge 拓扑尚未经过真实流量测试验证。参见[接口挂钩集合](../design/datapath.md#接口挂钩集合)。
+
 `auto`（在所有使用处均去除首尾空白并不区分 ASCII 大小写，因此 `AUTO`、` auto ` 与仅含空白的条目都算；`.dae` 列表解析器会丢弃真正为空的项，所以空列表仍表示没有接口）解析为拥有 metric 最低 IPv4 默认路由的网卡。如果不存在该路由，此项保持待定（绝不回退到 `lo`），直到默认路由出现。同一列表中显式命名的网卡继续工作。仅当某项为 `auto` 时才读取路由表；路由表无法读取是错误，而不是“没有默认路由”：启动时会失败，运行期间的失败则保持现有绑定不变。
 
 网卡存在即绑定，不要求 `IFF_UP`。角色按网卡区分（见[接口挂钩集合](../design/datapath.md#接口挂钩集合)），因此 LAN/WAN 共用网卡不会改变其他 LAN 网卡的 hook。bond、bridge 或其他 master 的成员通过该 master 绑定，但 `vrf` 与 `openvswitch` 的成员保持自身；LAN bridge 还会以 LAN 角色绑定其端口，bond 的 hook 只挂在逻辑 master 上，不挂成员。

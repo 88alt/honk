@@ -59,8 +59,8 @@ private mount/network namespaces do not isolate cgroup BPF attachment.
 gate (`.github/ci/run-vm-gate.sh floor`); `test-netns` retains `test-routing` as
 its dependency and boots only one guest. The complete routing suite also has
 root-cgroup cases, so neither recipe executes ignored tests on the host.
-The VM gate includes compiled routing, real backend/datapath, NFQUEUE/netns,
-TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership,
+The VM gate includes compiled routing (its exact-name-guarded `dns_ownership::tcx::unsupported_lan_ingress_frames_continue_tcx_without_marking`), real backend/datapath, NFQUEUE/netns,
+TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership, real VLAN/macsec frame cases,
 bond binding, native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher,
 lazy interface binding and SO_MARK socket checks. Exact nonempty
 selections in the guest gate must remain intact.
