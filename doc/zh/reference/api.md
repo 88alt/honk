@@ -1,16 +1,20 @@
 # 原生 API、Clash API 与 `/stats` 参考
 
-本页列出 honk 的原生 API、已实现的 Clash 兼容 HTTP 接口及其用户态统计快照。原生与 Clash API 的 feature、listener、凭据及 HTTP 边界相互独立，共用底层引擎 handles 与用户态统计。
+原生 API 与已实现的 Clash 兼容 HTTP 接口共用底层引擎句柄及用户态统计，但功能开关、监听器、凭据及 HTTP 边界相互独立。
 
 ## 原生 API
 
-`native-api` Cargo feature 需显式启用：以 `--features native-api`（或 `native-ui`）构建；full 发布产物包含它及内嵌 UI（`native-ui`），`-native-api` 产物包含它但不含 Clash 与 UI，`-clash-api` 产物不含它。listener 默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`--no-default-features --features native-api` 可脱离 Clash 使用。`.dae` 仍是配置格式；显式授权后可读取与替换已接受的源文件，或以 `--store db` 把 revision 记录在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
+原生 API 需要显式启用 `native-api` Cargo 功能：以 `--features native-api`（或 `native-ui`）构建。`--no-default-features --features native-api` 可脱离 Clash 使用。按所需接口选择发布产物：
 
-原生契约（包括认证、节点/provider 管理、geodata 与自动策略 override）为 [api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f](https://github.com/daeuniverse/api-standardize/tree/e6b0dbab5599689d965bc18a71be67c809d99d0f)；`crates/honk-core/tests/fixtures/native_api_openapi.yaml` 跟踪该 bundle。原生 runtime mode 仍未开放，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 secret 或 `password_auth`。可用功能以 capabilities 和逐源权限为准，不按路由名称推断。
+| 发布产物 | 原生 API | 内嵌 UI | Clash API |
+| --- | --- | --- | --- |
+| Full | 有 | 有（`native-ui`） | 有 |
+| `-native-api` | 有 | 无 | 无 |
+| `-clash-api` | 无 | 无 | 有 |
 
-`Node.stream_transport` 是可选、可为 null 的字符串，投影已接受的 Trojan/VMess/VLESS 配置：`tcp`、`ws`、`grpc` 或 `xhttp`（包括 `splithttp` 别名）。无法识别或不适用时，honk 返回 null。该字段表示配置的传输方式，不表示协商结果或健康状态；`protocol` 与 TCP/UDP 健康传输字段的含义不变。它不暴露凭据、host、path、extra 选项或链接。测试 fixture 复制 doona 契约 bundle，保留其 `read_only_reason` 扩展（SHA-256 `ef3e1ce08392c26d256b70277318d61a7ec932f4f5825ac8117d839944a33646`）；此固定版本不代表已发布的前端版本。
+监听器默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`.dae` 仍是配置格式；显式授权后可读取与替换 `-c` 指定的已接受源文件，或以 `--store db` 把修订记录保存在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
 
-`POST /api/v1/nodes` 接受 1–8192 个字符的链接；更长的声明（例如接近 16 KiB header 上限的 XHTTP `extra`）应通过编辑配置源写入。引擎拒绝的链接返回 `422 unsupported_value`，`error.message` 为解析器给出的静态原因，例如 `XHTTP xPaddingBytes must stay within 1-8192`，`details.fields` 为 `["name","link"]`；不会回显提交的名称、链接或选项值，也不会写入任何内容。`POST /api/v1/providers` 以同样方式报告被拒绝的订阅条目。其他拒绝仍使用通用消息。
+原生契约（包括认证、节点与订阅源管理、地理数据及自动策略覆盖）为 [api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f](https://github.com/daeuniverse/api-standardize/tree/e6b0dbab5599689d965bc18a71be67c809d99d0f)；`crates/honk-core/tests/fixtures/native_api_openapi.yaml` 跟踪该契约包。原生运行模式仍未开放，不声明 `full_transparency`。源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 `secret` 或 `password_auth`。可用功能以能力声明和逐源权限为准，不按路由名称推断。
 
 | 方法 | 路径 | 含义 |
 | --- | --- | --- |
@@ -73,7 +77,7 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 `udp_trace` 保持错误码 `udp_trace_unavailable`；失败仅影响 IPv4 或 IPv6 listener 地址族时，`details.reason` 分别为 `ipv4_unavailable` 或 `ipv6_unavailable`，两者都受影响时为 `unavailable`。追踪仍可用的地址族继续记录内核路由证据。挂载 warning 的 `family` 字段指出缺失地址族；listener warning 带有 `ipv4_unavailable` 与 `ipv6_unavailable` 字段。Listener 启动时重新判定并不重试 fallback hook 挂载：每个真实 backend 仅尝试一次，修改内核/BTF 支持后需重启。
 
-所有认证模式都公开 `GET /api`。密码 setup 与 login POST 也公开；version、capabilities 及其他 API 资源要求配置的静态 bearer 或有效密码会话。上述例外只针对不带凭据的请求：带有凭据的请求无论是否公开都会校验，错误或重复的凭据直接拒绝，不回退为匿名。query string 中的 token 一律拒绝。现有无 secret 开发模式要求显式匿名 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。Host 与 Origin 校验先于这些认证例外执行，也覆盖公共静态文件。OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
+所有认证模式都公开 `GET /api`。密码 setup 与 login POST 也公开；version、capabilities 及其他 API 资源要求配置的静态 bearer 或有效密码会话，显式启用匿名 loopback 访问时除外。上述例外只针对不带凭据的请求：带有凭据的请求无论是否公开都会校验，错误或重复的凭据直接拒绝，不回退为匿名。query string 中的 token 一律拒绝。现有无 secret 开发模式要求显式匿名 loopback 授权，并拒绝 `Sec-Fetch-Site: cross-site`。Host 与 Origin 校验先于这些认证例外执行，也覆盖公共静态文件。OPTIONS preflight 无需 bearer，但必须通过 Host、Origin、method 与 header 白名单。不返回 cookie credentials 或通配 CORS。
 
 已知禁用 action 返回 JSON `404 capability_not_supported`，未知 path 返回 JSON `404 resource_not_found`；已知资源不支持的 method 返回 JSON `405 method_not_allowed`，并带 `Allow`（GET 资源含 HEAD）；配置来源可读但未授权写入时，PUT 返回 `403 permission_denied`。错误信封为 `{error:{code,message,details},request_id}`。HEAD 保留 GET 状态/header，无 body。API 响应带 `no-store` 与 `nosniff`。应用上限为规范化 target 4096 字节、规范化 header 名/值合计 16384 字节、body 65536 字节（含 chunked）；已认证 GET/HEAD 携带非空 body 会被拒绝。普通观测读取不触发 probe 或选择变化；显式 `/dns/query` 是可联网的诊断请求。
 
@@ -87,7 +91,7 @@ TCP 在 copy 成功读取或 splice 成功写入目标 socket 时实时入账，
 
 应用 target/header 上限作用于 Hyper **解析并规范化后的表示**，不是原始 wire 字节。Hyper 可能先移除 request-target fragment，或合并相同 `Content-Length` 字段，再交给应用计量；这些形式的原始文本即使超过应用上限，也可能得到正常响应而不是 413。原始输入仍受 Hyper 传输处理约束。这是已接受的边界差异，不另写 HTTP parser，也不宣称原始 wire 大小保证；body 限制仍覆盖全部交付的 body 字节。
 
-配置 `ui` 后，`/` 与 `/ui` 重定向到 `/ui/`。目录托管保留无扩展名 SPA fallback；缺失静态资产、fonts/icons、manifest 或 service worker 返回 404，不返回 HTML。以 `--features native-ui` 构建（full 发布产物已启用）并设置 `ui: embedded`，即可直接提供固定真实 doona 产物，不解压到磁盘、不联网。`ui: embedded-lite` 选择更轻量的 doona lite 预览版，同样需要 `native-ui`。两种版本都连接页面同源的原生 API。其 hash router 使用 `/ui/#/...`；其他合法内嵌导航路径重定向回 `/ui/`，确保相对资产与 service worker 路径正确。内嵌 UI 以预压缩形式存储，浏览器接受时以 brotli 或 gzip 传输；目录托管以同样方式提供管理员放置的 `.br`/`.gz` 同名文件。`assets/` 下带内容哈希的文件按 immutable 缓存一年，其他静态响应使用 `no-cache`。静态响应带 `nosniff`，不带 framing header，以便 LuCI 等面板嵌入 UI；需要防御 clickjacking 的部署应在反向代理添加 `X-Frame-Options` 或 `Content-Security-Policy: frame-ancestors`。公开资产仍经过 Host/Origin 校验。Discovery 与密码 setup/login 使用上述公共例外，其他 API 请求要求 bearer；不向 UI 注入凭据。
+配置 `ui` 后，`/` 与 `/ui` 重定向到 `/ui/`。目录托管保留无扩展名 SPA fallback；缺失静态资产、fonts/icons、manifest 或 service worker 返回 404，不返回 HTML。以 `--features native-ui` 构建（full 发布产物已启用）并设置 `ui: embedded`，即可直接提供固定真实 doona 产物，不解压到磁盘、不联网。`ui: embedded-lite` 选择更轻量的 doona lite 预览版，同样需要 `native-ui`。两种版本都连接页面同源的原生 API。其 hash router 使用 `/ui/#/...`；其他合法内嵌导航路径重定向回 `/ui/`，确保相对资产与 service worker 路径正确。内嵌 UI 以预压缩形式存储，浏览器接受时以 brotli 或 gzip 传输；目录托管以同样方式提供管理员放置的 `.br`/`.gz` 同名文件。`assets/` 下带内容哈希的文件按 immutable 缓存一年，其他静态响应使用 `no-cache`。静态响应带 `nosniff`，不带 framing header，以便 LuCI 等面板嵌入 UI；需要防御 clickjacking 的部署应在反向代理添加 `X-Frame-Options` 或 `Content-Security-Policy: frame-ancestors`。公开资产仍经过 Host/Origin 校验。Discovery 与密码 setup/login 使用上述公共例外，其他 API 请求要求静态或会话 bearer，显式启用匿名 loopback 访问时除外；不向 UI 注入凭据。
 
 ### 认证发现与密码会话
 
@@ -119,7 +123,7 @@ Setup 与 login 每分钟按规范化对端 IP 最多接受 5 次尝试，全局
 
 记录使用 PBKDF2-HMAC-SHA256、100,000 次迭代及新生成的 16 字节随机 salt。密码模式直接使用配置的 `global.data_dir`：该目录不可用时启动失败，不回退到其他目录，以免在别处重新开放 setup。首次 setup 插入该行，不替换已有记录，因此两个进程在同一个状态数据库上同时 setup 时只有一个成功。写入开始前数据库忙碌，或插入失败且已回滚时，setup 失败，可以重试。提交或该回滚失败时，由于该行是否已持久化无法确定，进程在重启前拒绝登录和再次 setup。
 
-Setup 占有凭据状态后，discovery 返回 `setup_required:false`，耐久性不确定时也不重新开放。无法确认写入时返回 503 与 `durability_confirmed:false`，不带 `Retry-After`，不声称 `written:true`；须重启才能重新确认数据库中的账户状态。
+Setup 占有凭据状态后，discovery 返回 `setup_required:false`；无法确认持久化结果时也不重新开放。无法确认写入时返回 503 与 `durability_confirmed:false`，不带 `Retry-After`，不声称 `written:true`；须重启才能重新确认数据库中的账户状态。
 
 不提供 HTTP 密码重置。恢复访问时，停止 honk，执行 `honk-core admin reset`，重启后重新 setup。把 `<data_dir>/state` 整个移走也能恢复，但会丢弃所有其他持久化状态。
 
@@ -161,6 +165,8 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 ### 节点与组
 
+`Node.stream_transport` 是可选、可为 null 的字符串，投影已接受的 Trojan/VMess/VLESS 配置：`tcp`、`ws`、`grpc` 或 `xhttp`（包括 `splithttp` 别名）。无法识别或不适用时，honk 返回 null。该字段表示配置的传输方式，不表示协商结果或健康状态；`protocol` 与 TCP/UDP 健康传输字段的含义不变。它不暴露凭据、host、path、extra 选项或链接。测试 fixture 复制 doona 契约 bundle，保留其 `read_only_reason` 扩展（SHA-256 `ef3e1ce08392c26d256b70277318d61a7ec932f4f5825ac8117d839944a33646`）；此固定版本不代表已发布的前端版本。
+
 节点读取接受 `group_id`、`limit`（1–1000）及 `cursor`；只筛直接成员，不展开叶节点。节点分页最多八份 snapshot、30 秒、4 MiB，冻结分页期间观测；放不下时返回 `503 snapshot_unavailable` 并带 `Retry-After`；无法识别的游标返回 `410 snapshot_expired`，可识别但过滤器或 `limit` 不同的游标返回 `400 invalid_request`。Groups 返回摘要数组；detail 含 `config_revision`，不带 `ETag`；`GET /groups/{groupId}/config` 返回 `{policy, config}`，并以该 revision 作为带引号的 `ETag`。组 ID 为进程生命周期随机身份：同名 reload/重排保持，删除再添加获得新 ID，重启重新发现；不使用位置 UUID 或名称 hash。
 
 节点名、订阅标签、组名/成员名、icon、检查 URL、final 出站标签和出站计数名称，采用与源内容/flow 显示相同的监听凭据遮蔽规则。节点快照在有界序列化前遮蔽凭据，续页保留同一份已遮蔽字节；不修改不透明 ID、revision hash、成员身份或游标绑定。
@@ -178,7 +184,7 @@ Flow list 接受 `network/state/connection_id/detail/limit/cursor`。最多八�
 
 ### 原生事件
 
-使用带 Bearer 与 `Accept: text/event-stream` 的流式 fetch；浏览器 EventSource 不能设置所需 Authorization。可选 `kinds/flow_id` 绑定续传游标。最多保留 512 个事件、60 秒，支持 16 个 client，每个 client 的 live 队列最多 64 条。队列满时断开流，不静默 skip 事件。16 个名额已满时，新连接返回 `503 temporarily_unavailable` 并带 `Retry-After`。每 15 秒发送 heartbeat。每个连接都先发送 ready；有效续传的顺序为 ready→replay→live，ready 保留请求游标，之后由 replay 推进，原子挂接不留空窗。过期、未知、旧实例或不同过滤器的游标在 HTTP 200 前返回 `409 event_cursor_expired`。
+需要 bearer 认证时，使用带 Bearer 与 `Accept: text/event-stream` 的流式 fetch；浏览器 EventSource 不能设置 Authorization header。可选 `kinds/flow_id` 绑定续传游标。最多保留 512 个事件、60 秒，支持 16 个 client，每个 client 的 live 队列最多 64 条。队列满时断开流，不静默 skip 事件。16 个名额已满时，新连接返回 `503 temporarily_unavailable` 并带 `Retry-After`。每 15 秒发送 heartbeat。每个连接都先发送 ready；有效续传的顺序为 ready→replay→live，ready 保留请求游标，之后由 replay 推进，原子挂接不留空窗。过期、未知、旧实例或不同过滤器的游标在 HTTP 200 前返回 `409 event_cursor_expired`。
 
 每条事件/日志记录最多为其首个精确过滤绑定缓存一份完整 frame；其他绑定仍独立签名。既有 2 MiB 留存 ring 预算在发布前预留 payload、一份可能的缓存 frame 及 cache cell，因此接近单条上限的 payload 可能在达到条数上限前过期。该 ring 预算不是所有排队或 HTTP 持有引用的进程级内存上限。
 
@@ -232,7 +238,7 @@ PUT 与校验请求体含未知字段（包括 `secrets_redacted`）时返回 `4
 
 因为 reload 会拒绝修改需重启设置的候选配置，而已写入的文件不回滚，磁盘 hash 会与 accepted hash 不一致，后续写入都返回 412，所以协调器在写入前拒绝。Group PATCH、节点与 provider 编辑、数据库模式的 import 与 revision 激活同样适用；`full` 模式校验以 warning 报告这些诊断。需重启的设置应在配置文件中修改，然后重启 honk。
 
-协调器在副作用前预留 operation，串行处理 API 新写入和 SIGHUP，SIGHUP 也先入队再读盘。单源 overlay 完整校验后，采用目录 FD、拒绝符号链接的普通文件检查、独占临时文件、保留 mode、文件 fsync、目标与完整依赖集复查、原子 rename、目录 fsync。外部编辑器不受协调器约束，最后检查到 rename 之间仍有竞争窗口；UI 保存期间不要并行手工改同一文件。Rename 后若目录 fsync 失败，503 明确携带 `written:true,durability_confirmed:false`，不带 `Retry-After`：可见内容已经改变，不表示未写或回滚。写入后 reload 无法入队时同样返回 `written:true`，不带 `Retry-After`。
+协调器在副作用前预留 operation，串行处理 API 新写入和 SIGHUP；SIGHUP 也先入队再读盘。单源 overlay 通过完整校验后，写入使用目录 FD，检查目标为非符号链接的普通文件，创建独占临时文件并保留 mode，再依次执行文件 fsync、目标与完整依赖集复查、原子 rename、目录 fsync。外部编辑器不受协调器约束，最后检查到 rename 之间仍有竞争窗口；UI 保存期间不要并行手工改同一文件。Rename 后若目录 fsync 失败，503 明确携带 `written:true,durability_confirmed:false`，不带 `Retry-After`：可见内容已经改变，不表示未写或回滚。写入后 reload 无法入队时同样返回 `written:true`，不带 `Retry-After`。
 
 `POST /api/v1/config/sources` 新建一个源文件。能力中的 `config.create` 仅在 `config.writable` 为 true 时为 true；配置不可用或不可写时的响应与 PUT 相同；配置可写但 `config.create` 为 false 时返回 `404 capability_not_supported`。Body 为 `{"path":"config.d/proxies.dae","content":"..."}`。`path` 相对入口目录，只含普通路径段，以 `.dae` 结尾，不超过 1024 字节且不含控制字符；父目录必须位于入口根目录内，经符号链接指向根目录外同样拒绝。不满足时返回 `400 invalid_request`。路径已存在于磁盘或属于已接受的源时返回 `409 state_conflict`，不覆盖。候选配置执行与 PUT 相同的完整校验、凭据检查与需重启设置检查，且新文件必须由某个 include 模式加载；否则 422 携带归属主文件、位置为 null 的 `source-not-included` 错误诊断。文件经临时文件与禁止覆盖的 rename 写入，使用入口文件的 mode；数据库模式改为把新源记录到新 revision。Reload 失败时新建的文件保留在原处，因为删除它会与该路径的其他编辑者竞争。每个失败的新建 operation 都报告 `written`（文件创建后为 `true`）与 `committed`（`false`、`true` 或 `null`）。大小限制、`Idempotency-Key` 以及 413、415、429、503 响应与 PUT 相同。
 
@@ -318,6 +324,8 @@ GET 和成功的 PATCH 响应包含只读 `recording`：`flows`、`logs`、`dns_
 
 ### 主文件条目与 geodata 管理
 
+`POST /api/v1/nodes` 接受 1–8192 个字符的链接；更长的声明（例如接近 16 KiB header 上限的 XHTTP `extra`）应通过编辑配置源写入。引擎拒绝的链接返回 `422 unsupported_value`，`error.message` 为解析器给出的静态原因，例如 `XHTTP xPaddingBytes must stay within 1-8192`，`details.fields` 为 `["name","link"]`；不会回显提交的名称、链接或选项值，也不会写入任何内容。`POST /api/v1/providers` 以同样方式报告被拒绝的订阅条目。其他拒绝仍使用通用消息。
+
 `resources.nodes.can_manage` 与 `resources.providers.can_manage` 要求来源协调器运行，且 accepted 主文件可写、不含 API 凭据。创建节点提交 `{"name":"edge","link":"socks5://192.0.2.2:1080"}`；创建 provider 提交 `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`。`resources.providers.create_options` 列出可选 provider 字段省略时的生效值：`update_interval`（秒，最多一年，`0` 表示只在请求时刷新，内置默认 `86400`）、`user_agent`（1 至 256 个可打印 ASCII 字符，内置默认 `honk/<version>`），以及仅在 `global.store_subscribe` 打开订阅存储时列出的 `cache`（内置默认 `true`）。内置默认值只是回退值；`assets.subscription` 设置了对应默认值时，`create_options` 返回该设置值。`resources.providers` 还会声明 `create_unfetched: true`，表示支持这种未拉取即创建的方式。显式提供选项的 provider 写作 `tag: 'url' { ... }`，`ua`、`interval` 和 `cache` 各占一行；schema 长度、pattern、kind、interval 或 user-agent 边界违规返回 `400 invalid_request`；未声明的选项（如没有 store 时的 `cache`）返回 `422 unsupported_value`。严格 JSON 与 64 KiB 正文限制不变。复用引擎 parser、完整离线准入、FD 相对耐久写入及真实 reload；激活与订阅协调完成后才以 `201` 返回当前 Node/Provider 和 `Location`。HTTP 断连不取消已入队工作；使用 `--store db` 时，这些操作记录新 revision，不重写主文件。
 
 节点名为 1–64 字符，链接最多 8192 字符；provider 名为 1–64 个 ASCII 字母/数字/`_.-`，HTTP(S) URL 最多 4096 字符。schema 长度、pattern、enum 或边界违规返回 `400 invalid_request`；重名返回 409；结构合法但不支持的链接、身份、provider URL scheme 或选项返回 422。新 provider 即使有旧缓存正文，也从零节点、stale、无更新时间开始。同一 source specification 的延迟拉取状态在无关编辑和 reload 中保留，直到显式 refresh。修改该 specification 或重启后，恢复普通订阅启动行为。API 不创建 same-fetch 别名；删除归属有歧义时直接拒绝，不转移 ID 或节点。
@@ -356,9 +364,9 @@ DELETE 不接受 body/query：带有任一项时返回 `400 invalid_request`，b
 
 ### 内嵌 doona 来源
 
-默认关闭的 `native-ui` 隐含 `native-api`，编译时从 `HONK_DOONA_DIR` 指定的绝对路径目录内嵌标准版 doona，从同级 `${HONK_DOONA_DIR}-lite` 目录内嵌 doona lite（忽略末尾斜杠）；两个目录都必须含 `index.html`，只需设置这一个环境变量。`ci/fetch-doona.sh` 下载 `.github/ci/pins.env` 固定的两种版本程序包（当前为 doona `0.1.0-rc.2`、提交 `426597a5c9294625c8e95a2eb6f3858d7b5f033a`），分别按 `DOONA_SHA256` / `DOONA_LITE_SHA256` 校验 SHA-256，确认各包内含 `THIRD-PARTY-NOTICES.txt` 及 `NOTICE` 引用的全部 `LICENSES/` 文件，删除字体，将标准版解压到指定目录、lite 解压到其 `-lite` 同级目录，并只输出标准版目录：`export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`。未设置该变量时，`just lint` 与 `just test-ci` 自动执行该脚本。full 发布产物包含内嵌 UI，精简的 `-clash-api`/`-native-api` 产物不包含；二进制内嵌两种版本各自的 notices，每个 full 发布 tarball 分别在 `doona/` 与 `doona-lite/` 目录附带这些文件。Lite 使用系统字体。内嵌产物不含 Noto Sans TC 与 SC 字体。doona 的 CSS 以 `font-display: optional` 声明这些字体，因此字体请求返回 404 时浏览器使用系统字体。需要 Noto Sans 时，将 [doona 发布页](https://github.com/Zakkaus/doona/releases)的 `doona-<version>.tar.gz` 与 `doona-fonts-<version>.tar.gz` 解压到同一目录并让 `ui` 指向该目录，或安装 `doona` 与 `doona-fonts` 软件包并设置 `ui: /usr/share/doona`。两种版本共用的 GPL-3.0-only 源码是 doona 标签 [`v0.1.0-rc.2`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.2)。发布流程将 `doona-source-0.1.0-rc.2.tar.gz` 附加到正式标签发布与滚动 Debug 发布；该包由 `ci/fetch-doona.sh --source` 生成：先确认标签仍指向固定提交，再执行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.2 | gzip -n`（GNU gzip）。再分发 `native-ui` 二进制时，须按 GPL-3.0 第 6 条一并提供该源码包与 notices。
+默认关闭的 `native-ui` 隐含 `native-api`，编译时从 `HONK_DOONA_DIR` 指定的绝对路径目录内嵌标准版 doona，从同级 `${HONK_DOONA_DIR}-lite` 目录内嵌 doona lite（忽略末尾斜杠）；两个目录都必须含 `index.html`，只需设置这一个环境变量。`ci/fetch-doona.sh` 下载 `.github/ci/pins.env` 固定的两种版本程序包（当前为 doona `0.1.0-rc.3`、提交 `931be7f19c481c8d2ce01509faa0f9050ce175bb`），分别按 `DOONA_SHA256` / `DOONA_LITE_SHA256` 校验 SHA-256，确认各包内含 `THIRD-PARTY-NOTICES.txt` 及 `NOTICE` 引用的全部 `LICENSES/` 文件，删除字体，将标准版解压到指定目录、lite 解压到其 `-lite` 同级目录，并只输出标准版目录：`export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`。未设置该变量时，`just lint` 与 `just test-ci` 自动执行该脚本。full 发布产物包含内嵌 UI，精简的 `-clash-api`/`-native-api` 产物不包含；二进制内嵌两种版本各自的 notices，每个 full 发布 tarball 分别在 `doona/` 与 `doona-lite/` 目录附带这些文件。Lite 使用系统字体。内嵌产物不含 Noto Sans TC 与 SC 字体。doona 的 CSS 以 `font-display: optional` 声明这些字体，因此字体请求返回 404 时浏览器使用系统字体。需要 Noto Sans 时，将 [doona 发布页](https://github.com/Zakkaus/doona/releases)的 `doona-<version>.tar.gz` 与 `doona-fonts-<version>.tar.gz` 解压到同一目录并让 `ui` 指向该目录，或安装 `doona` 与 `doona-fonts` 软件包并设置 `ui: /usr/share/doona`。两种版本共用的 GPL-3.0-only 源码是 doona 标签 [`v0.1.0-rc.3`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.3)。发布流程将 `doona-source-0.1.0-rc.3.tar.gz` 附加到正式标签发布与滚动 Debug 发布；该包由 `ci/fetch-doona.sh --source` 生成：先确认标签仍指向固定提交，再执行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.3 | gzip -n`（GNU gzip）。再分发 `native-ui` 二进制时，须保留 notices，并按 GPL-3.0 第 6 条允许的方式提供对应源码。
 
-复现时将源码包解压到独立目录，用 Node 22+、`pnpm@11.15.1` 执行 `pnpm install --frozen-lockfile`、`pnpm build`、`pnpm -C apps/lite build`、`SOURCE_DATE_EPOCH=1793072394 pnpm package`。该 epoch 是固定上游提交的时间；源码包不含 Git 历史。须安装 brotli，`PATH` 中须使用 GNU tar 和 GNU gzip（已验证 tar 1.35、gzip 1.15）；其他 gzip 实现即使压缩相同 tar 字节，也可能产生不同包摘要。Cargo 构建只内嵌 `HONK_DOONA_DIR` 及其 `-lite` 同级目录中的文件，不构建也不下载前端。该源码的 checker 为 `tools/conformance.mjs`；live walk 只读，跳过控制、诊断和缺少已观测 ID 的资源。基础与管理契约应分别核对，浏览器操作另行验收；schema 通过不等于完整 UI、内核或部署矩阵通过。
+复现时将源码包解压到独立目录，用符合 `^22.13.0 || ^24.0.0 || >=26.0.0` 的 Node、`pnpm@11.15.1` 执行 `pnpm install --frozen-lockfile`、`pnpm build`、`pnpm -C apps/lite build`、`SOURCE_DATE_EPOCH=1793194168 pnpm package`。该 epoch 是固定上游提交的时间；源码包不含 Git 历史。须安装 brotli，`PATH` 中须使用 GNU tar 和 GNU gzip（已验证 tar 1.35、gzip 1.15）；其他 gzip 实现即使压缩相同 tar 字节，也可能产生不同包摘要。Cargo 构建只内嵌 `HONK_DOONA_DIR` 及其 `-lite` 同级目录中的文件，不构建也不下载前端。该源码的 checker 为 `tools/conformance.mjs`；live walk 只读，跳过控制、诊断和缺少已观测 ID 的资源。基础与管理契约应分别核对，浏览器操作另行验收；schema 通过不等于完整 UI、内核或部署矩阵通过。
 
 ### 连接关闭、模式与数据面生命周期
 
@@ -411,7 +419,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 | GET | `/stats` | 返回下文所述的用户态出站、ready pool、热资源、Score 选路原因和 UDP 快照。 |
 | GET | `/logs` | 通过 WebSocket 或分块 JSON 行推送 tracing 事件；所有订阅者共用一个 256 槽位的广播队列，`?level=` 默认为 `info`。 |
 | GET | `/dns/query` | 经 honk DNS 解析 `?name=` 并返回 DoH 风格 JSON；`?type=` 默认为 `A`。 |
-| POST | `/cache/fakeip/flush` | 相容 no-op，返回 204；没有持久化 FakeIP 映射可清除。 |
+| POST | `/cache/fakeip/flush` | 兼容性 no-op，返回 204；没有持久化 FakeIP 映射可清除。 |
 | POST | `/cache/dns/flush` | 清除存活 DNS cache 及其持久化 DNS 状态。 |
 | GET | `/providers/proxies` | 将非空组暴露为 Clash proxy provider。 |
 | GET | `/providers/rules` | 返回当前空桩文档 `{"providers":[]}`。 |
@@ -461,7 +469,7 @@ WebSocket upgrade 也可以改用 `?token=<percent-encoded-secret>`。honk 会�
 
 ### 延迟测量
 
-调用方通过 `?url=` 指定测试 URL。组请求最多同时执行 `URLTEST_MAX_CONCURRENT`（10）项经代理的测量。
+两个接口使用上表所列的 URL 参数与并发上限。
 
 延迟测试使用规范的 HTTP 检查目标解码器：HEAD 保留原始路径与查询串（包括点段和仅查询串的 `/?query`），authority 移除凭据和默认端口，fragment 不会发送。它与周期健康检查共享 HTTP 实现，报告第二轮请求的热路径 RTT，不含代理拨号、目标 TLS 与第一轮请求。HTTPS 验证证书，协商 HTTP/2 或 HTTP/1.1，并禁用 server push。两轮最终响应的解码状态都必须为有效的 200–499。第二轮传输失败或超时可回退到已验证的第一轮样本；HTTP/1 部分响应即使超时也不回退，而正常 HTTP/2 GOAWAY 可以回退。每轮 HTTP/1 临时响应头与最终响应头的累计上限为 16 KiB，H2 响应头列表上限同样为 16 KiB。session 预热、拨号、目标 TLS、H2 启动与每轮请求分别使用阶段预算。冷可复用 generation 探测使用带 guard 的临时 runtime，结束后关闭；HTTP/2 driver 在完成或取消后释放，因此组扫描不会为每个已测试节点留下新的常驻可复用 runtime。
 
@@ -737,7 +745,7 @@ Readonly／Peek 使用已提交参与者，不重新排名。Apply 初始化并�
 | `warm.sessions.juicity` | 已占用的 Juicity client slot 数。 |
 | `warm.sessions.hysteria2` | 已占用的 Hysteria2 client slot 数。 |
 
-一个节点可以同时计入多个显式原因。gauge 跟随当前 runtime generation；已排干资源会从下一次快照中消失。
+一个节点可以同时计入多个显式原因。gauge 跟随当前运行时代次；已排干资源会从下一次快照中消失。
 
 ## Related docs
 

@@ -25,7 +25,7 @@ In quoted tags and links, a backslash escapes the next character when locating t
 
 A malformed recognized link is dropped with a warning. Known invalid fields retain a specific safe reason and schema path; unknown parse failures use `invalid-node-entry`. Diagnostics carry the original node-entry ordinal and source location, never the raw link, value, or node name. Data entrypoints return them without logging; plain entrypoints report them once. An unknown scheme or removed VLESS `vless_mode` is a hard configuration error. A standalone `mux:` or `mux=` line is also rejected; VLESS packet and carrier choices belong in that link's exact `packetEncoding=`, `mux=`, and `udp=` query parameters.
 
-A link that is accepted only ever warns with `legacy-*` codes. Any other warning on a node entry means the entry was dropped, so a client can validate a single `node { name: 'link' }` declaration in `syntax` mode and tell a skipped link from an accepted one by code alone.
+An accepted link warns only with `legacy-*` codes. Any other warning on a node entry means the parser dropped it. A client validating a single `node { name: 'link' }` declaration in `syntax` mode can distinguish skipped and accepted links by code alone.
 
 In the legacy `ss://base64(method:password@host:port)` form, decoded credentials are literal text, not URL-decoded: `%20` stays `%20`, and `?`, `/`, `#`, `:` and `@` remain password characters. The last `@` separates the endpoint; the userinfo may itself be `base64(method:password)`. A decoded payload without `@`, or credentials that cannot supply a method and password, is rejected. URL userinfo forms still percent-decode their credentials. The endpoint, path, query (including `/?plugin=...`) and fragment keep the usual URL handling.
 
@@ -128,7 +128,7 @@ Sing-box `hop_interval`, `idle_session_timeout`, and `idle_session_check_interva
 
 Hysteria2 hopping sets reject repeated ports and overlapping ranges before dialing, including `443,443`. A singleton remains valid. Valid specifications retain their spelling; embedded authority lists retain their stricter empty-segment rule. The outbound constructor uses the same checked decoder for directly constructed nodes.
 
-Every canonical adapter completion applies intrinsic validation: ordinary share links, VMess JSON, standalone flat Node serde, and subscription imports. UUID-based protocols require valid UUIDs; unsupported cipher, transport, packet capability, flow, ALPN context, or hopping sets reject before identity derivation. Vision requires TLS or REALITY. Constructed nodes also reject empty SNI/flow/network values that adapters normalize away. Feed-only nonempty-password requirements remain format-specific; optional SOCKS authentication and handler-supported empty credentials remain valid. Invalid dae node lines and feed entries retain their existing skip policy; valid siblings survive. Parse-only Config fragments remain parse-only, except that invalid contained nodes now reject at construction. Standalone serde preserves a supplied ID; runtime identity admission is separate.
+Every canonical adapter completion applies intrinsic validation: ordinary share links, VMess JSON, standalone flat Node serde, and subscription imports. UUID-based protocols require valid UUIDs; unsupported cipher, transport, packet capability, flow, ALPN context, or hopping sets reject before identity derivation. Without VLESS Encryption, Vision requires TLS or REALITY. Constructed nodes also reject empty SNI/flow/network values that adapters normalize away. Feed-only nonempty-password requirements remain format-specific; optional SOCKS authentication and handler-supported empty credentials remain valid. Invalid dae node lines and feed entries retain their existing skip policy; valid siblings survive. Parse-only Config fragments remain parse-only, except that invalid contained nodes now reject at construction. Standalone serde preserves a supplied ID; runtime identity admission is separate.
 
 Direct `Node::validate()` calls return the same static, redacted errors as adapter completion. Validation errors never include the supplied node name or credential values.
 
@@ -333,7 +333,7 @@ Durations accept bare seconds plus `ms`, `s`, `m`, and `h` suffixes.
 
 ### UDP and multiplexing
 
-VLESS has three independent choices. `udp=0|1` controls whether packet dialing is permitted, `packetEncoding=auto|none|xudp|uot-v2` selects the fallback packet protocol, and `mux=off|h2mux|xray` selects the TCP/UDP carrier paths. These choices are not negotiated.
+VLESS has three independent choices: `udp=0|1` controls packet-dialing permission; `packetEncoding=auto|none|xudp|uot-v2` selects the fallback packet protocol; `mux=off|h2mux|xray` selects the TCP/UDP carrier paths. These choices are not negotiated.
 
 | Canonical URI query | Default | Accepted values and effect |
 | --- | --- | --- |
@@ -341,8 +341,8 @@ VLESS has three independent choices. `udp=0|1` controls whether packet dialing i
 | `packetEncoding` | `auto` | `auto`, `none` (native VLESS command-UDP), `xudp` (Single XUDP), or `uot-v2`. This is the fallback whenever mux does not own the UDP path. |
 | `mux` | `off` | `off`, `h2mux`, or `xray`. |
 | `padding` | `false` | Boolean, valid only with `mux=h2mux`; selects sing-mux v1 padding. |
-| `concurrency` | `0` | Signed `i16`, valid only with `mux=xray`: negative disables TCP mux, zero allows 8 concurrent logical children per TCP carrier, and a positive value sets that per-carrier concurrency, capped at 128. It does not set the number of physical carriers. |
-| `xudpConcurrency` | `0` | Signed `i16`, valid only with `mux=xray`: negative uses the protocol fallback; zero shares the TCP pool and its per-carrier concurrency when TCP mux is enabled (otherwise the protocol fallback); a positive value creates a separate UDP pool with that many concurrent logical children per carrier, capped at 128. |
+| `concurrency` | `0` | Signed `i16`, valid only with `mux=xray`. Negative disables TCP mux; zero allows 8 concurrent logical children per TCP carrier. A positive value sets that per-carrier concurrency, capped at 128. It does not set the number of physical carriers. |
+| `xudpConcurrency` | `0` | Signed `i16`, valid only with `mux=xray`. Negative uses the protocol fallback. Zero shares the TCP pool and its per-carrier concurrency when TCP mux is enabled; otherwise it uses the protocol fallback. A positive value creates a separate UDP pool with that many concurrent logical children per carrier, capped at 128. |
 | `xudpProxyUDP443` | `allow` | `reject`, `skip`, or `allow`, valid only with `mux=xray`; the exact UDP/443 precedence is below. |
 
 `packetEncoding`, `mux`, and each mux control may occur at most once. Repeated `udp` claims are accepted only when all values agree.
@@ -419,7 +419,7 @@ For VLESS and Trojan URL links, `security=reality` enables TLS and maps the REAL
 | `flow=xtls-rprx-vision-udp443` | Normalizes to `xtls-rprx-vision`; UDP/443 is already allowed by default. |
 | `fp` | Accepted but ignored; global TLS mode owns the ClientHello fingerprint. |
 
-An explicit `security=` overrides the historical VLESS default: `none` disables TLS; any other value enables it. Without `security`, VLESS defaults TLS on. Standard VMess links use their v2rayN JSON `tls` field instead.
+An explicit `security=` overrides the historical VLESS default: `none` disables TLS; any other value enables it. Without `security`, an explicit `tls=0|1` controls TLS; otherwise ordinary VLESS links default it on and base64-authority Shadowrocket links default it off, unless REALITY fields enable it. Standard VMess links use their v2rayN JSON `tls` field instead.
 Repeated `security` and recognized `tls` claims must agree, including cross-alias TLS enablement; a later value never overrides an earlier contradiction. VLESS and encoded VMess accept only `tls=0|1`; other schemes retain their handling of unrecognized `tls` text. Trojan and AnyTLS reject explicit plaintext claims rather than silently retaining mandatory TLS.
 
 REALITY is TLS-1.3-only. Its first attempt advertises hybrid `X25519MLKEM768` followed by the preset classic `X25519` share. Only a completed handshake with a non-ed25519 leaf permits one fresh same-peer X25519-only connection; it must still authenticate with the configured REALITY key/HMAC before proxy data is sent. Both attempts share one `3 × connect_timeout` setup deadline and introduce no new setting. This unauthenticated trigger is not server-version detection. Invalid ed25519 HMAC, TLS/IO errors and HRR remain terminal. Each connection seals its ClientHello exactly once, without key/nonce reuse. See [compatibility and authentication boundaries](../design/outbound.md#server-authentication-and-fingerprint-constraints).
